@@ -1550,6 +1550,17 @@ def _menu_actions_class():
             except Exception:  # noqa: BLE001
                 pass
 
+        # NSApplication delegate: fires when you double-click the app (or click its
+        # Dock icon) while it's ALREADY running. A menu-bar app has no main window,
+        # so without this "opening" the app does nothing visible — here we open the
+        # transcribe window so it behaves like a normal app you can open.
+        def applicationShouldHandleReopen_hasVisibleWindows_(self, app, flag):
+            try:
+                self._app._show_transcribe_window()
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+
         def restart_(self, sender):
             # Relaunch a fresh instance, then quit this one. Detached so it
             # survives our termination; LSMultipleInstancesProhibited + our exit
@@ -2569,6 +2580,7 @@ class FlowApp:
                 self._transcribe_ctrl = (
                     _transcribe_controller_class().alloc().initWithApp_(self))
             self._transcribe_ctrl.show()
+            print("[flow] transcribe window opened.", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[flow] couldn't open the transcribe window: {e}", flush=True)
 
@@ -2594,6 +2606,9 @@ class FlowApp:
 
         target = _menu_actions_class().alloc().initWithApp_(self)
         self._menu_target = target
+        # Make `target` the app delegate too, so double-clicking the app (a "reopen"
+        # while it's already running) opens the transcribe window.
+        app.setDelegate_(target)
 
         # Initial state: healthy (idle) unless the hotkey tap couldn't be created
         # because Input Monitoring isn't granted to frutflow yet.
