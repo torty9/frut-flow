@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Apply the früt Flow icon to frutflow.app WITHOUT re-signing the bundle.
+
+Re-signing the .app resets its macOS permission grants (Microphone / Accessibility /
+Input Monitoring). So instead of baking the icon into Contents/Resources + Info.plist
+(which would change the code signature), this uses the Finder custom-icon mechanism
+(NSWorkspace.setIcon), which attaches the icon to the bundle without touching the seal.
+
+Usage:  ./.venv/bin/python3 set-icon.py [path/to/icon.png]
+        (defaults to assets/frut-flow-icon.png next to this script)
+"""
+import sys
+from pathlib import Path
+
+from AppKit import NSImage, NSWorkspace
+
+APP = "/Users/thorstenpfeiffer/Applications/frutflow.app"
+DEFAULT_ICON = Path(__file__).resolve().parent / "assets" / "frut-flow-icon.png"
+
+
+def main() -> int:
+    icon = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_ICON
+    if not icon.exists():
+        print(f"icon not found: {icon}")
+        return 1
+    img = NSImage.alloc().initWithContentsOfFile_(str(icon))
+    if img is None:
+        print(f"could not load image: {icon}")
+        return 1
+    ok = NSWorkspace.sharedWorkspace().setIcon_forFile_options_(img, APP, 0)
+    print(f"applied {icon.name} to {APP}: {'ok' if ok else 'FAILED'}")
+    # nudge Finder to refresh the icon
+    Path(APP).touch()
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
