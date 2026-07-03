@@ -1,0 +1,31 @@
+# --- Python virtual environment (machine-specific, ~700 MB — never commit) ---
+.venv/
+venv/
+env/
+
+# --- Python caches / build ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- Timestamped dev backups created while iterating (flow.py.bak.*, etc.) ---
+*.bak
+*.bak.*
+*.orig
+
+# --- App bundle backups (frutflow.app.bak.YYYYMMDD-HHMMSS/) ---
+*.app.bak.*/
+frutflow.app.bak.*/
+
+# --- macOS cruft ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# --- Local editor / agent / session config ---
+.claude/
+
+# --- Runtime data & logs (the real data lives in ~/.flowdictate, outside the repo) ---
+*.log
