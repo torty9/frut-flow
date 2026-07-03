@@ -154,6 +154,18 @@ DEFAULT_CONFIG = {
     "auto_space": True,          # prepend a space so dictation merges naturally
                                  # with text already in the field (Wispr-style)
 
+    # --- voice undo ("never mind") ---
+    "undo_enabled": True,        # if a whole dictation is just an undo phrase (below),
+                                 # delete the PREVIOUS dictation instead of typing it.
+                                 # e.g. say "the dog ran outside", then "never mind" ->
+                                 # the last sentence is backspaced away. Say it again to
+                                 # peel off the one before, and so on.
+    "undo_phrases": [            # exact whole-utterance triggers (case/punctuation-insensitive)
+        "never mind", "nevermind", "actually never mind", "actually nevermind",
+        "scratch that", "actually scratch that", "delete that", "actually delete that",
+        "cancel that", "forget that", "undo that",
+    ],
+
     # --- feedback / guards ---
     "play_sounds": True,
     "ding_volume": 0.25,         # volume (0.0–1.0) of the success ding; lower = quieter
@@ -1149,6 +1161,95 @@ def _send_paste() -> None:
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
 
 
+def _send_backspaces(n: int) -> None:
+    """Delete the `n` characters to the LEFT of the cursor by synthesizing that
+    many Backspace (Delete) key presses as Quartz CGEvents — the same mechanism
+    (and the same Accessibility requirement) as the synthetic Cmd-V paste. A tiny
+    inter-event gap keeps fast apps (browsers/Electron) from coalescing/dropping
+    events on long deletes."""
+    if n <= 0:
+        return
+    import Quartz
+    DELETE_KEYCODE = 51  # Backspace ("delete to the left")
+    src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+    for _ in range(n):
+        down = Quartz.CGEventCreateKeyboardEvent(src, DELETE_KEYCODE, True)
+        up = Quartz.CGEventCreateKeyboardEvent(src, DELETE_KEYCODE, False)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+        time.sleep(0.003)
+
+
+def _composed_len(s: str) -> int:
+    """Number of Backspace presses needed to delete `s`: one per composed-character
+    sequence, NOT per Python code point. A macOS Backspace removes a whole grapheme
+    (e.g. NFD 'e'+combining-acute, or a flag emoji) at once, so counting code points
+    (len) would send too many and chew into the user's other text. Falls back to len
+    only if Foundation is somehow unavailable. For rare exotic emoji this may slightly
+    UNDER-count (leaves a straggler) — the safe direction, since it never over-deletes."""
+    try:
+        from Foundation import NSString
+        ns = NSString.stringWithString_(s)
+        length = ns.length()
+        i = n = 0
+        while i < length:
+            r = ns.rangeOfComposedCharacterSequenceAtIndex_(i)
+            i = r.location + r.length
+            n += 1
+        return n
+    except Exception:  # noqa: BLE001
+        return len(s)
+
+
+def _ax_caret_at_end(el, val: str):
+    """Best-effort: True if the insertion point is at the very end of the focused
+    field, False if it is CONFIDENTLY elsewhere, None if we can't tell. Used to make
+    voice-undo refuse (rather than corrupt) when the cursor has moved off the end."""
+    if el is None or val is None:
+        return None
+    try:
+        from ApplicationServices import (
+            AXUIElementCopyAttributeValue, kAXSelectedTextRangeAttribute,
+            AXValueGetValue, kAXValueTypeCFRange,
+        )
+        err, rng = AXUIElementCopyAttributeValue(
+            el, kAXSelectedTextRangeAttribute, None)
+        if err != 0 or rng is None:
+            return None
+        ok, cf = AXValueGetValue(rng, kAXValueTypeCFRange, None)
+        if not ok or cf is None:
+            return None
+        try:
+            from Foundation import NSString
+            end = NSString.stringWithString_(val).length()   # UTF-16 units, as AX uses
+        except Exception:  # noqa: BLE001
+            end = len(val)
+        # Only a confident "empty caret, sitting before the end" counts as False;
+        # anything ambiguous returns None so we don't refuse a valid undo.
+        if cf.length == 0 and 0 <= cf.location < end:
+            return False
+        if cf.length == 0 and cf.location == end:
+            return True
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_UNDO_PUNCT = str.maketrans("", "", ",.;:!?’'\"")
+
+
+def _is_undo_phrase(text: str, cfg: dict) -> bool:
+    """True iff the WHOLE utterance is one of the configured undo phrases
+    (case- and punctuation-insensitive). Exact match only — 'never mind that guy'
+    is real text and must NOT trigger an undo."""
+    if not text:
+        return False
+    norm = " ".join(text.lower().translate(_UNDO_PUNCT).split())
+    wanted = {" ".join(str(p).lower().translate(_UNDO_PUNCT).split())
+              for p in (cfg.get("undo_phrases") or [])}
+    return norm in wanted
+
+
 def insert_text(text: str, cfg: dict) -> bool:
     """Insert `text` into the focused app. Returns True if it was delivered
     via synthetic paste/type, False if it was only left on the clipboard as a
@@ -1508,6 +1609,9 @@ class FlowApp:
         # Auto-learn-from-edits: a handle on the field we last pasted into, so we
         # can diff your correction against it. None when nothing is pending.
         self._pending_learn: dict | None = None
+        # Voice-undo ("never mind"): a stack of the EXACT strings we inserted, most
+        # recent last. Saying an undo phrase pops the top and backspaces over it.
+        self._undo_stack: list[str] = []
         # Menu-bar ("real app") mode: on when launched as frutflow.app rather than
         # from an interactive terminal. LaunchServices sets __CFBundleIdentifier
         # for bundle launches; a plain `python flow.py` does not. run() adds a
@@ -1634,6 +1738,13 @@ class FlowApp:
                 print("[flow] (no speech detected)")
                 return
             print(f"[flow] → {text}")
+            # Voice undo: if the WHOLE utterance is "never mind" (or similar), delete
+            # the previous dictation instead of typing this. Check the raw transcript
+            # too, in case cleanup/fuzzy-correct nudged the words. Never learns from it.
+            if self.cfg.get("undo_enabled", True) and (
+                    _is_undo_phrase(text, self.cfg) or _is_undo_phrase(raw, self.cfg)):
+                self._undo_last_insertion()
+                return
             # Wispr-style natural merge: lead with a space so the dictation
             # doesn't glue onto whatever word is already left of the cursor.
             to_insert = (" " + text) if self.cfg.get("auto_space", True) else text
@@ -1641,6 +1752,11 @@ class FlowApp:
             # Close the perception loop: a subtle (quiet) cue when text actually
             # lands, a distinct, louder one when it only made it to the clipboard.
             if delivered:
+                # Remember EXACTLY what landed so a later "never mind" can delete it.
+                with self._state_lock:
+                    self._undo_stack.append(to_insert)
+                    if len(self._undo_stack) > 25:   # keep it bounded
+                        self._undo_stack.pop(0)
                 play("Glass", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
                 if self.cfg.get("learn_from_edits", True):
                     # Finalize the PREVIOUS paste's pending learn before arming this
@@ -1669,6 +1785,54 @@ class FlowApp:
                     print("[flow] (left text on clipboard — press Cmd-V)")
                 except Exception:  # noqa: BLE001
                     pass
+
+    def _undo_last_insertion(self) -> bool:
+        """Voice command 'never mind': delete the most recent dictation by
+        backspacing over the exact text we inserted. Returns True if it deleted.
+
+        Refuses (rather than risk eating your other text) when it can tell the
+        inserted span is no longer sitting untouched at the cursor — e.g. you edited
+        the pasted text in place (the auto-learn workflow) or moved the cursor. When
+        the app doesn't expose its text to Accessibility we can't check, so we delete
+        best-effort (counting whole characters, so accents/emoji don't over-delete)."""
+        with self._state_lock:
+            last = self._undo_stack.pop() if self._undo_stack else None
+
+        def _refuse(msg: str, put_back: bool = True) -> bool:
+            print(f"[flow] {msg}")
+            if put_back and last:
+                with self._state_lock:
+                    self._undo_stack.append(last)
+            play("Basso", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
+            return False
+
+        if not last:
+            return _refuse("(never mind — but nothing to undo)", put_back=False)
+        # Deleting uses synthetic keystrokes, same as paste: needs Accessibility and
+        # is blocked by Secure Input.
+        if not _ax_trusted() or _secure_input_active():
+            return _refuse("can't undo — Accessibility not granted or Secure Input on.")
+
+        # SAFETY: confirm the exact text we inserted is STILL the tail of the focused
+        # field and the cursor is at the end. If the app exposes its value and it was
+        # edited (or the caret moved off the end), backspacing a fixed count would
+        # delete the wrong characters — so refuse instead of corrupting the field.
+        el = _ax_focused_element()
+        val = _ax_read_value(el)
+        if val is not None:
+            if not val.endswith(last):
+                return _refuse("never mind — the last dictation was changed; leaving it as is.")
+            if _ax_caret_at_end(el, val) is False:
+                return _refuse("never mind — the cursor moved; leaving the text as is.")
+
+        n = _composed_len(last)   # one Backspace per composed character (macOS rule)
+        print(f"[flow] ↩︎ never mind — deleting last dictation ({n} chars).")
+        _send_backspaces(n)
+        # We just removed it, so don't let the auto-learner mine the deleted text.
+        with self._state_lock:
+            self._pending_learn = None
+        play("Bottle", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
+        return True
 
     # -- automatic learning from your post-paste edits -----------------------
 
