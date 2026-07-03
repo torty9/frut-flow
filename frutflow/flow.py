@@ -1201,53 +1201,56 @@ def _composed_len(s: str) -> int:
         return len(s)
 
 
-def _ax_caret_at_end(el, val: str):
-    """Best-effort: True if the insertion point is at the very end of the focused
-    field, False if it is CONFIDENTLY elsewhere, None if we can't tell. Used to make
-    voice-undo refuse (rather than corrupt) when the cursor has moved off the end."""
-    if el is None or val is None:
-        return None
-    try:
-        from ApplicationServices import (
-            AXUIElementCopyAttributeValue, kAXSelectedTextRangeAttribute,
-            AXValueGetValue, kAXValueTypeCFRange,
-        )
-        err, rng = AXUIElementCopyAttributeValue(
-            el, kAXSelectedTextRangeAttribute, None)
-        if err != 0 or rng is None:
-            return None
-        ok, cf = AXValueGetValue(rng, kAXValueTypeCFRange, None)
-        if not ok or cf is None:
-            return None
-        try:
-            from Foundation import NSString
-            end = NSString.stringWithString_(val).length()   # UTF-16 units, as AX uses
-        except Exception:  # noqa: BLE001
-            end = len(val)
-        # Only a confident "empty caret, sitting before the end" counts as False;
-        # anything ambiguous returns None so we don't refuse a valid undo.
-        if cf.length == 0 and 0 <= cf.location < end:
-            return False
-        if cf.length == 0 and cf.location == end:
-            return True
-        return None
-    except Exception:  # noqa: BLE001
-        return None
+def _drop_last_sentence(s: str) -> str:
+    """Return `s` with its last sentence removed (sentences end at . ! ?). Used so
+    an inline 'actually never mind' retracts just the sentence spoken before it."""
+    s = s.rstrip()
+    if not s:
+        return ""
+    core = re.sub(r"[.!?]+$", "", s).rstrip()      # ignore a trailing terminator run
+    terms = list(re.finditer(r"[.!?]+", core))
+    return core[:terms[-1].end()] if terms else ""
 
 
-_UNDO_PUNCT = str.maketrans("", "", ",.;:!?’'\"")
+def apply_undo(text: str, cfg: dict):
+    """Apply 'never mind' retractions to ONE dictation, inline.
 
+    Returns (kept_text, prev_delete_count):
+      • Each undo phrase deletes the sentence spoken right before it *within this
+        utterance* — so you can talk, say "actually never mind", and keep going in
+        the same breath; only the retracted sentence is dropped from what's typed.
+      • If a phrase has nothing before it in this utterance (it's the whole thing,
+        or at the very start), it instead retracts a PREVIOUS pasted dictation
+        (prev_delete_count) — the original separate-press behaviour still works.
 
-def _is_undo_phrase(text: str, cfg: dict) -> bool:
-    """True iff the WHOLE utterance is one of the configured undo phrases
-    (case- and punctuation-insensitive). Exact match only — 'never mind that guy'
-    is real text and must NOT trigger an undo."""
-    if not text:
-        return False
-    norm = " ".join(text.lower().translate(_UNDO_PUNCT).split())
-    wanted = {" ".join(str(p).lower().translate(_UNDO_PUNCT).split())
-              for p in (cfg.get("undo_phrases") or [])}
-    return norm in wanted
+    kept_text is what to actually type; prev_delete_count is how many earlier
+    dictations to backspace away first. Returns (text, 0) when no phrase is present."""
+    phrases = [str(p).strip() for p in (cfg.get("undo_phrases") or []) if str(p).strip()]
+    if not text or not phrases:
+        return text, 0
+    pats = sorted({p.lower() for p in phrases}, key=len, reverse=True)  # longest first
+    rx = re.compile(r"(?<!\w)(?:" + "|".join(re.escape(p) for p in pats) + r")(?!\w)",
+                    re.IGNORECASE)
+    if not rx.search(text):
+        return text, 0
+    kept = ""
+    prev_delete = 0
+    pos = 0
+    for m in rx.finditer(text):
+        kept += text[pos:m.start()]
+        if kept.strip():
+            kept = _drop_last_sentence(kept)   # retract the sentence just spoken
+        else:
+            prev_delete += 1                   # nothing here yet -> retract a prior paste
+            kept = ""
+        pos = m.end()
+    kept += text[pos:]
+    # Tidy the seams left by the removals (stray/leading/duplicated punctuation).
+    kept = re.sub(r"\s+", " ", kept)
+    kept = re.sub(r"\s+([,.!?;:])", r"\1", kept)
+    kept = re.sub(r"([.!?])\s*[.!?,;:]+", r"\1", kept)
+    kept = re.sub(r"^[\s,;:.!?]+", "", kept)
+    return kept.strip(), prev_delete
 
 
 def insert_text(text: str, cfg: dict) -> bool:
@@ -1541,6 +1544,12 @@ def _menu_actions_class():
             except Exception:  # noqa: BLE001
                 pass
 
+        def transcribeFile_(self, sender):
+            try:
+                self._app._show_transcribe_window()
+            except Exception:  # noqa: BLE001
+                pass
+
         def restart_(self, sender):
             # Relaunch a fresh instance, then quit this one. Detached so it
             # survives our termination; LSMultipleInstancesProhibited + our exit
@@ -1567,6 +1576,183 @@ def _menu_actions_class():
 
     _MENU_ACTIONS_CLASS = _MenuActions
     return _MENU_ACTIONS_CLASS
+
+
+_TRANSCRIBE_CTRL_CLASS = None
+
+
+def _transcribe_controller_class():
+    """Lazily build the controller that runs the 'Transcribe an audio file' window:
+    a titled, resizable window with a Choose-file button, a status line, an editable
+    transcript text view, and Copy / Save buttons. Deferred import so CLI paths never
+    load AppKit."""
+    global _TRANSCRIBE_CTRL_CLASS
+    if _TRANSCRIBE_CTRL_CLASS is not None:
+        return _TRANSCRIBE_CTRL_CLASS
+    import objc
+    from Cocoa import (
+        NSObject, NSWindow, NSScrollView, NSTextView, NSButton, NSTextField,
+        NSOpenPanel, NSSavePanel, NSApplication, NSColor, NSFont,
+        NSApplicationActivationPolicyRegular, NSApplicationActivationPolicyAccessory,
+        NSMakeRect, NSMakeSize, NSOperationQueue,
+        NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
+        NSWindowStyleMaskResizable, NSWindowStyleMaskMiniaturizable,
+        NSBackingStoreBuffered, NSViewWidthSizable, NSViewHeightSizable,
+        NSViewMinYMargin, NSViewMaxYMargin,
+    )
+    OK = 1               # NSModalResponseOK / NSFileHandlingPanelOKButton
+    AUDIO_TYPES = ["wav", "aiff", "aif", "aifc", "caf", "m4a", "m4b", "mp3", "mp4",
+                   "aac", "flac", "ogg", "opus", "mov", "wma", "amr", "3gp"]
+
+    class _TranscribeController(NSObject):
+        def initWithApp_(self, app):
+            self = objc.super(_TranscribeController, self).init()
+            if self is None:
+                return None
+            self._app = app
+            self._path = None
+            self._busy = False
+            self._build()
+            return self
+
+        @objc.python_method
+        def _build(self):
+            style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                     | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable)
+            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, 640, 520), style, NSBackingStoreBuffered, False)
+            win.setTitle_("Transcribe Audio File — früt Flow")
+            win.setReleasedWhenClosed_(False)
+            win.setDelegate_(self)
+            win.setMinSize_(NSMakeSize(440, 340))
+            content = win.contentView()
+
+            choose = NSButton.buttonWithTitle_target_action_(
+                "Choose Audio File…", self, "chooseFile:")
+            choose.setFrame_(NSMakeRect(16, 476, 190, 28))
+            choose.setAutoresizingMask_(NSViewMinYMargin)
+            content.addSubview_(choose)
+            self._choose = choose
+
+            status = NSTextField.labelWithString_(
+                "Choose an audio file (voice memo, m4a, mp3, wav…) to transcribe it.")
+            status.setFrame_(NSMakeRect(216, 481, 408, 20))
+            status.setAutoresizingMask_(NSViewMinYMargin | NSViewWidthSizable)
+            status.setTextColor_(NSColor.secondaryLabelColor())
+            content.addSubview_(status)
+            self._status = status
+
+            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(16, 52, 608, 412))
+            scroll.setHasVerticalScroller_(True)
+            scroll.setBorderType_(2)   # NSBezelBorder
+            scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 606, 410))
+            tv.setEditable_(True)
+            tv.setRichText_(False)
+            tv.setFont_(NSFont.systemFontOfSize_(14))
+            tv.setTextContainerInset_(NSMakeSize(6, 8))
+            tv.setAutoresizingMask_(NSViewWidthSizable)
+            scroll.setDocumentView_(tv)
+            content.addSubview_(scroll)
+            self._tv = tv
+
+            copy = NSButton.buttonWithTitle_target_action_("Copy", self, "copyText:")
+            copy.setFrame_(NSMakeRect(16, 12, 96, 30))
+            copy.setAutoresizingMask_(NSViewMaxYMargin)
+            content.addSubview_(copy)
+            save = NSButton.buttonWithTitle_target_action_("Save…", self, "saveText:")
+            save.setFrame_(NSMakeRect(118, 12, 96, 30))
+            save.setAutoresizingMask_(NSViewMaxYMargin)
+            content.addSubview_(save)
+
+            win.center()
+            self._win = win
+
+        # -- helpers (pure-Python; hidden from the Obj-C runtime) -----------
+        @objc.python_method
+        def _set_status(self, s):
+            self._status.setStringValue_(s)
+
+        @objc.python_method
+        def show(self):
+            # Become a regular app while the window is open so it focuses and shows a
+            # Dock icon (the app logo); revert to menu-bar-only when it closes.
+            app = NSApplication.sharedApplication()
+            app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+            app.activateIgnoringOtherApps_(True)
+            self._win.makeKeyAndOrderFront_(None)
+
+        def windowWillClose_(self, note):
+            NSApplication.sharedApplication().setActivationPolicy_(
+                NSApplicationActivationPolicyAccessory)
+
+        # -- actions --------------------------------------------------------
+        def chooseFile_(self, sender):
+            if self._busy:
+                return
+            panel = NSOpenPanel.openPanel()
+            panel.setCanChooseFiles_(True)
+            panel.setCanChooseDirectories_(False)
+            panel.setAllowsMultipleSelection_(False)
+            panel.setAllowedFileTypes_(AUDIO_TYPES)
+            panel.setMessage_("Choose an audio file to transcribe")
+            if panel.runModal() != OK or not panel.URLs():
+                return
+            path = str(panel.URLs()[0].path())
+            self._path = path
+            name = os.path.basename(path)
+            self._busy = True
+            self._choose.setEnabled_(False)
+            self._set_status(f"Transcribing “{name}” — long files can take a bit…")
+            self._tv.setString_("")
+            threading.Thread(target=self._run, args=(path, name), daemon=True).start()
+
+        @objc.python_method
+        def _run(self, path, name):
+            try:
+                text, err = self._app._transcribe_path(path)
+            except Exception as e:  # noqa: BLE001
+                text, err = None, f"Transcription failed: {e}"
+
+            def _done():
+                self._busy = False
+                self._choose.setEnabled_(True)
+                if err:
+                    self._set_status(err)
+                elif not text:
+                    self._set_status("No speech detected in that file.")
+                else:
+                    self._set_status(f"Done — {len(text.split())} words from “{name}”. "
+                                  "Edit, Copy, or Save below.")
+                    self._tv.setString_(text)
+            NSOperationQueue.mainQueue().addOperationWithBlock_(_done)
+
+        def copyText_(self, sender):
+            s = self._tv.string()
+            if s and str(s).strip():
+                _clip_set(str(s))
+                self._set_status("Copied to the clipboard.")
+
+        def saveText_(self, sender):
+            s = self._tv.string()
+            if not (s and str(s).strip()):
+                return
+            panel = NSSavePanel.savePanel()
+            panel.setAllowedFileTypes_(["txt"])
+            base = "transcription"
+            if self._path:
+                base = os.path.splitext(os.path.basename(self._path))[0] + " — transcript"
+            panel.setNameFieldStringValue_(base + ".txt")
+            if panel.runModal() == OK and panel.URL():
+                try:
+                    with open(str(panel.URL().path()), "w", encoding="utf-8") as f:
+                        f.write(str(s))
+                    self._set_status("Saved.")
+                except Exception as e:  # noqa: BLE001
+                    self._set_status(f"Couldn't save: {e}")
+
+    _TRANSCRIBE_CTRL_CLASS = _TranscribeController
+    return _TRANSCRIBE_CTRL_CLASS
 
 
 class FlowApp:
@@ -1612,6 +1798,11 @@ class FlowApp:
         # Voice-undo ("never mind"): a stack of the EXACT strings we inserted, most
         # recent last. Saying an undo phrase pops the top and backspaces over it.
         self._undo_stack: list[str] = []
+        # "Transcribe an audio file" window (built lazily on first open).
+        self._transcribe_ctrl = None
+        # Serialize model access: the mic worker and the file-transcribe window must
+        # never call transcribe() on the same model concurrently.
+        self._transcribe_lock = threading.Lock()
         # Menu-bar ("real app") mode: on when launched as frutflow.app rather than
         # from an interactive terminal. LaunchServices sets __CFBundleIdentifier
         # for bundle launches; a plain `python flow.py` does not. run() adds a
@@ -1731,20 +1922,24 @@ class FlowApp:
             # Only pay for context capture when the LLM formatter will use it.
             context = ({"app": _focused_app_name()}
                        if self.cfg.get("cleanup") == "llm" else None)
-            raw = self.transcriber.transcribe(audio, prompt=prompt,
-                                              hotwords=hotwords)
+            with self._transcribe_lock:   # never overlap with the file-transcribe window
+                raw = self.transcriber.transcribe(audio, prompt=prompt,
+                                                  hotwords=hotwords)
             text = clean(raw, self.cfg, context)
             if not text:
                 print("[flow] (no speech detected)")
                 return
             print(f"[flow] → {text}")
-            # Voice undo: if the WHOLE utterance is "never mind" (or similar), delete
-            # the previous dictation instead of typing this. Check the raw transcript
-            # too, in case cleanup/fuzzy-correct nudged the words. Never learns from it.
-            if self.cfg.get("undo_enabled", True) and (
-                    _is_undo_phrase(text, self.cfg) or _is_undo_phrase(raw, self.cfg)):
-                self._undo_last_insertion()
-                return
+            # Voice undo. A "never mind" phrase retracts the sentence spoken right
+            # before it — INLINE, so you can talk, say "actually never mind", and keep
+            # going in one breath (only that sentence is dropped from what's typed). If
+            # the phrase is the whole utterance or at the very start, it instead
+            # retracts the PREVIOUS pasted dictation (backspacing it away).
+            if self.cfg.get("undo_enabled", True):
+                kept, prev_delete = apply_undo(text, self.cfg)
+                if prev_delete or kept != text:
+                    self._apply_undo_result(kept, prev_delete)
+                    return
             # Wispr-style natural merge: lead with a space so the dictation
             # doesn't glue onto whatever word is already left of the cursor.
             to_insert = (" " + text) if self.cfg.get("auto_space", True) else text
@@ -1752,11 +1947,7 @@ class FlowApp:
             # Close the perception loop: a subtle (quiet) cue when text actually
             # lands, a distinct, louder one when it only made it to the clipboard.
             if delivered:
-                # Remember EXACTLY what landed so a later "never mind" can delete it.
-                with self._state_lock:
-                    self._undo_stack.append(to_insert)
-                    if len(self._undo_stack) > 25:   # keep it bounded
-                        self._undo_stack.pop(0)
+                self._remember_insertion(to_insert)   # so a later "never mind" can delete it
                 play("Glass", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
                 if self.cfg.get("learn_from_edits", True):
                     # Finalize the PREVIOUS paste's pending learn before arming this
@@ -1786,6 +1977,44 @@ class FlowApp:
                 except Exception:  # noqa: BLE001
                     pass
 
+    def _remember_insertion(self, inserted: str) -> None:
+        """Push the EXACT string we just inserted onto the undo stack (bounded), so a
+        later 'never mind' can backspace it away."""
+        with self._state_lock:
+            self._undo_stack.append(inserted)
+            if len(self._undo_stack) > 25:
+                self._undo_stack.pop(0)
+
+    def _apply_undo_result(self, kept: str, prev_delete: int) -> None:
+        """Carry out an utterance that contained a 'never mind': retract `prev_delete`
+        previously-pasted dictations (backspace), then type the `kept` remainder (the
+        continuation after an inline retraction), if any."""
+        print(f"[flow] ↩︎ never mind — retract {prev_delete} prior dictation(s); "
+              f"keep {kept!r}", flush=True)
+        for _ in range(prev_delete):
+            if not self._undo_last_insertion():   # pops stack, AX-verifies, backspaces
+                break
+        if not kept.strip():
+            return
+        # Inline retraction with a continuation to type. Give a distinct cue that the
+        # retraction registered when we didn't already backspace (which dinged).
+        if prev_delete == 0:
+            play("Bottle", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
+        to_insert = (" " + kept) if self.cfg.get("auto_space", True) else kept
+        if insert_text(to_insert, self.cfg):
+            self._remember_insertion(to_insert)
+            play("Glass", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
+            if self.cfg.get("learn_from_edits", True):
+                self._reconcile_edit_learning()
+                self._arm_edit_learning(kept)
+            if self.cfg.get("learn_vocab", True):
+                try:
+                    learn_vocab(kept)
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            play("Basso", self.cfg)
+
     def _undo_last_insertion(self) -> bool:
         """Voice command 'never mind': delete the most recent dictation by
         backspacing over the exact text we inserted. Returns True if it deleted.
@@ -1813,20 +2042,23 @@ class FlowApp:
         if not _ax_trusted() or _secure_input_active():
             return _refuse("can't undo — Accessibility not granted or Secure Input on.")
 
-        # SAFETY: confirm the exact text we inserted is STILL the tail of the focused
-        # field and the cursor is at the end. If the app exposes its value and it was
-        # edited (or the caret moved off the end), backspacing a fixed count would
-        # delete the wrong characters — so refuse instead of corrupting the field.
-        el = _ax_focused_element()
-        val = _ax_read_value(el)
+        # SAFETY: if the app exposes its text to Accessibility, confirm the words we
+        # inserted are STILL the tail of the field (some fields trim the leading/
+        # trailing space from their AX value, so accept those variants too). If the
+        # tail clearly isn't our dictation anymore (edited in place), refuse rather
+        # than backspace into unrelated text. Delete exactly the MATCHED tail so the
+        # count is right even when a boundary space was trimmed. When the app is
+        # opaque to AX (val is None), delete best-effort.
+        tail = last
+        val = _ax_read_value(_ax_focused_element())
         if val is not None:
-            if not val.endswith(last):
+            tail = next((c for c in (last, last.rstrip(), last.lstrip(), last.strip())
+                         if c and val.endswith(c)), None)
+            if tail is None:
                 return _refuse("never mind — the last dictation was changed; leaving it as is.")
-            if _ax_caret_at_end(el, val) is False:
-                return _refuse("never mind — the cursor moved; leaving the text as is.")
 
-        n = _composed_len(last)   # one Backspace per composed character (macOS rule)
-        print(f"[flow] ↩︎ never mind — deleting last dictation ({n} chars).")
+        n = _composed_len(tail)   # one Backspace per composed character (macOS rule)
+        print(f"[flow] ↩︎ never mind — deleting last dictation ({n} chars).", flush=True)
         _send_backspaces(n)
         # We just removed it, so don't let the auto-learner mine the deleted text.
         with self._state_lock:
@@ -2311,6 +2543,35 @@ class FlowApp:
             finally:
                 self._teardown_tap()
 
+    def _transcribe_path(self, path: str):
+        """Transcribe an audio FILE with the app's already-loaded engine + the full
+        cleanup/vocab pipeline. Returns (text, error_message). Reuses self.transcriber
+        (no second model load) and serializes with the live mic path via a lock."""
+        audio = _load_audio_file(path)
+        if audio is None:
+            return None, "Couldn't read that audio file (unsupported format or corrupt)."
+        if len(audio) / SAMPLE_RATE < 0.05:
+            return None, "That file has essentially no audio."
+        prompt = hotwords = None
+        if self.cfg.get("learn_vocab", True):
+            if self.cfg.get("vocab_biasing", "hotwords") == "prompt":
+                prompt = build_learned_prompt(self.cfg)
+            elif self.cfg.get("vocab_biasing", "hotwords") == "hotwords":
+                hotwords = build_hotwords(self.cfg)
+        with self._transcribe_lock:
+            raw = self.transcriber.transcribe(audio, prompt=prompt, hotwords=hotwords)
+        return (clean(raw, self.cfg) or ""), None
+
+    def _show_transcribe_window(self) -> None:
+        """Open (or re-focus) the 'Transcribe an audio file' window. Built lazily."""
+        try:
+            if self._transcribe_ctrl is None:
+                self._transcribe_ctrl = (
+                    _transcribe_controller_class().alloc().initWithApp_(self))
+            self._transcribe_ctrl.show()
+        except Exception as e:  # noqa: BLE001
+            print(f"[flow] couldn't open the transcribe window: {e}", flush=True)
+
     def _run_menubar(self) -> None:
         """Set up the menu-bar status item and run the NSApplication event loop.
         Blocks until the app is told to quit. Only called in app mode. Every
@@ -2364,7 +2625,9 @@ class FlowApp:
         _add("Wispr DIY", None, enabled=False)
         self._status_line = _add(label, None, enabled=False)
         menu.addItem_(NSMenuItem.separatorItem())
+        _add("Transcribe Audio File…", "transcribeFile:")
         _add("Teach a Word…", "teachWord:")
+        menu.addItem_(NSMenuItem.separatorItem())
         _add("Restart", "restart:")
         _add("Open Log", "openLog:")
         _add("Privacy Settings…", "openPrivacy:")
@@ -2585,6 +2848,14 @@ def compare_engines(cfg: dict, seconds: float = 6.0) -> int:
 
 
 def main() -> int:
+    # When launched as the app, stdout/stderr are redirected to flow.log, where
+    # Python block-buffers them — so status lines only appear minutes later. Make
+    # them line-buffered so the log reflects what's happening in real time.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(line_buffering=True)
+        except Exception:  # noqa: BLE001
+            pass
     parser = argparse.ArgumentParser(description="Wispr DIY — local voice dictation")
     parser.add_argument("--setup", action="store_true",
                         help="write default config + print permission help")
