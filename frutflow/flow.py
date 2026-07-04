@@ -1663,6 +1663,9 @@ def _menu_actions_class():
             try:
                 app = self._app
                 glyph, label = arr[0], arr[1]
+                # Remember the latest glyph so the rich popover can colour its
+                # status dot to match the menu bar the next time it's shown.
+                app._last_glyph = glyph
                 item = app._status_item
                 if item is not None:
                     btn = item.button()
@@ -1674,8 +1677,45 @@ def _menu_actions_class():
                     app._status_line.setTitle_(label)
                 # Same state, second surface: the floating recording HUD.
                 app._hud_apply(glyph)
+                # Third surface: if the popover is open right now, live-update it.
+                pc = app._popover_ctrl
+                if pc is not None:
+                    try:
+                        pc._apply_status_to_vc()
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception:  # noqa: BLE001
                 pass
+
+        # Status-item button click handler. LEFT click -> rich popover; a
+        # CONTROL-click or RIGHT click -> the classic NSMenu fallback (so the app
+        # is ALWAYS controllable even if the popover ever misbehaves). We read the
+        # triggering NSEvent to decide. Runs on the main thread.
+        def statusClicked_(self, sender):
+            try:
+                from Cocoa import (NSApplication, NSEventTypeRightMouseUp,
+                                   NSEventModifierFlagControl)
+                ev = NSApplication.sharedApplication().currentEvent()
+                want_menu = False
+                if ev is not None:
+                    try:
+                        if ev.type() == NSEventTypeRightMouseUp:
+                            want_menu = True
+                        elif ev.modifierFlags() & NSEventModifierFlagControl:
+                            want_menu = True
+                    except Exception:  # noqa: BLE001
+                        want_menu = False
+                if want_menu:
+                    self._app._popup_menu()
+                else:
+                    self._app._show_popover()
+            except Exception:  # noqa: BLE001
+                # Last-resort safety: if anything above fails, fall back to the
+                # classic menu so the user is never locked out.
+                try:
+                    self._app._popup_menu()
+                except Exception:  # noqa: BLE001
+                    pass
 
         def teachWord_(self, sender):
             threading.Thread(target=_teach_word_interactive, daemon=True).start()
@@ -5304,6 +5344,649 @@ def _onboarding_controller_class():
     return _ONBOARDING_CTRL_CLASS
 
 
+_POPOVER_CTRL_CLASS = None
+
+
+def _popover_controller_class():
+    """Lazily build & cache the NSObject subclass that owns the menu-bar POPOVER —
+    a rich, dark-glass replacement for the plain NSMenu shown on a LEFT-click of
+    the status-item glyph. The classic NSMenu stays reachable (control-click /
+    right-click) as an always-available fallback, so the app can never become
+    uncontrollable.
+
+    Implemented with an NSPopover (behavior = transient) anchored to the status
+    button: the popover handles transient dismissal, positioning, and — crucially
+    for a dictation app — does NOT activate früt Flow or steal key focus from the
+    app you're dictating into. Its content is an NSViewController whose view is the
+    styled glass content (header, push-to-talk hint, nav rows, footer rows). The
+    popover appearance is forced vibrant-dark so the mockup's charcoal-glass look
+    and white-on-dark text read correctly regardless of the system light/dark mode.
+
+    Deferred AppKit import so non-app / CLI code paths never touch Cocoa."""
+    global _POPOVER_CTRL_CLASS
+    if _POPOVER_CTRL_CLASS is not None:
+        return _POPOVER_CTRL_CLASS
+
+    import objc
+    from Cocoa import (
+        NSObject, NSView, NSViewController, NSPopover, NSTextField, NSButton,
+        NSImage, NSImageView, NSColor, NSBezierPath, NSTrackingArea,
+        NSMakeRect, NSMakeSize, NSInsetRect,
+        NSTextAlignmentCenter, NSTextAlignmentLeft, NSTextAlignmentRight,
+        NSImageScaleProportionallyUpOrDown,
+    )
+
+    G = _glass()
+
+    # NSPopover behavior + preferred edge. Import by name; fall back to the stable
+    # raw enum values (an unimported constant is a runtime NameError, not compile).
+    try:
+        from Cocoa import NSPopoverBehaviorTransient as _BEHAVIOR_TRANSIENT
+    except ImportError:  # pragma: no cover — very old pyobjc
+        _BEHAVIOR_TRANSIENT = 1
+    try:
+        from Cocoa import NSMinYEdge as _MIN_Y_EDGE
+    except ImportError:  # pragma: no cover
+        _MIN_Y_EDGE = 1
+
+    # Tracking-area option flags for the row hover highlight.
+    try:
+        from Cocoa import (
+            NSTrackingMouseEnteredAndExited as _TR_ENTER_EXIT,
+            NSTrackingActiveAlways as _TR_ACTIVE_ALWAYS,
+            NSTrackingInVisibleRect as _TR_IN_VISIBLE,
+        )
+    except ImportError:  # pragma: no cover
+        _TR_ENTER_EXIT, _TR_ACTIVE_ALWAYS, _TR_IN_VISIBLE = 0x01, 0x80, 0x200
+
+    def _white(a):
+        return NSColor.whiteColor().colorWithAlphaComponent_(a)
+
+    def _rgb(r, g, b, a=1.0):
+        return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, a)
+
+    GREEN = _rgb(0.788, 0.925, 0.431)          # #c9ec6e — the früt accent
+    NEAR_BLACK = _rgb(0.078, 0.090, 0.043)     # #14170b — text on green buttons
+    RED_HOVER = _rgb(1.0, 0.353, 0.314, 0.16)  # ~rgba(255,90,80,.16) — Quit hover
+
+    # --- geometry (mockup MENU-BAR POPOVER block, lines 434-491) ------------
+    PW = 326.0                       # popover content width
+    PAD = 16.0                       # header horizontal padding
+    ROW_H = 38.0                     # nav row height (comfortable tap target)
+    FOOT_ROW_H = 34.0                # footer row height
+    ROW_INSET = 8.0                  # left/right inset of the row band
+    ICON_COL = 20.0                  # icon column width
+    DIV_H = 1.0
+
+    # SF-Symbol names mapped from the mockup's phosphor icons.
+    SYM = {
+        "history": "clock.arrow.circlepath",
+        "transcribe": "waveform",
+        "teach": "graduationcap",
+        "settings": "gearshape",
+        "restart": "arrow.clockwise",
+        "quit": "power",
+    }
+
+    # -----------------------------------------------------------------------
+    # A hover-highlighting, clickable row. It is a plain NSView subclass (an
+    # NSObject, retained as a subview), so there is NO closure/lambda target that
+    # could be GC'd (HARD RULE 3b). On click it messages the controller via a
+    # stored (target, selector) and disambiguates by sender.tag().
+    # -----------------------------------------------------------------------
+    class _HoverRow(NSView):
+        @objc.python_method
+        def configure(self, controller, sel, tag, radius, hover_color):
+            self._ctl = controller
+            self._sel = sel                 # selector name, e.g. "rowClicked:"
+            self._rtag = int(tag)
+            self._radius = float(radius)
+            self._hover = hover_color       # NSColor or None
+            self._hovered = False
+            self.setWantsLayer_(True)
+            return self
+
+        def tag(self):
+            # Override NSView.tag so sender.tag() works from the action.
+            try:
+                return self._rtag
+            except AttributeError:
+                return -1
+
+        def isFlipped(self):
+            return True
+
+        def updateTrackingAreas(self):
+            objc.super(_HoverRow, self).updateTrackingAreas()
+            try:
+                for ta in list(self.trackingAreas()):
+                    self.removeTrackingArea_(ta)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                ta = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+                    self.bounds(),
+                    _TR_ENTER_EXIT | _TR_ACTIVE_ALWAYS | _TR_IN_VISIBLE,
+                    self, None)
+                self.addTrackingArea_(ta)
+            except Exception:  # noqa: BLE001
+                pass
+
+        def mouseEntered_(self, _ev):
+            self._hovered = True
+            self.setNeedsDisplay_(True)
+
+        def mouseExited_(self, _ev):
+            self._hovered = False
+            self.setNeedsDisplay_(True)
+
+        def drawRect_(self, _dirty):
+            try:
+                if self._hovered and self._hover is not None:
+                    r = NSInsetRect(self.bounds(), 0.0, 0.0)
+                    path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                        r, self._radius, self._radius)
+                    self._hover.set()
+                    path.fill()
+            except Exception:  # noqa: BLE001
+                pass
+
+        def mouseUp_(self, _ev):
+            try:
+                self._ctl.performSelector_withObject_(self._sel, self)
+            except Exception:  # noqa: BLE001
+                pass
+
+        def acceptsFirstMouse_(self, _ev):
+            return True     # register the first click after the popover opens
+
+    # A flipped container so top-down origin math places children correctly.
+    class _FlippedView(NSView):
+        def isFlipped(self):
+            return True
+
+    # -----------------------------------------------------------------------
+    # The content view controller. Builds the styled view; reads live state from
+    # self._ctl (the _PopoverController), which holds self._app.
+    # -----------------------------------------------------------------------
+    class _PopoverContentVC(NSViewController):
+        @objc.python_method
+        def setController(self, ctl):
+            self._ctl = ctl
+            return self
+
+        def loadView(self):
+            self._build()
+
+        @objc.python_method
+        def _asset_icon(self):
+            """Load frut-flow-icon.png next to this module; None if missing."""
+            try:
+                base = Path(__file__).resolve().parent
+            except Exception:  # noqa: BLE001
+                base = Path(os.getcwd())
+            p = base / "assets" / "frut-flow-icon.png"
+            if not p.exists():
+                return None
+            try:
+                return NSImage.alloc().initWithContentsOfFile_(str(p))
+            except Exception:  # noqa: BLE001
+                return None
+
+        @objc.python_method
+        def _symbol(self, key, color):
+            """An SF-Symbol image for `key`; None on failure (older macOS)."""
+            name = SYM.get(key, key)
+            try:
+                return NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                    name, None)
+            except Exception:  # noqa: BLE001
+                return None
+
+        @objc.python_method
+        def _hotkey_glyph(self):
+            app = self._ctl._app
+            return {
+                "alt_r": "⌥", "alt_l": "⌥", "alt": "⌥",
+                "ctrl_r": "⌃", "ctrl_l": "⌃", "ctrl": "⌃",
+                "cmd_r": "⌘", "cmd_l": "⌘", "cmd": "⌘",
+                "shift": "⇧", "fn": "fn",
+            }.get(str(getattr(app, "hotkey_name", "alt_r")).lower(),
+                  str(getattr(app, "hotkey_name", "alt_r")))
+
+        @objc.python_method
+        def _hotkey_words(self):
+            app = self._ctl._app
+            return {
+                "alt_r": "Right Option", "alt_l": "Left Option", "alt": "Option",
+                "ctrl_r": "Right Control", "ctrl_l": "Left Control",
+                "ctrl": "Control", "cmd_r": "Right Command",
+                "cmd_l": "Left Command", "cmd": "Command",
+                "shift": "Shift", "fn": "Fn",
+            }.get(str(getattr(app, "hotkey_name", "alt_r")).lower(),
+                  str(getattr(app, "hotkey_name", "alt_r")))
+
+        @objc.python_method
+        def _label(self, s, frame, size, weight, color, align=None):
+            f = NSTextField.labelWithString_(s)
+            f.setFrame_(frame)
+            f.setFont_(G.rounded_font(size, weight))
+            f.setTextColor_(color)
+            if align is not None:
+                f.setAlignment_(align)
+            f.setBackgroundColor_(NSColor.clearColor())
+            f.setBordered_(False)
+            f.setEditable_(False)
+            f.setSelectable_(False)
+            return f
+
+        @objc.python_method
+        def _divider(self, root, y):
+            d = NSView.alloc().initWithFrame_(NSMakeRect(0, y, PW, DIV_H))
+            d.setWantsLayer_(True)
+            d.layer().setBackgroundColor_(_white(0.07).CGColor())
+            root.addSubview_(d)
+
+        @objc.python_method
+        def _nav_row(self, root, y, key, title, tag, chevron, danger=False):
+            """One nav/footer row: SF-Symbol + label (+ optional chevron / ⌘Q).
+            The whole row is a hover-highlighting clickable band that messages
+            rowClicked: with sender.tag() == `tag`."""
+            footer = danger or tag >= 100
+            h = FOOT_ROW_H if footer else ROW_H
+            band_w = PW - 2 * ROW_INSET
+            row = _HoverRow.alloc().initWithFrame_(
+                NSMakeRect(ROW_INSET, y, band_w, h))
+            row.configure(self._ctl, "rowClicked:", tag, 9.0,
+                          RED_HOVER if danger else _white(0.08))
+            root.addSubview_(row)
+
+            icon_color = _white(0.55) if footer else GREEN
+            img = self._symbol(key, icon_color)
+            icon_x = 10.0
+            if img is not None:
+                iv = NSImageView.alloc().initWithFrame_(
+                    NSMakeRect(icon_x, (h - 20) / 2.0, ICON_COL, 20))
+                iv.setImage_(img)
+                iv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+                try:
+                    iv.setContentTintColor_(icon_color)
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    iv.setEnabled_(False)   # clicks fall through to the row
+                except Exception:  # noqa: BLE001
+                    pass
+                row.addSubview_(iv)
+
+            text_x = icon_x + ICON_COL + 12.0
+            tsize = 13.0 if footer else 13.5
+            tcolor = _white(0.72) if footer else _white(0.9)
+            lbl = self._label(title,
+                              NSMakeRect(text_x, (h - 18) / 2.0,
+                                         band_w - text_x - 34, 18),
+                              tsize, 0.0, tcolor, NSTextAlignmentLeft)
+            row.addSubview_(lbl)
+
+            if chevron:
+                cimg = None
+                try:
+                    cimg = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                        "chevron.right", None)
+                except Exception:  # noqa: BLE001
+                    cimg = None
+                if cimg is not None:
+                    cv = NSImageView.alloc().initWithFrame_(
+                        NSMakeRect(band_w - 24, (h - 12) / 2.0, 12, 12))
+                    cv.setImage_(cimg)
+                    cv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+                    try:
+                        cv.setContentTintColor_(_white(0.3))
+                        cv.setEnabled_(False)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    row.addSubview_(cv)
+            elif key == "quit":
+                kb = self._label("⌘Q",
+                                 NSMakeRect(band_w - 44, (h - 16) / 2.0, 36, 16),
+                                 11.5, 0.0, _white(0.32), NSTextAlignmentRight)
+                row.addSubview_(kb)
+
+            return row
+
+        @objc.python_method
+        def _build(self):
+            # Compute the layout top-down (view is flipped), then build.
+            HEADER_H = 70.0
+            CARD_TOP = HEADER_H
+            CARD_H = 66.0
+            CARD_GAP = 12.0
+            div1_y = CARD_TOP + CARD_H + CARD_GAP
+            nav_top = div1_y + DIV_H + 6.0
+            nav_h = 4 * ROW_H
+            div2_y = nav_top + nav_h + 8.0
+            foot_top = div2_y + DIV_H + 6.0
+            foot_h = 2 * FOOT_ROW_H
+            total_h = foot_top + foot_h + 10.0
+
+            root = _FlippedView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, PW, total_h))
+
+            # ===== header: app icon + wordmark + status dot/text =====
+            box = NSView.alloc().initWithFrame_(NSMakeRect(PAD, 15, 40, 40))
+            box.setWantsLayer_(True)
+            bl = box.layer()
+            bl.setCornerRadius_(11.0)
+            bl.setBackgroundColor_(_rgb(0.047, 0.047, 0.043).CGColor())  # #0c0c0b
+            bl.setMasksToBounds_(True)
+            bl.setBorderWidth_(1.0)
+            bl.setBorderColor_(_white(0.1).CGColor())
+            icon = self._asset_icon()
+            if icon is not None:
+                iv = NSImageView.alloc().initWithFrame_(NSMakeRect(0, 0, 40, 40))
+                iv.setImage_(icon)
+                iv.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+                box.addSubview_(iv)
+            root.addSubview_(box)
+
+            title = self._label(
+                "früt Flow",
+                NSMakeRect(PAD + 52, 16, PW - (PAD + 52) - PAD, 20),
+                14.5, 0.62, _white(0.95), NSTextAlignmentLeft)
+            root.addSubview_(title)
+
+            dot = NSView.alloc().initWithFrame_(NSMakeRect(PAD + 52, 42, 7, 7))
+            dot.setWantsLayer_(True)
+            dl = dot.layer()
+            dl.setCornerRadius_(3.5)
+            dl.setMasksToBounds_(False)
+            root.addSubview_(dot)
+            self._dot = dot
+
+            stext = self._label(
+                "Idle",
+                NSMakeRect(PAD + 52 + 13, 38, PW - (PAD + 52 + 13) - PAD, 16),
+                12.0, 0.0, _white(0.55), NSTextAlignmentLeft)
+            root.addSubview_(stext)
+            self._status_text = stext
+
+            # ===== push-to-talk card =====
+            card = NSView.alloc().initWithFrame_(
+                NSMakeRect(12, CARD_TOP, PW - 24, CARD_H))
+            card.setWantsLayer_(True)
+            cl = card.layer()
+            cl.setCornerRadius_(13.0)
+            cl.setBackgroundColor_(_rgb(0.0, 0.0, 0.0, 0.24).CGColor())
+            cl.setMasksToBounds_(True)
+            cl.setBorderWidth_(1.0)
+            cl.setBorderColor_(_white(0.07).CGColor())
+            root.addSubview_(card)
+
+            cap = self._label("Push-to-talk",
+                              NSMakeRect(14, 10, PW - 24 - 28, 15),
+                              11.5, 0.0, _white(0.5), NSTextAlignmentLeft)
+            card.addSubview_(cap)
+
+            chip = NSView.alloc().initWithFrame_(NSMakeRect(14, 30, 30, 24))
+            chip.setWantsLayer_(True)
+            kl = chip.layer()
+            kl.setCornerRadius_(8.0)
+            kl.setBackgroundColor_(_white(0.09).CGColor())
+            kl.setBorderWidth_(1.0)
+            kl.setBorderColor_(_white(0.12).CGColor())
+            card.addSubview_(chip)
+            glyph = self._label(self._hotkey_glyph(),
+                                NSMakeRect(0, 3, 30, 18),
+                                13.0, 0.4, _white(0.9), NSTextAlignmentCenter)
+            chip.addSubview_(glyph)
+            name = self._label(self._hotkey_words(),
+                               NSMakeRect(52, 33, 150, 18),
+                               12.5, 0.0, _white(0.62), NSTextAlignmentLeft)
+            card.addSubview_(name)
+
+            # Right side: an informational hint (hold mode) OR a real toggle
+            # button (toggle mode) — a global HOLD-key can't be a click, so we
+            # only surface a button when tapping is what actually toggles.
+            mode = str(self._ctl._app.cfg.get("mode", "hold")).lower()
+            if mode == "toggle":
+                btn = NSButton.buttonWithTitle_target_action_(
+                    "Start", self._ctl, "toggleRecord:")
+                btn.setFrame_(NSMakeRect(PW - 24 - 14 - 92, 30, 92, 26))
+                btn.setBezelStyle_(1)
+                btn.setFont_(G.rounded_font(12.5, 0.5))
+                try:
+                    btn.setContentTintColor_(NEAR_BLACK)
+                except Exception:  # noqa: BLE001
+                    pass
+                btn.setWantsLayer_(True)
+                gl = btn.layer()
+                if gl is not None:
+                    gl.setCornerRadius_(9.0)
+                    gl.setBackgroundColor_(GREEN.CGColor())
+                    gl.setBorderWidth_(1.0)
+                    gl.setBorderColor_(_white(0.28).CGColor())
+                card.addSubview_(btn)
+                self._toggle_btn = btn
+            else:
+                hint = NSView.alloc().initWithFrame_(
+                    NSMakeRect(PW - 24 - 14 - 118, 30, 118, 26))
+                hint.setWantsLayer_(True)
+                hl = hint.layer()
+                hl.setCornerRadius_(9.0)
+                hl.setBackgroundColor_(
+                    GREEN.colorWithAlphaComponent_(0.16).CGColor())
+                hl.setBorderWidth_(1.0)
+                hl.setBorderColor_(
+                    GREEN.colorWithAlphaComponent_(0.32).CGColor())
+                htxt = self._label("Hold to talk",
+                                   NSMakeRect(0, 4, 118, 18),
+                                   12.0, 0.4, GREEN, NSTextAlignmentCenter)
+                hint.addSubview_(htxt)
+                card.addSubview_(hint)
+                self._toggle_btn = None
+
+            # ===== divider + nav rows =====
+            self._divider(root, div1_y)
+            self._nav_row(root, nav_top + 0 * ROW_H, "history",
+                          "History", 0, True)
+            self._nav_row(root, nav_top + 1 * ROW_H, "transcribe",
+                          "Transcribe Audio File…", 1, False)
+            self._nav_row(root, nav_top + 2 * ROW_H, "teach",
+                          "Teach a Word…", 2, False)
+            self._nav_row(root, nav_top + 3 * ROW_H, "settings",
+                          "Settings…", 3, False)
+
+            # ===== divider + footer rows =====
+            self._divider(root, div2_y)
+            self._nav_row(root, foot_top + 0 * FOOT_ROW_H, "restart",
+                          "Restart", 100, False)
+            self._nav_row(root, foot_top + 1 * FOOT_ROW_H, "quit",
+                          "Quit früt Flow", 101, False, danger=True)
+
+            self.setView_(root)
+            try:
+                self._ctl._apply_status_to_vc()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # -----------------------------------------------------------------------
+    # The controller: owns the NSPopover + content VC, exposes toggle/close, and
+    # implements the row actions (all routing to the SAME FlowApp entry points
+    # the classic NSMenu uses). Its selectors run on the MAIN thread.
+    # -----------------------------------------------------------------------
+    class _PopoverController(NSObject):
+        def initWithApp_(self, app):
+            self = objc.super(_PopoverController, self).init()
+            if self is None:
+                return None
+            self._app = app
+            self._popover = None
+            self._vc = None
+            return self
+
+        @objc.python_method
+        def _ensure(self):
+            if self._popover is not None:
+                return
+            vc = _PopoverContentVC.alloc().init()
+            vc.setController(self)
+            self._vc = vc
+            pop = NSPopover.alloc().init()
+            pop.setContentViewController_(vc)
+            pop.setBehavior_(_BEHAVIOR_TRANSIENT)
+            pop.setAnimates_(True)
+            try:
+                from Cocoa import NSAppearance
+                ap = NSAppearance.appearanceNamed_("NSAppearanceNameVibrantDark")
+                if ap is not None:
+                    pop.setAppearance_(ap)
+            except Exception:  # noqa: BLE001
+                pass
+            pop.setDelegate_(self)
+            try:
+                sz = vc.view().frame().size
+                pop.setContentSize_(NSMakeSize(sz.width, sz.height))
+            except Exception:  # noqa: BLE001
+                pass
+            self._popover = pop
+
+        @objc.python_method
+        def toggle(self):
+            """Left-click of the status glyph: toggle the popover, anchored under
+            the status button. Never activates the app (transient popover)."""
+            self._ensure()
+            if self._popover.isShown():
+                self._popover.performClose_(None)
+                return
+            item = getattr(self._app, "_status_item", None)
+            btn = item.button() if item is not None else None
+            if btn is None:
+                return
+            try:
+                self._apply_status_to_vc()
+            except Exception:  # noqa: BLE001
+                pass
+            self._popover.showRelativeToRect_ofView_preferredEdge_(
+                btn.bounds(), btn, _MIN_Y_EDGE)
+
+        @objc.python_method
+        def close(self):
+            if self._popover is not None and self._popover.isShown():
+                self._popover.performClose_(None)
+
+        @objc.python_method
+        def _apply_status_to_vc(self):
+            """Recolor the status dot + text (and the toggle button title) from
+            the app's last state glyph. Pure main-thread label writes."""
+            vc = self._vc
+            if vc is None or not hasattr(vc, "_dot"):
+                return
+            glyph = getattr(self._app, "_last_glyph", None)
+            if glyph is None:
+                glyph = "🎙️" if getattr(self._app, "_tap_ok", True) else "⚠️"
+            if glyph == "🔴":
+                color, text, glow = GREEN, "Listening…", 0.9
+            elif glyph == "⏳":
+                color, text, glow = _rgb(1.0, 0.78, 0.35), "Transcribing…", 0.8
+            elif glyph == "⚠️":
+                color, text, glow = _rgb(1.0, 0.45, 0.4), \
+                    "Needs Input Monitoring", 0.0
+            else:
+                color, text, glow = _white(0.5), "Idle", 0.0
+            try:
+                dl = vc._dot.layer()
+                dl.setBackgroundColor_(color.CGColor())
+                if glow > 0:
+                    dl.setShadowColor_(color.CGColor())
+                    dl.setShadowRadius_(4.0)
+                    dl.setShadowOpacity_(float(glow))
+                    dl.setShadowOffset_(NSMakeSize(0.0, 0.0))
+                else:
+                    dl.setShadowOpacity_(0.0)
+                vc._status_text.setStringValue_(text)
+                if getattr(vc, "_toggle_btn", None) is not None:
+                    rec = bool(getattr(self._app, "recorder", None)
+                               and self._app.recorder.recording)
+                    vc._toggle_btn.setTitle_("Stop" if rec else "Start")
+            except Exception:  # noqa: BLE001
+                pass
+
+        # NSPopoverDelegate — nothing special; keep default transient behavior.
+        def popoverDidClose_(self, _note):
+            pass
+
+        # -- row actions (tag-dispatched; MAIN thread) ----------------------
+        def rowClicked_(self, sender):
+            try:
+                tag = int(sender.tag())
+            except Exception:  # noqa: BLE001
+                return
+            # Close first so opening a window (which activates the app) doesn't
+            # fight the transient popover, then perform the action.
+            self.close()
+            try:
+                app = self._app
+                if tag == 0:
+                    app._show_history_window()
+                elif tag == 1:
+                    app._show_transcribe_window()
+                elif tag == 2:
+                    threading.Thread(target=_teach_word_interactive,
+                                     daemon=True).start()
+                elif tag == 3:
+                    # Settings window is a separate screen; guard so a merge
+                    # ordering issue can never crash the popover.
+                    fn = getattr(app, "_show_settings_window", None)
+                    if callable(fn):
+                        fn()
+                    else:
+                        app._show_history_window()
+                elif tag == 100:
+                    self._do_restart()
+                elif tag == 101:
+                    self._do_quit()
+            except Exception:  # noqa: BLE001
+                pass
+
+        def toggleRecord_(self, _sender):
+            try:
+                app = self._app
+                if getattr(app, "recorder", None) and app.recorder.recording:
+                    app._end()
+                else:
+                    app._begin()
+                self._apply_status_to_vc()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Restart / Quit mirror _MenuActions.restart_ / quit_ exactly, so the
+        # popover and the classic menu behave identically.
+        @objc.python_method
+        def _do_restart(self):
+            try:
+                subprocess.Popen(
+                    ["/bin/sh", "-c", f'sleep 1; open -g "{APP_BUNDLE_PATH}"'],
+                    start_new_session=True)
+            except Exception:  # noqa: BLE001
+                pass
+            from Cocoa import NSApplication
+            NSApplication.sharedApplication().terminate_(None)
+
+        @objc.python_method
+        def _do_quit(self):
+            try:
+                subprocess.run(
+                    ["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT_LABEL}"],
+                    capture_output=True)
+            except Exception:  # noqa: BLE001
+                pass
+            from Cocoa import NSApplication
+            NSApplication.sharedApplication().terminate_(None)
+
+    _POPOVER_CTRL_CLASS = _PopoverController
+    return _POPOVER_CTRL_CLASS
+
+
 class FlowApp:
     def __init__(self, cfg: dict, transcriber):
         self.cfg = cfg
@@ -5374,6 +6057,9 @@ class FlowApp:
         self._menu = None          # NSMenu (retained so it isn't GC'd)
         self._menu_target = None   # _MenuActions instance (retained; action target)
         self._tap_ok = True        # False if Input Monitoring not yet granted
+        self._popover_ctrl = None  # _PopoverController (rich menu-bar popover; lazy)
+        self._last_glyph = None    # most recent state glyph, so the popover can
+                                   # colour its status dot to match the menu bar
 
     def _set_status(self, glyph: str, label: str) -> None:
         """Reflect the dictation state in the menu bar. No-op unless in app mode.
@@ -6211,6 +6897,35 @@ class FlowApp:
         except Exception as e:  # noqa: BLE001
             print(f"[flow] couldn't open the transcribe window: {e}", flush=True)
 
+    def _show_popover(self) -> None:
+        """Toggle the rich menu-bar popover (LEFT-click of the status glyph).
+        Built lazily. Transient + non-activating, so it never steals focus from
+        the app you're dictating into. Any failure falls back to the classic
+        menu so the app is never uncontrollable. Main-thread only."""
+        try:
+            if self._popover_ctrl is None:
+                self._popover_ctrl = (
+                    _popover_controller_class().alloc().initWithApp_(self))
+            self._popover_ctrl.toggle()
+        except Exception as e:  # noqa: BLE001
+            print(f"[flow] popover failed ({e}); showing the classic menu.",
+                  flush=True)
+            self._popup_menu()
+
+    def _popup_menu(self) -> None:
+        """Pop up the classic NSMenu on demand (control-click / right-click, or as
+        a fallback if the popover ever fails). The menu is built in _run_menubar
+        but deliberately NOT assigned as the status item's menu — assigning it
+        would make macOS auto-open it on every click and swallow the left-click we
+        need for the popover — so we present it manually here. Main-thread only."""
+        try:
+            item, menu = self._status_item, self._menu
+            if item is None or menu is None:
+                return
+            item.popUpStatusItemMenu_(menu)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _run_menubar(self) -> None:
         """Set up the menu-bar status item and run the NSApplication event loop.
         Blocks until the app is told to quit. Only called in app mode. Every
@@ -6254,6 +6969,24 @@ class FlowApp:
         except Exception:  # noqa: BLE001  very old AppKit fallback
             item.setTitle_(glyph)
 
+        # Route BOTH mouse buttons through our own action so we can decide
+        # popover-vs-menu ourselves (see _MenuActions.statusClicked_). We do NOT
+        # call item.setMenu_(menu) below: assigning a menu makes macOS auto-open
+        # it on every click and swallow the left-click we need for the popover.
+        # If wiring the button fails on very old AppKit, we fall back to the
+        # classic always-a-menu behaviour so the app stays controllable.
+        button_wired = False
+        try:
+            from Cocoa import NSEventMaskLeftMouseUp, NSEventMaskRightMouseUp
+            btn = item.button()
+            if btn is not None:
+                btn.setTarget_(target)
+                btn.setAction_("statusClicked:")
+                btn.sendActionOn_(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)
+                button_wired = True
+        except Exception:  # noqa: BLE001
+            button_wired = False
+
         menu = NSMenu.alloc().init()
         self._menu = menu
 
@@ -6280,7 +7013,13 @@ class FlowApp:
         _add("Privacy Settings…", "openPrivacy:")
         menu.addItem_(NSMenuItem.separatorItem())
         _add("Quit Wispr DIY", "quit:")
-        item.setMenu_(menu)
+        # Only bind the menu directly to the item as a LAST-RESORT fallback: if we
+        # couldn't wire the button's click action above, revert to the classic
+        # always-a-menu behaviour so the app is never uncontrollable. In the
+        # normal path we keep `menu` unassigned and present it manually from
+        # _popup_menu (control/right-click), leaving left-click for the popover.
+        if not button_wired:
+            item.setMenu_(menu)
 
         # We're on the main thread here, so paint the initial state directly.
         app.run()
