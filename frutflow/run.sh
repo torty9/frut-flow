@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot launcher: creates a virtualenv, installs deps, and starts Wispr DIY.
+# One-shot launcher: creates a virtualenv, installs deps, and starts früt Flow.
 # Usage:  ./run.sh          (run the app)
 #         ./run.sh --setup  (write config + show permissions)
 set -euo pipefail

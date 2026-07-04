@@ -27,5 +27,8 @@ Icon?
 # --- Local editor / agent / session config ---
 .claude/
 
+# --- Private local notes / research — never publish ---
+_local-notes/
+
 # --- Runtime data & logs (the real data lives in ~/.flowdictate, outside the repo) ---
 *.log

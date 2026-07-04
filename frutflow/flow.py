@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Wispr DIY — a local, private voice-dictation tool for macOS.
+früt Flow — a local, private voice-dictation tool for macOS.
 
 Hold a hotkey, speak, release. Your speech is transcribed *on your machine*
 and pasted into whatever app you're focused on. No subscription, no account,
 and (by default) no audio ever leaves your computer.
 
-This is a from-scratch alternative to Wispr Flow. It reproduces the core loop:
+The core loop:
     push-to-talk hotkey -> capture mic audio -> speech-to-text -> light cleanup
     -> insert text at the cursor of the active app.
 
@@ -44,6 +44,26 @@ import numpy as np
 CONFIG_DIR = Path.home() / ".flowdictate"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
+
+def _secure_dir() -> None:
+    """Create ~/.flowdictate as owner-only (0700). Everything we persist here —
+    learned vocabulary, corrections, dictation history, the log — is personal
+    content, so no other local user should be able to read it."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(CONFIG_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def _chmod_private(path: Path) -> None:
+    """Best-effort 0600 on a file we just wrote (owner read/write only)."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 SAMPLE_RATE = 16_000   # Whisper expects 16 kHz
 CHANNELS = 1
 
@@ -65,8 +85,8 @@ DEFAULT_CONFIG = {
     "transcribe_backend": "parakeet",  # "parakeet" (NVIDIA Parakeet via MLX,
                                  # runs on the M-series GPU — DEFAULT, ~6-12x
                                  # faster than faster-whisper AND more accurate,
-                                 # with native punctuation/caps), "local"
-                                 # (faster-whisper on CPU), or "openai" (cloud).
+                                 # with native punctuation/caps), or "local"
+                                 # (faster-whisper on CPU). Both run on-device.
                                  # If the parakeet backend fails to load for any
                                  # reason we fall back to "local" automatically.
     "parakeet_model": "mlx-community/parakeet-tdt-0.6b-v2",
@@ -132,18 +152,17 @@ DEFAULT_CONFIG = {
                                  # future transcriptions toward your vocabulary.
 
     # --- post-processing ---
-    "cleanup": "basic",          # "none" | "basic" | "llm" (Anthropic cloud) |
-                                 # "local" (on-device MLX: conservative, context-aware
-                                 # repair of MISHEARD words — homophones like there/their,
-                                 # "pier/peer", or a garbled term the sentence makes
-                                 # obvious. Fully offline, no API key, no cloud. Opt-in;
-                                 # the small model downloads on first use. It never
-                                 # paraphrases — see local_repair_* below.)
-    "llm_model": "claude-haiku-4-5-20251001",
+    "cleanup": "basic",          # "none" | "basic" | "local" (on-device MLX:
+                                 # conservative, context-aware repair of MISHEARD
+                                 # words — homophones like there/their, "pier/peer",
+                                 # or a garbled term the sentence makes obvious. Fully
+                                 # offline, no API key, no cloud. Opt-in; the small
+                                 # model downloads on first use. It never paraphrases
+                                 # — see local_repair_* below.)
     "local_repair_model": "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
                                  # on-device model used when cleanup=="local". ~0.9 GB
                                  # one-time download to ~/.cache/huggingface; ~1.2 GB RAM
-                                 # once loaded (only paid when you opt in). Drop-in swaps:
+                                 # once loaded (only incurred when you opt in). Drop-in swaps:
                                  #   mlx-community/Llama-3.2-1B-Instruct-4bit  (~0.7 GB, lighter)
                                  #   mlx-community/Qwen2.5-3B-Instruct-4bit    (~1.8 GB, sharper)
     "local_repair_temperature": 0.0,   # 0.0 = greedy/deterministic (safest, reproducible)
@@ -170,7 +189,7 @@ DEFAULT_CONFIG = {
                                  # "clipboard" (copy only, no Accessibility)
     "restore_clipboard": True,   # put your old clipboard back after pasting
     "auto_space": True,          # prepend a space so dictation merges naturally
-                                 # with text already in the field (Wispr-style)
+                                 # with text already in the field
 
     # --- voice undo ("never mind") ---
     "undo_enabled": True,        # if a whole dictation is just an undo phrase (below),
@@ -203,23 +222,43 @@ DEFAULT_CONFIG = {
 }
 
 
+def _coerce_like(default, value):
+    """Accept a user config value only if it matches the shape of the default,
+    so a hand-edited config with e.g. "max_record_seconds": "oops" can't crash the
+    dictation loop later — we fall back to the default instead. Returns a sentinel
+    (the default) when the value is unusable."""
+    if isinstance(default, bool):
+        return value if isinstance(value, bool) else default
+    if isinstance(default, int):        # (bool already handled above)
+        return value if isinstance(value, int) and not isinstance(value, bool) else default
+    if isinstance(default, float):
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+    if isinstance(default, str):
+        return value if isinstance(value, str) else default
+    return value                        # lists/dicts/None: pass through untouched
+
+
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         try:
             user = json.loads(CONFIG_PATH.read_text())
-            cfg.update({k: v for k, v in user.items() if k in DEFAULT_CONFIG})
-        except (json.JSONDecodeError, OSError) as e:
+            if isinstance(user, dict):
+                for k, v in user.items():
+                    if k in DEFAULT_CONFIG:
+                        cfg[k] = _coerce_like(DEFAULT_CONFIG[k], v)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
             print(f"[flow] WARNING: could not read {CONFIG_PATH}: {e}")
     return cfg
 
 
 def write_default_config() -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _secure_dir()
     if CONFIG_PATH.exists():
         print(f"[flow] config already exists at {CONFIG_PATH} (leaving it as-is)")
         return
     CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+    _chmod_private(CONFIG_PATH)
     print(f"[flow] wrote default config to {CONFIG_PATH}")
 
 
@@ -400,47 +439,6 @@ class LocalTranscriber:
         return " ".join(seg.text.strip() for seg in segments).strip()
 
 
-class OpenAITranscriber:
-    """Optional cloud back-end (Whisper API). Needs OPENAI_API_KEY."""
-
-    def __init__(self, language: str, *, normalize: bool = True,
-                 normalize_peak: float = 0.95, normalize_method: str = "rms",
-                 normalize_rms_dbfs: float = -20.0):
-        from openai import OpenAI
-        self.client = OpenAI()
-        self.language = language
-        self.normalize = normalize
-        self.normalize_peak = normalize_peak
-        self.normalize_method = normalize_method
-        self.normalize_rms_dbfs = normalize_rms_dbfs
-
-    def transcribe(self, audio: np.ndarray, prompt: str | None = None,
-                   hotwords: str | None = None) -> str:
-        import io
-        import wave
-        # whisper-1 only exposes `prompt`, so fold any hotwords into it.
-        prompt = " ".join(p for p in (prompt, hotwords) if p) or None
-        if self.normalize:
-            audio = normalize_audio(audio, method=self.normalize_method,
-                                    peak=self.normalize_peak,
-                                    rms_dbfs=self.normalize_rms_dbfs)
-        pcm16 = np.clip(audio, -1.0, 1.0)
-        pcm16 = (pcm16 * 32767).astype(np.int16)
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(pcm16.tobytes())
-        buf.seek(0)
-        buf.name = "audio.wav"
-        resp = self.client.audio.transcriptions.create(
-            model="whisper-1", file=buf, language=self.language,
-            prompt=(prompt or None),
-        )
-        return resp.text.strip()
-
-
 def _hf_repo_cached(repo_id: str) -> bool:
     """True if a Hugging Face repo already has a local snapshot, so we can load it
     fully offline (no network round-trip / no hang when disconnected)."""
@@ -617,15 +615,16 @@ class ParakeetTranscriber:
 
 def build_transcriber(cfg: dict):
     backend = cfg.get("transcribe_backend", "parakeet")
+    # Only on-device engines are supported. Anything else (e.g. a legacy
+    # "openai" config from an older version) falls back to the best free default.
+    if backend not in ("parakeet", "local"):
+        backend = "parakeet"
     norm_kwargs = dict(
         normalize=cfg.get("normalize_audio", True),
         normalize_peak=cfg.get("normalize_peak", 0.95),
         normalize_method=cfg.get("normalize_method", "rms"),
         normalize_rms_dbfs=cfg.get("normalize_rms_dbfs", -20.0),
     )
-
-    if backend == "openai":
-        return OpenAITranscriber(cfg["language"], **norm_kwargs)
 
     if backend == "parakeet":
         try:
@@ -705,7 +704,9 @@ def learn_vocab(text: str) -> None:
                             key=lambda kv: kv[1].get("count", 0),
                             reverse=True)[:400])
     try:
+        _secure_dir()
         VOCAB_PATH.write_text(json.dumps(vocab))
+        _chmod_private(VOCAB_PATH)
     except OSError:
         pass
 
@@ -721,8 +722,9 @@ def add_correction(heard: str, correct: str, *, silent: bool = False) -> None:
         return
     corr = load_corrections()
     corr[heard] = correct
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _secure_dir()
     CORRECTIONS_PATH.write_text(json.dumps(corr, indent=2) + "\n")
+    _chmod_private(CORRECTIONS_PATH)
     if not silent:
         print(f"[flow] correction saved: '{heard}' -> '{correct}'  ({CORRECTIONS_PATH})")
         print("[flow] (takes effect on your next dictation — no restart needed)")
@@ -759,7 +761,7 @@ def _atomic_write_json(path: Path, obj) -> None:
     rename — a cross-device replace would raise), flush+fsync, then replace.
     Caller holds _HISTORY_LOCK. Re-raises on failure (its only callers guard it)."""
     import tempfile
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _secure_dir()
     payload = json.dumps(obj, ensure_ascii=False)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent),
                                prefix=path.name + ".", suffix=".tmp")
@@ -1196,7 +1198,8 @@ def learn_from_edit(el, pasted: str, *, max_learn: int = 3) -> int:
 # ---------------------------------------------------------------------------
 
 # Conservative: only strip true vocal fillers. Whisper already punctuates and
-# capitalizes, so we don't try to rewrite meaning (that's what "llm" mode is for).
+# capitalizes, so we don't try to rewrite meaning (the on-device "local" repair
+# mode handles misheard words; basic cleanup never touches word identity).
 _FILLER_RE = re.compile(
     r"\b(?:u+h+|u+m+|a+h+|e+h+|e+r+m*|hm+|mm+-?hmm+|uh-huh)\b[,.]?",
     re.IGNORECASE,
@@ -1213,10 +1216,10 @@ def basic_cleanup(text: str) -> str:
 
 
 def _context_blocks(context: dict | None) -> str:
-    """The shared '<known_spellings>' / '<active_app>' suffix injected into both the
-    cloud (llm_cleanup) and on-device (local_repair) prompts. Biasing the model toward
-    your canonical spellings is what lets it prefer 'Vercel'/'früt' when it does touch a
-    garbled proper noun. Returns '' when there's nothing to add."""
+    """The shared '<known_spellings>' / '<active_app>' suffix injected into the
+    on-device local_repair prompt. Biasing the model toward your canonical spellings
+    is what lets it prefer 'Vercel'/'früt' when it does touch a garbled proper noun.
+    Returns '' when there's nothing to add."""
     context = context or {}
     blocks = []
     glossary = distinctive_terms(max_terms=60)
@@ -1226,45 +1229,6 @@ def _context_blocks(context: dict | None) -> str:
     if context.get("app"):
         blocks.append(f"<active_app>{context['app']}</active_app>")
     return ("\n\n" + "\n".join(blocks)) if blocks else ""
-
-
-def llm_cleanup(text: str, cfg: dict, context: dict | None = None) -> str:
-    """Polish dictation with a fast Anthropic model — FORMATTING ONLY, never
-    rewriting your words. Needs ANTHROPIC_API_KEY.
-
-    The prompt is built from the research consensus on why cloud tools feel more
-    accurate than raw Whisper AND why they get the "the AI rewrote what I said"
-    complaint: the cleanup layer must fix punctuation/casing/fillers but must NOT
-    second-guess word identity (that's the recognizer's job). We also inject your
-    known spellings (so it prefers them) and the active app (for tone)."""
-    from anthropic import Anthropic
-    client = Anthropic()
-    ctx = _context_blocks(context)
-
-    system = (
-        "You are a transcription editor for a voice-dictation tool. You receive a "
-        "raw speech-to-text transcript and return it lightly cleaned up.\n"
-        "HARD RULES:\n"
-        "1. NEVER change the meaning, wording, or intent. You are not an assistant: "
-        "do not answer questions, add content, or paraphrase.\n"
-        "2. NEVER 'fix' a word you think was misheard by swapping in a different "
-        "word. Word identity belongs to the speech recognizer, not you.\n"
-        "3. DO fix punctuation, capitalization, and spacing; remove filler words "
-        "(um, uh, like, you know) and false starts/stutters; honor an explicit "
-        "spoken self-correction ('no wait, make that…', 'scratch that').\n"
-        "4. If a word matches one of the user's known spellings below, prefer that "
-        "exact spelling.\n"
-        "5. Keep the tone the user dictated. Output ONLY the cleaned text — no "
-        "preamble, no quotes, no commentary." + ctx
-    )
-    msg = client.messages.create(
-        model=cfg.get("llm_model", "claude-haiku-4-5-20251001"),
-        max_tokens=4096,   # headroom so long dictation isn't silently truncated
-        temperature=0.2,
-        system=system,
-        messages=[{"role": "user", "content": text}],
-    )
-    return "".join(b.text for b in msg.content if b.type == "text").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1439,12 +1403,6 @@ def clean(text: str, cfg: dict, context: dict | None = None, gpu_lock=None) -> s
     mode = cfg["cleanup"]
     if mode == "none":
         out = text
-    elif mode == "llm":
-        try:
-            out = llm_cleanup(text, cfg, context)
-        except Exception as e:  # noqa: BLE001  fall back, never lose the words
-            print(f"[flow] llm cleanup failed ({e}); using basic cleanup.")
-            out = basic_cleanup(text)
     elif mode == "local":
         # On-device context repair. basic_cleanup FIRST (deterministic fillers/punct/
         # casing) so the model sees clean prose and does exactly ONE job: word repair.
@@ -1680,7 +1638,7 @@ def insert_text(text: str, cfg: dict) -> bool:
 
     if cfg["insert_method"] == "clipboard":
         # Copy only — needs NO Accessibility permission. You press Cmd-V to
-        # paste. The most permission-light way to get text out of Wispr DIY.
+        # paste. The most permission-light way to get text out of früt Flow.
         _pbcopy(text)
         print("[flow] ✓ copied to clipboard — press Cmd-V to paste it.")
         return False
@@ -1854,9 +1812,9 @@ def _trust_probe() -> None:
 # the CLI paths (--correct, --try, …) never pay for them.
 # ---------------------------------------------------------------------------
 
-APP_BUNDLE_PATH = "/Users/thorstenpfeiffer/Applications/frutflow.app"
+APP_BUNDLE_PATH = str(Path.home() / "Applications" / "frutflow.app")
 APP_BUNDLE_ID = "com.frutflow.dictation"
-AGENT_LABEL = "com.wisprdiy.dictation"
+AGENT_LABEL = "com.frutflow.dictation"
 
 
 def _teach_word_interactive() -> None:
@@ -1871,7 +1829,7 @@ def _teach_word_interactive() -> None:
         script = (
             'try\n'
             f'  set r to text returned of (display dialog {json.dumps(prompt, ensure_ascii=False)} '
-            f'default answer "" with title "Teach Wispr DIY" '
+            f'default answer "" with title "Teach früt Flow" '
             f'buttons {{"Cancel", "{btn}"}} default button "{btn}")\n'
             '  return r\n'
             'on error\n  return ""\nend try'
@@ -1883,7 +1841,7 @@ def _teach_word_interactive() -> None:
         except Exception:  # noqa: BLE001
             return ""
 
-    heard = _ask("Teach Wispr DIY a fix.\n\nWhat did it type WRONG?  "
+    heard = _ask("Teach früt Flow a fix.\n\nWhat did it type WRONG?  "
                  "(the word it got wrong)")
     if not heard:
         return
@@ -1895,12 +1853,12 @@ def _teach_word_interactive() -> None:
     except Exception as e:  # noqa: BLE001
         print(f"[flow] teach-a-word failed: {e}", flush=True)
         return
-    msg = (f'Saved. Wispr DIY will now type "{correct}" instead of "{heard}" '
+    msg = (f'Saved. früt Flow will now type "{correct}" instead of "{heard}" '
            'from your next dictation on.')
     try:
         subprocess.run(["osascript", "-e",
                         f'display dialog {json.dumps(msg, ensure_ascii=False)} '
-                        'with title "Wispr DIY" '
+                        'with title "früt Flow" '
                         'buttons {"Great"} default button "Great"'],
                        capture_output=True, text=True, timeout=120)
     except Exception:  # noqa: BLE001
@@ -4811,8 +4769,8 @@ def _settings_controller_class():
             inner, h = self._card_at(pane, y, 4)
             self._row_text(inner, 0, "Transcription engine",
                            "Parakeet runs on the Apple-Silicon GPU", right_x=230.0)
-            self._add_segment(inner, 0, ("Parakeet", "Whisper", "Cloud"),
-                              ("parakeet", "local", "openai"),
+            self._add_segment(inner, 0, ("Parakeet", "Whisper"),
+                              ("parakeet", "local"),
                               self._cfg("transcribe_backend", "parakeet"),
                               cfg_key="transcribe_backend", seg_w=66.0)
             self._row_divider(inner, 1)
@@ -4827,8 +4785,8 @@ def _settings_controller_class():
             self._row_text(inner, 2, "Cleanup",
                            "How much to tidy the text", right_x=220.0)
             self._add_segment(inner, 2,
-                              ("None", "Basic", "AI polish", "On-device"),
-                              ("none", "basic", "llm", "local"),
+                              ("None", "Basic", "On-device"),
+                              ("none", "basic", "local"),
                               self._cfg("cleanup", "basic"),
                               cfg_key="cleanup", seg_w=None)
             self._row_divider(inner, 3)
@@ -4921,8 +4879,9 @@ def _settings_controller_class():
                  "The engine that turns speech into text. “Parakeet” "
                  "runs on your Apple-Silicon GPU — fast, private, and "
                  "recommended. “Whisper” is an alternative on-device "
-                 "model. “Cloud” sends audio to OpenAI: very accurate, "
-                 "but your voice leaves the Mac."),
+                 "model. Both run entirely on your Mac — your voice never "
+                 "leaves the device, and neither engine needs an account or "
+                 "API key."),
                 ("Language model",
                  "Which Parakeet model to load. “English” is tuned for "
                  "English only; “Multilingual” understands about 25 "
@@ -4931,9 +4890,8 @@ def _settings_controller_class():
                  "How much früt Flow tidies the raw transcript before inserting "
                  "it. “None” inserts it word-for-word. “Basic” "
                  "fixes spacing, capitalization, and words you've taught it. "
-                 "“AI polish” uses a cloud model to smooth grammar. "
                  "“On-device” uses a local model to fix misheard words "
-                 "from context — no cloud, still private."),
+                 "from context — no cloud, no API key, still private."),
                 ("Normalize audio",
                  "Boosts quiet or whispered speech before transcription so soft "
                  "talking is still picked up clearly. Leave it on unless your "
@@ -5190,7 +5148,7 @@ def _settings_controller_class():
             try:
                 r = subprocess.run(
                     ["launchctl", "print",
-                     f"gui/{os.getuid()}/com.wisprdiy.dictation"],
+                     f"gui/{os.getuid()}/{AGENT_LABEL}"],
                     capture_output=True, timeout=3)
                 return r.returncode == 0
             except Exception:  # noqa: BLE001
@@ -6785,9 +6743,10 @@ class FlowApp:
         # Auto-learn-from-edits: a handle on the field we last pasted into, so we
         # can diff your correction against it. None when nothing is pending.
         self._pending_learn: dict | None = None
-        # Voice-undo ("never mind"): a stack of the EXACT strings we inserted, most
-        # recent last. Saying an undo phrase pops the top and backspaces over it.
-        self._undo_stack: list[str] = []
+        # Voice-undo ("never mind"): a stack of (EXACT string we inserted, name of
+        # the app it was inserted into), most recent last. Saying an undo phrase pops
+        # the top and backspaces over it — but only if focus is still in that app.
+        self._undo_stack: list[tuple[str, str | None]] = []
         # "Transcribe an audio file" window (built lazily on first open).
         self._transcribe_ctrl = None
         # "History" window — the app's home page (built lazily on first open).
@@ -6866,7 +6825,7 @@ class FlowApp:
             except Exception as e:  # noqa: BLE001  mic failed even after reinit
                 print(f"[flow] could not open the microphone: {e} — try again "
                       "in a moment (if it persists, check System Settings ▸ "
-                      "Privacy ▸ Microphone or restart Wispr DIY).", flush=True)
+                      "Privacy ▸ Microphone or restart früt Flow).", flush=True)
                 play("Basso", self.cfg)
                 return
             self._record_started = time.monotonic()
@@ -6950,7 +6909,7 @@ class FlowApp:
                 hotwords = build_hotwords(self.cfg)
             # Only pay for context capture when a cleanup model will use it (tone hint).
             context = ({"app": _focused_app_name()}
-                       if self.cfg.get("cleanup") in ("llm", "local") else None)
+                       if self.cfg.get("cleanup") == "local" else None)
             with self._transcribe_lock:   # never overlap with the file-transcribe window
                 raw = self.transcriber.transcribe(audio, prompt=prompt,
                                                   hotwords=hotwords)
@@ -6971,8 +6930,8 @@ class FlowApp:
                 if prev_delete or kept != text:
                     self._apply_undo_result(kept, prev_delete)
                     return
-            # Wispr-style natural merge: lead with a space so the dictation
-            # doesn't glue onto whatever word is already left of the cursor.
+            # Natural merge: lead with a space so the dictation doesn't glue
+            # onto whatever word is already left of the cursor.
             to_insert = (" " + text) if self.cfg.get("auto_space", True) else text
             delivered = insert_text(to_insert, self.cfg)
             # Close the perception loop: a subtle (quiet) cue when text actually
@@ -7020,10 +6979,11 @@ class FlowApp:
                     record_history(text, app=None, delivered=False)
 
     def _remember_insertion(self, inserted: str) -> None:
-        """Push the EXACT string we just inserted onto the undo stack (bounded), so a
-        later 'never mind' can backspace it away."""
+        """Push the EXACT string we just inserted, tagged with the app we inserted it
+        into, onto the undo stack (bounded), so a later 'never mind' can backspace it
+        away — and can refuse if focus has since moved to a different app."""
         with self._state_lock:
-            self._undo_stack.append(inserted)
+            self._undo_stack.append((inserted, _focused_app_name()))
             if len(self._undo_stack) > 25:
                 self._undo_stack.pop(0)
 
@@ -7080,6 +7040,14 @@ class FlowApp:
 
         if not last:
             return _refuse("(never mind — but nothing to undo)", put_back=False)
+        last_text, last_app = last
+        # SAFETY (app identity): only backspace if focus is still in the SAME app we
+        # dictated into. Otherwise 'never mind' — said to yourself after clicking into
+        # a terminal/editor — would eat that app's text. Refuse on any app change.
+        cur_app = _focused_app_name()
+        if last_app is not None and cur_app is not None and cur_app != last_app:
+            return _refuse(f"never mind — focus moved to {cur_app!r}; leaving your "
+                           f"text in {last_app!r} untouched.")
         # Deleting uses synthetic keystrokes, same as paste: needs Accessibility and
         # is blocked by Secure Input.
         if not _ax_trusted() or _secure_input_active():
@@ -7092,10 +7060,10 @@ class FlowApp:
         # than backspace into unrelated text. Delete exactly the MATCHED tail so the
         # count is right even when a boundary space was trimmed. When the app is
         # opaque to AX (val is None), delete best-effort.
-        tail = last
+        tail = last_text
         val = _ax_read_value(_ax_focused_element())
         if val is not None:
-            tail = next((c for c in (last, last.rstrip(), last.lstrip(), last.strip())
+            tail = next((c for c in (last_text, last_text.rstrip(), last_text.lstrip(), last_text.strip())
                          if c and val.endswith(c)), None)
             if tail is None:
                 return _refuse("never mind — the last dictation was changed; leaving it as is.")
@@ -7269,7 +7237,7 @@ class FlowApp:
                 print("[flow] WARNING: a transcription has been running for "
                       f">{self._max_processing:.0f}s — it may be stuck. New "
                       "dictations are still being recorded and queued. If text "
-                      "stops appearing, restart Wispr DIY.", flush=True)
+                      "stops appearing, restart früt Flow.", flush=True)
 
     # -- low-level Quartz tap callback ---------------------------------------
 
@@ -7601,7 +7569,7 @@ class FlowApp:
         shown_model = (self.cfg.get("parakeet_model", "") if backend == "parakeet"
                        else self.cfg["model"])
         print("=" * 60)
-        print("  Wispr DIY is running.")
+        print("  früt Flow is running.")
         print(f"  {verb} [{self.hotkey_name}] to dictate. Ctrl-C to quit.")
         print(f"  backend={backend} model={shown_model} "
               f"cleanup={self.cfg['cleanup']}")
@@ -7669,7 +7637,7 @@ class FlowApp:
             self._activity_token = (
                 NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
                     Foundation.NSActivityUserInitiatedAllowingIdleSystemSleep,
-                    "Wispr DIY listens for the dictation hotkey"))
+                    "früt Flow listens for the dictation hotkey"))
         except Exception:  # noqa: BLE001  cosmetic-level optimization only
             self._activity_token = None
 
@@ -7918,7 +7886,7 @@ class FlowApp:
             menu.addItem_(it)
             return it
 
-        _add("Wispr DIY", None, enabled=False)
+        _add("früt Flow", None, enabled=False)
         self._status_line = _add(label, None, enabled=False)
         menu.addItem_(NSMenuItem.separatorItem())
         _add("History…", "historyWindow:")
@@ -7931,7 +7899,7 @@ class FlowApp:
         _add("Open Log", "openLog:")
         _add("Privacy Settings…", "openPrivacy:")
         menu.addItem_(NSMenuItem.separatorItem())
-        _add("Quit Wispr DIY", "quit:")
+        _add("Quit früt Flow", "quit:")
         # Only bind the menu directly to the item as a LAST-RESORT fallback: if we
         # couldn't wire the button's click action above, revert to the classic
         # always-a-menu behaviour so the app is never uncontrollable. In the
@@ -7980,7 +7948,7 @@ def ensure_microphone_access() -> None:
         return
     if status in (1, 2):
         print("[flow] microphone access is OFF. Turn it on in System Settings "
-              "▸ Privacy & Security ▸ Microphone, then restart Wispr DIY.",
+              "▸ Privacy & Security ▸ Microphone, then restart früt Flow.",
               flush=True)
         return
 
@@ -8024,7 +7992,11 @@ def _load_audio_file(path: str) -> np.ndarray | None:
     if not src.exists():
         print(f"[flow] file not found: {src}")
         return None
-    tmp = Path(tempfile.gettempdir()) / f"wisprdiy_in_{os.getpid()}.wav"
+    # mkstemp gives a fresh 0600 file with an unpredictable name (O_EXCL), so a
+    # local attacker can't pre-plant a symlink at a guessable /tmp path.
+    _fd, _tmp = tempfile.mkstemp(prefix="frutflow_in_", suffix=".wav")
+    os.close(_fd)
+    tmp = Path(_tmp)
     try:
         subprocess.run(
             ["afconvert", "-f", "WAVE", "-d", f"LEI16@{SAMPLE_RATE}", "-c", "1",
@@ -8161,7 +8133,7 @@ def main() -> int:
             _stream.reconfigure(line_buffering=True)
         except Exception:  # noqa: BLE001
             pass
-    parser = argparse.ArgumentParser(description="Wispr DIY — local voice dictation")
+    parser = argparse.ArgumentParser(description="früt Flow — local voice dictation")
     parser.add_argument("--setup", action="store_true",
                         help="write default config + print permission help")
     parser.add_argument("--list-devices", action="store_true",
@@ -8231,8 +8203,10 @@ def main() -> int:
 
     if args.try_text is not None:
         cfg = load_config()
-        # Don't hit the network for a dry run — force the deterministic path.
-        if cfg.get("cleanup") == "llm":
+        # Keep the dry run fast and side-effect-free: skip model-based cleanup so
+        # --try just exercises the deterministic fuzzy/correction layer (and never
+        # triggers the one-time local-model download).
+        if cfg.get("cleanup") in ("llm", "local"):
             cfg["cleanup"] = "basic"
         print("in : " + args.try_text)
         print("out: " + clean(args.try_text, cfg))

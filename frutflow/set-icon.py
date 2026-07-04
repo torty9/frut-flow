@@ -14,7 +14,7 @@ from pathlib import Path
 
 from AppKit import NSImage, NSWorkspace
 
-APP = "/Users/thorstenpfeiffer/Applications/frutflow.app"
+APP = str(Path.home() / "Applications" / "frutflow.app")
 DEFAULT_ICON = Path(__file__).resolve().parent / "assets" / "frut-flow-icon.png"
 
 

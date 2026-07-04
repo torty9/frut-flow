@@ -22,13 +22,12 @@
   "learn_window_seconds": 20,
 
   "cleanup": "basic",
-  "llm_model": "claude-haiku-4-5-20251001",
 
   "insert_method": "paste",
   "restore_clipboard": true,
 
   "play_sounds": true,
-  "show_hud": false,
+  "show_hud": true,
   "min_seconds": 0.3,
   "max_record_seconds": 120,
   "warn_before_max_seconds": 10,
