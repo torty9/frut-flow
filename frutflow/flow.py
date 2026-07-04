@@ -649,6 +649,150 @@ def apply_corrections(text: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Dictation history  (~/.flowdictate/history.json)
+#
+# Pure-Python, AppKit-free, worker-thread-safe. Every finalized dictation is
+# appended best-effort; a failure here must NEVER propagate into the paste path.
+# Entry shape: {"text": str, "ts": float, "app": str|None, "words": int,
+#               "delivered": bool}. Stored OLDEST-first on disk (cheap append +
+# slice cap); load_history() returns NEWEST-first for the UI. Capped at the last
+# HISTORY_CAP entries — your last hundred dictations.
+# ---------------------------------------------------------------------------
+HISTORY_PATH = CONFIG_DIR / "history.json"
+HISTORY_CAP = 100
+_HISTORY_LOCK = threading.Lock()   # serialize worker append vs. clear vs. itself
+
+
+def _atomic_write_json(path: Path, obj) -> None:
+    """Write JSON so a concurrent reader never sees a torn file: serialize to a
+    temp file IN THE SAME DIRECTORY (so os.replace is a same-filesystem atomic
+    rename — a cross-device replace would raise), flush+fsync, then replace.
+    Caller holds _HISTORY_LOCK. Re-raises on failure (its only callers guard it)."""
+    import tempfile
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(obj, ensure_ascii=False)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent),
+                               prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)          # atomic on the same filesystem; no torn reads
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_history() -> list:
+    """Return the dictation history, NEWEST-FIRST (index 0 is most recent).
+    Never raises: a missing or corrupt file yields []. Because the file is only
+    ever swapped in atomically, a lock-free read can never see a partial write.
+    Defensively drops any entry that isn't a well-formed dict with text."""
+    data = _read_json(HISTORY_PATH, [])
+    if not isinstance(data, list):
+        return []
+    good = [e for e in data if isinstance(e, dict) and isinstance(e.get("text"), str)]
+    return list(reversed(good))        # disk oldest-first -> newest-first for UI
+
+
+def record_history(text: str, app: "str | None" = None, delivered: bool = True) -> None:
+    """Append one finalized dictation (best-effort, thread-safe, atomic, capped).
+    NEVER raises into the caller: runs on the dictation worker thread and must
+    not be able to break a paste. Any failure is swallowed."""
+    try:
+        text = (text or "").strip()
+        if not text:
+            return
+        entry = {
+            "text": text,
+            "ts": time.time(),
+            "app": app,
+            "words": len(text.split()),
+            "delivered": bool(delivered),
+        }
+        with _HISTORY_LOCK:
+            data = _read_json(HISTORY_PATH, [])
+            if not isinstance(data, list):
+                data = []
+            data.append(entry)                  # oldest-first on disk
+            if len(data) > HISTORY_CAP:
+                data = data[-HISTORY_CAP:]       # keep the LAST N
+            _atomic_write_json(HISTORY_PATH, data)
+    except Exception:  # noqa: BLE001  history is a nicety; never break dictation
+        pass
+
+
+def clear_history() -> None:
+    """Empty the history atomically (write [] rather than unlink, so a reader
+    mid-flight still sees a valid file). Best-effort; never raises."""
+    try:
+        with _HISTORY_LOCK:
+            _atomic_write_json(HISTORY_PATH, [])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def pop_history_matching(text: str) -> None:
+    """Remove the NEWEST history entry whose text matches this just-retracted
+    dictation — a 'never mind' backspaced it out of the target app, so it should
+    no longer appear in History. Matched by CONTENT (not position) because the
+    history log and the undo stack can diverge: clipboard-only and error-path
+    dictations are recorded but never pushed onto the undo stack. Best-effort;
+    never raises (called from the dictation worker thread)."""
+    try:
+        t = (text or "").strip()
+        if not t:
+            return
+        with _HISTORY_LOCK:
+            data = _read_json(HISTORY_PATH, [])
+            if not isinstance(data, list):
+                return
+            for i in range(len(data) - 1, -1, -1):   # disk is oldest-first; scan newest
+                e = data[i]
+                if isinstance(e, dict) and str(e.get("text", "")).strip() == t:
+                    del data[i]
+                    _atomic_write_json(HISTORY_PATH, data)
+                    return
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def relative_time(ts, now: "float | None" = None) -> str:
+    """iOS-style relative label: 'just now' / '2m ago' / '3h ago' / 'yesterday'
+    / '4d ago' / a short date. Pure; trivially unit-testable. Never raises."""
+    try:
+        now = time.time() if now is None else float(now)
+        d = now - float(ts)
+        if d < 0:
+            d = 0.0
+        if d < 45:
+            return "just now"
+        if d < 3600:
+            return f"{int(round(d / 60)) or 1}m ago"
+        if d < 86400:
+            return f"{int(d // 3600)}h ago"
+        # Calendar-aware day bucketing so "yesterday" means the prior calendar day.
+        a = time.localtime(now)
+        b = time.localtime(ts)
+
+        def _midnight(t):
+            return time.mktime((t.tm_year, t.tm_mon, t.tm_mday,
+                                0, 0, 0, 0, 0, -1))
+        day = int(round((_midnight(a) - _midnight(b)) / 86400))
+        if day <= 1:
+            return "yesterday"
+        if day < 7:
+            return f"{day}d ago"
+        return time.strftime("%b %-d", b)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def build_learned_prompt(cfg: dict) -> str:
     """Whisper initial_prompt biased toward YOUR words: config primer +
     correction targets + most-used distinctive vocabulary (length-capped).
@@ -1550,13 +1694,19 @@ def _menu_actions_class():
             except Exception:  # noqa: BLE001
                 pass
 
+        def historyWindow_(self, sender):
+            try:
+                self._app._show_history_window()
+            except Exception:  # noqa: BLE001
+                pass
+
         # NSApplication delegate: fires when you double-click the app (or click its
         # Dock icon) while it's ALREADY running. A menu-bar app has no main window,
         # so without this "opening" the app does nothing visible — here we open the
-        # transcribe window so it behaves like a normal app you can open.
+        # History window (the home page) so it behaves like a normal app you open.
         def applicationShouldHandleReopen_hasVisibleWindows_(self, app, flag):
             try:
-                self._app._show_transcribe_window()
+                self._app._show_history_window()
             except Exception:  # noqa: BLE001
                 pass
             return True
@@ -1589,6 +1739,199 @@ def _menu_actions_class():
     return _MENU_ACTIONS_CLASS
 
 
+# ---------------------------------------------------------------------------
+# Liquid-glass UI helpers, shared by the History + Transcribe windows.
+# All AppKit imports are deferred so CLI paths never load Cocoa. Every newer API
+# (continuous corner curve, SF-Rounded font design, some materials) is
+# version-guarded: an older macOS degrades to a plain-but-fine look, not a crash.
+# ---------------------------------------------------------------------------
+_GLASS = None
+
+
+def _glass():
+    """Lazily build & cache the glass helper namespace (a class with static
+    methods + resolved constants)."""
+    global _GLASS
+    if _GLASS is not None:
+        return _GLASS
+
+    from Cocoa import (
+        NSView, NSVisualEffectView, NSColor, NSFont,
+        NSMakeRect, NSMakeSize,
+        NSViewWidthSizable, NSViewHeightSizable,
+    )
+
+    # Vibrancy material / blend / state — import by name, fall back to the stable
+    # raw enum values (an unimported constant is a runtime NameError, not compile).
+    try:
+        from Cocoa import (
+            NSVisualEffectMaterialUnderWindowBackground as _MAT_WINDOW,
+            NSVisualEffectMaterialSidebar as _MAT_SIDEBAR,
+            NSVisualEffectMaterialPopover as _MAT_CARD,
+            NSVisualEffectMaterialHeaderView as _MAT_HEADER,
+            NSVisualEffectBlendingModeBehindWindow as _BLEND_BEHIND,
+            NSVisualEffectBlendingModeWithinWindow as _BLEND_WITHIN,
+            NSVisualEffectStateActive as _STATE_ACTIVE,
+        )
+    except ImportError:  # pragma: no cover — very old pyobjc
+        _MAT_WINDOW, _MAT_SIDEBAR, _MAT_CARD, _MAT_HEADER = 21, 7, 6, 10
+        _BLEND_BEHIND, _BLEND_WITHIN, _STATE_ACTIVE = 0, 1, 1
+
+    # SF-Rounded design token (macOS 10.15+).
+    try:
+        from Cocoa import NSFontDescriptorSystemDesignRounded as _ROUNDED
+    except ImportError:  # pragma: no cover
+        _ROUNDED = None
+
+    # Continuous "squircle" corner curve. On this pyobjc it lives in Quartz; the
+    # KVC string value 'continuous' is an equivalent fallback.
+    _CURVE = None
+    try:
+        from Quartz import kCACornerCurveContinuous as _CURVE
+    except Exception:  # noqa: BLE001
+        _CURVE = "continuous"
+
+    _SIZABLE = NSViewWidthSizable | NSViewHeightSizable
+    _rounded_cache = {}
+
+    class _Glass:
+        MAT_WINDOW, MAT_SIDEBAR = _MAT_WINDOW, _MAT_SIDEBAR
+        MAT_CARD, MAT_HEADER = _MAT_CARD, _MAT_HEADER
+        BLEND_BEHIND, BLEND_WITHIN, STATE_ACTIVE = _BLEND_BEHIND, _BLEND_WITHIN, _STATE_ACTIVE
+
+        @staticmethod
+        def rounded_font(size, weight=0.0):
+            """SF Rounded at size/weight (the iOS vibe); falls back to the plain
+            system font where the rounded design is unavailable. Cached."""
+            key = (round(float(size), 1), float(weight))
+            f = _rounded_cache.get(key)
+            if f is not None:
+                return f
+            base = NSFont.systemFontOfSize_weight_(size, weight)
+            out = base
+            if _ROUNDED is not None:
+                try:
+                    desc = base.fontDescriptor().fontDescriptorWithDesign_(_ROUNDED)
+                    if desc is not None:
+                        r = NSFont.fontWithDescriptor_size_(desc, size)
+                        if r is not None:
+                            out = r
+                except Exception:  # noqa: BLE001
+                    out = base
+            _rounded_cache[key] = out
+            return out
+
+        @staticmethod
+        def dress_window(win):
+            """Translucent edge-to-edge chrome so the window blur runs under the
+            traffic lights. Safe on all recent macOS; degrades to a plain window."""
+            try:
+                from Cocoa import (NSWindowStyleMaskFullSizeContentView,
+                                   NSWindowTitleHidden)
+                win.setStyleMask_(win.styleMask() | NSWindowStyleMaskFullSizeContentView)
+                win.setTitlebarAppearsTransparent_(True)
+                win.setTitleVisibility_(NSWindowTitleHidden)
+                win.setMovableByWindowBackground_(True)
+            except Exception:  # noqa: BLE001
+                pass
+
+        @staticmethod
+        def backing(frame, material):
+            """A behind-window blur view to use as a window's content view."""
+            v = NSVisualEffectView.alloc().initWithFrame_(frame)
+            v.setBlendingMode_(_Glass.BLEND_BEHIND)
+            v.setState_(_Glass.STATE_ACTIVE)
+            try:
+                v.setMaterial_(material)
+            except Exception:  # noqa: BLE001
+                pass
+            v.setAutoresizingMask_(_SIZABLE)
+            return v
+
+        @staticmethod
+        def round_layer(view, radius, mask=True):
+            """Layer-back `view`, round it, and use the continuous curve when
+            available. Caller owns any shadow (a masked layer can't cast one)."""
+            view.setWantsLayer_(True)
+            layer = view.layer()
+            if layer is None:
+                return None
+            layer.setCornerRadius_(radius)
+            layer.setMasksToBounds_(mask)
+            if _CURVE is not None:
+                try:
+                    layer.setCornerCurve_(_CURVE)
+                except Exception:  # noqa: BLE001
+                    pass
+            return layer
+
+        @staticmethod
+        def card(frame, radius=15.0):
+            """A rounded translucent squircle card. Because a masksToBounds layer
+            can't ALSO cast an outer shadow, return (container, inner):
+              • container — unmasked NSView that carries the soft drop shadow,
+              • inner     — within-window NSVisualEffectView clipped to a
+                            continuous-rounded squircle with a hairline rim.
+            Add content to `inner`."""
+            container = NSView.alloc().initWithFrame_(frame)
+            container.setWantsLayer_(True)
+            cl = container.layer()
+            if cl is not None:
+                cl.setShadowColor_(NSColor.blackColor().CGColor())
+                cl.setShadowOpacity_(0.16)
+                cl.setShadowRadius_(9.0)
+                cl.setShadowOffset_(NSMakeSize(0.0, -2.0))  # CA: -y = downward on screen
+                cl.setMasksToBounds_(False)                 # MUST be false to cast a shadow
+
+            inner = NSVisualEffectView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, frame.size.width, frame.size.height))
+            inner.setBlendingMode_(_Glass.BLEND_WITHIN)
+            inner.setState_(_Glass.STATE_ACTIVE)
+            try:
+                inner.setMaterial_(_Glass.MAT_CARD)
+            except Exception:  # noqa: BLE001
+                pass
+            inner.setAutoresizingMask_(_SIZABLE)
+            il = _Glass.round_layer(inner, radius, mask=True)
+            if il is not None:
+                il.setBorderWidth_(1.0)
+                il.setBorderColor_(
+                    NSColor.whiteColor().colorWithAlphaComponent_(0.14).CGColor())
+            container.addSubview_(inner)
+            return container, inner
+
+    _GLASS = _Glass
+    return _GLASS
+
+
+def _sync_activation_policy():
+    """Keep the Dock icon visible while ANY real app window is open; revert to
+    menu-bar-only (Accessory) once the last one closes. Call (deferred one runloop
+    turn) from every window's windowWillClose_. Main-thread only."""
+    try:
+        from Cocoa import (
+            NSApplication, NSApplicationActivationPolicyRegular,
+            NSApplicationActivationPolicyAccessory, NSWindowStyleMaskTitled,
+        )
+        app = NSApplication.sharedApplication()
+        any_visible = False
+        for w in app.windows():
+            try:
+                # Only count real, on-screen, titled windows (the status item is
+                # not a window and won't appear here; skip off-screen panels).
+                if (w.isVisible() and not w.isMiniaturized()
+                        and (w.styleMask() & NSWindowStyleMaskTitled)):
+                    any_visible = True
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+        app.setActivationPolicy_(
+            NSApplicationActivationPolicyRegular if any_visible
+            else NSApplicationActivationPolicyAccessory)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 _TRANSCRIBE_CTRL_CLASS = None
 
 
@@ -1609,8 +1952,9 @@ def _transcribe_controller_class():
         NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
         NSWindowStyleMaskResizable, NSWindowStyleMaskMiniaturizable,
         NSBackingStoreBuffered, NSViewWidthSizable, NSViewHeightSizable,
-        NSViewMinYMargin, NSViewMaxYMargin,
+        NSViewMinYMargin, NSViewMaxYMargin, NSVisualEffectView,
     )
+    G = _glass()
     OK = 1               # NSModalResponseOK / NSFileHandlingPanelOKButton
     AUDIO_TYPES = ["wav", "aiff", "aif", "aifc", "caf", "m4a", "m4b", "mp3", "mp4",
                    "aac", "flac", "ogg", "opus", "mov", "wma", "amr", "3gp"]
@@ -1636,12 +1980,16 @@ def _transcribe_controller_class():
             win.setReleasedWhenClosed_(False)
             win.setDelegate_(self)
             win.setMinSize_(NSMakeSize(440, 340))
-            content = win.contentView()
+            # Liquid-glass chrome: edge-to-edge blur under the traffic lights.
+            G.dress_window(win)
+            content = G.backing(win.contentView().frame(), G.MAT_WINDOW)
+            win.setContentView_(content)
 
             choose = NSButton.buttonWithTitle_target_action_(
                 "Choose Audio File…", self, "chooseFile:")
             choose.setFrame_(NSMakeRect(16, 476, 190, 28))
             choose.setAutoresizingMask_(NSViewMinYMargin)
+            choose.setFont_(G.rounded_font(13))
             content.addSubview_(choose)
             self._choose = choose
 
@@ -1649,19 +1997,24 @@ def _transcribe_controller_class():
                 "Choose an audio file (voice memo, m4a, mp3, wav…) to transcribe it.")
             status.setFrame_(NSMakeRect(216, 481, 408, 20))
             status.setAutoresizingMask_(NSViewMinYMargin | NSViewWidthSizable)
+            status.setFont_(G.rounded_font(13))
             status.setTextColor_(NSColor.secondaryLabelColor())
             content.addSubview_(status)
             self._status = status
 
             scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(16, 52, 608, 412))
             scroll.setHasVerticalScroller_(True)
-            scroll.setBorderType_(2)   # NSBezelBorder
+            scroll.setBorderType_(0)              # NSNoBorder (was NSBezelBorder)
+            scroll.setDrawsBackground_(False)     # let the window blur show through
             scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            G.round_layer(scroll, 12.0)           # continuous-rounded transcript panel
             tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 606, 410))
             tv.setEditable_(True)
             tv.setRichText_(False)
-            tv.setFont_(NSFont.systemFontOfSize_(14))
-            tv.setTextContainerInset_(NSMakeSize(6, 8))
+            tv.setFont_(G.rounded_font(14))
+            tv.setDrawsBackground_(False)         # transparent over the blur
+            tv.setTextColor_(NSColor.labelColor())
+            tv.setTextContainerInset_(NSMakeSize(10, 10))
             tv.setAutoresizingMask_(NSViewWidthSizable)
             scroll.setDocumentView_(tv)
             content.addSubview_(scroll)
@@ -1670,10 +2023,12 @@ def _transcribe_controller_class():
             copy = NSButton.buttonWithTitle_target_action_("Copy", self, "copyText:")
             copy.setFrame_(NSMakeRect(16, 12, 96, 30))
             copy.setAutoresizingMask_(NSViewMaxYMargin)
+            copy.setFont_(G.rounded_font(13))
             content.addSubview_(copy)
             save = NSButton.buttonWithTitle_target_action_("Save…", self, "saveText:")
             save.setFrame_(NSMakeRect(118, 12, 96, 30))
             save.setAutoresizingMask_(NSViewMaxYMargin)
+            save.setFont_(G.rounded_font(13))
             content.addSubview_(save)
 
             win.center()
@@ -1694,8 +2049,11 @@ def _transcribe_controller_class():
             self._win.makeKeyAndOrderFront_(None)
 
         def windowWillClose_(self, note):
-            NSApplication.sharedApplication().setActivationPolicy_(
-                NSApplicationActivationPolicyAccessory)
+            # Defer one runloop turn so the closing window is no longer "visible";
+            # revert to Accessory only if no other app window remains (don't yank
+            # the Dock icon while the History window is still open).
+            NSOperationQueue.mainQueue().addOperationWithBlock_(
+                lambda: _sync_activation_policy())
 
         # -- actions --------------------------------------------------------
         def chooseFile_(self, sender):
@@ -1766,6 +2124,405 @@ def _transcribe_controller_class():
     return _TRANSCRIBE_CTRL_CLASS
 
 
+_HISTORY_CTRL_CLASS = None
+
+
+def _history_controller_class():
+    """Lazily build the History window controller: an iOS 'liquid glass' list of
+    the last 100 dictations (newest first) as translucent squircle cards in a
+    flipped NSStackView, with a search field, per-card Copy, a Clear control, and
+    an empty state. Re-reads history.json on every show(). Deferred AppKit import.
+    Mirrors _transcribe_controller_class's patterns."""
+    global _HISTORY_CTRL_CLASS
+    if _HISTORY_CTRL_CLASS is not None:
+        return _HISTORY_CTRL_CLASS
+    import objc
+    from Cocoa import (
+        NSObject, NSView, NSWindow, NSScrollView, NSStackView, NSTextField,
+        NSButton, NSImage, NSSearchField, NSAlert, NSApplication, NSColor,
+        NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
+        NSApplicationActivationPolicyRegular, NSApplicationActivationPolicyAccessory,
+        NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
+        NSWindowStyleMaskResizable, NSWindowStyleMaskMiniaturizable,
+        NSBackingStoreBuffered, NSViewWidthSizable, NSViewHeightSizable,
+        NSViewMinXMargin, NSViewMinYMargin, NSViewMaxYMargin,
+        NSTextAlignmentCenter, NSImageLeft,
+    )
+    # Layout constants that some pyobjc builds don't export by name (raw values
+    # are stable across macOS): stack orientation / distribution / alignment.
+    try:
+        from Cocoa import (
+            NSUserInterfaceLayoutOrientationVertical as _VERT,
+            NSStackViewDistributionFill as _FILL,
+            NSLayoutAttributeLeading as _ALIGN_LEADING,
+        )
+    except ImportError:  # pragma: no cover
+        _VERT, _FILL, _ALIGN_LEADING = 1, 0, 5
+
+    G = _glass()
+    PAD = 16.0          # window inner padding
+    CARD_GAP = 10.0     # vertical gap between cards
+    TOPBAR_H = 70.0     # search + buttons row (leaves the top strip for traffic lights)
+
+    # A flipped document view so the stack lays out TOP-DOWN (AppKit's default
+    # origin is bottom-left); the newest card ends up at the top like an iOS list.
+    class _FlippedDoc(NSView):
+        def isFlipped(self):
+            return True
+
+    class _HistoryController(NSObject):
+        def initWithApp_(self, app):
+            self = objc.super(_HistoryController, self).init()
+            if self is None:
+                return None
+            self._app = app
+            self._all = []        # history dicts, newest-first, cached per show()
+            self._rows = {}       # button tag -> row text (keeps Copy targets valid)
+            self._bodies = []     # body labels, for responsive re-wrap on resize
+            self._next_tag = 1
+            self._filter_timer = None   # debounce live search (coalesce keystrokes)
+            self._resize_timer = None   # coalesce live-drag resize re-layout
+            self._build()
+            return self
+
+        # ---- window construction -----------------------------------------
+        @objc.python_method
+        def _build(self):
+            style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                     | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable)
+            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, 560, 640), style, NSBackingStoreBuffered, False)
+            win.setTitle_("History — früt Flow")
+            win.setReleasedWhenClosed_(False)
+            win.setDelegate_(self)
+            win.setMinSize_(NSMakeSize(420, 380))
+            G.dress_window(win)
+
+            frame = win.contentView().frame()
+            content = G.backing(frame, G.MAT_SIDEBAR)   # behind-window blur = content view
+            win.setContentView_(content)
+            W = frame.size.width
+            H = frame.size.height
+            ctrl_y = H - 62      # control row sits just below the traffic-light strip
+
+            # --- top bar: search field + Transcribe + Clear -------------------
+            search = NSSearchField.alloc().initWithFrame_(
+                NSMakeRect(PAD, ctrl_y, W - PAD * 2 - 216, 30))
+            search.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+            search.setFont_(G.rounded_font(13))
+            search.setPlaceholderString_("Search dictations")
+            search.setDelegate_(self)                 # controlTextDidChange_ -> live filter
+            search.setTarget_(self)
+            search.setAction_("searchChanged:")
+            content.addSubview_(search)
+            self._search = search
+
+            trans = NSButton.buttonWithTitle_target_action_(
+                "Transcribe File…", self, "openTranscribe:")
+            trans.setFrame_(NSMakeRect(W - PAD - 208, ctrl_y, 122, 30))
+            trans.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            trans.setBezelStyle_(1)   # NSBezelStyleRounded
+            trans.setFont_(G.rounded_font(13))
+            content.addSubview_(trans)
+
+            clear = NSButton.buttonWithTitle_target_action_(
+                "Clear", self, "clearHistory:")
+            clear.setFrame_(NSMakeRect(W - PAD - 78, ctrl_y, 78, 30))
+            clear.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            clear.setBezelStyle_(1)
+            clear.setFont_(G.rounded_font(13))
+            content.addSubview_(clear)
+            self._clear = clear
+
+            # --- scroll view + flipped stack of cards -------------------------
+            scroll = NSScrollView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, W, H - TOPBAR_H))
+            scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            scroll.setHasVerticalScroller_(True)
+            scroll.setDrawsBackground_(False)   # let the blur show through
+            scroll.setBorderType_(0)            # NSNoBorder
+
+            doc = _FlippedDoc.alloc().initWithFrame_(NSMakeRect(0, 0, W, 10))
+            doc.setAutoresizingMask_(NSViewWidthSizable)
+
+            stack = NSStackView.alloc().initWithFrame_(NSMakeRect(0, 0, W, 10))
+            stack.setOrientation_(_VERT)
+            stack.setAlignment_(_ALIGN_LEADING)
+            stack.setDistribution_(_FILL)
+            stack.setSpacing_(CARD_GAP)
+            stack.setEdgeInsets_((PAD, PAD, PAD, PAD))   # top,left,bottom,right
+            stack.setTranslatesAutoresizingMaskIntoConstraints_(False)
+            doc.addSubview_(stack)
+            # Pin the stack to the flipped doc: full width, top-anchored. Its height
+            # is driven by the arranged cards (each sizes to its wrapped text).
+            stack.leadingAnchor().constraintEqualToAnchor_(doc.leadingAnchor()).setActive_(True)
+            stack.trailingAnchor().constraintEqualToAnchor_(doc.trailingAnchor()).setActive_(True)
+            stack.topAnchor().constraintEqualToAnchor_(doc.topAnchor()).setActive_(True)
+
+            scroll.setDocumentView_(doc)
+            content.addSubview_(scroll)
+            self._scroll = scroll
+            self._doc = doc
+            self._stack = stack
+
+            # Empty-state label, centered; shown only when there are no cards.
+            empty = NSTextField.labelWithString_("No dictations yet…")
+            empty.setFont_(G.rounded_font(17, 0.2))
+            empty.setTextColor_(NSColor.tertiaryLabelColor())
+            empty.setAlignment_(NSTextAlignmentCenter)
+            empty.setFrame_(NSMakeRect(0, (H - TOPBAR_H) / 2 - 16, W, 32))
+            empty.setAutoresizingMask_(
+                NSViewWidthSizable | NSViewMinYMargin | NSViewMaxYMargin)
+            empty.setHidden_(True)
+            content.addSubview_(empty)
+            self._empty = empty
+
+            win.center()
+            self._win = win
+
+        # ---- show / activation policy ------------------------------------
+        @objc.python_method
+        def show(self):
+            app = NSApplication.sharedApplication()
+            app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+            app.activateIgnoringOtherApps_(True)
+            self._reload()                       # re-read history.json every show
+            self._win.makeKeyAndOrderFront_(None)
+            self._win.makeFirstResponder_(self._search)
+
+        def windowWillClose_(self, note):
+            # Kill any pending debounced work so a timer can't fire into a closed
+            # window (touching a torn-down view hierarchy).
+            self._cancel_timers()
+            # Defer one runloop turn so the closing window is no longer counted as
+            # visible, then revert to Accessory ONLY if no other window remains.
+            NSOperationQueue.mainQueue().addOperationWithBlock_(
+                lambda: _sync_activation_policy())
+
+        def windowDidResize_(self, note):
+            # Coalesce live-drag resize ticks: re-wrapping ~100 blur cards on every
+            # intermediate frame is janky, so run the re-fit once the drag settles.
+            if self._resize_timer is not None:
+                self._resize_timer.invalidate()
+            self._resize_timer = NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+                0.05, False, lambda _t: self._resize_doc())
+
+        @objc.python_method
+        def _cancel_timers(self):
+            for attr in ("_filter_timer", "_resize_timer"):
+                t = getattr(self, attr, None)
+                if t is not None:
+                    try:
+                        t.invalidate()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    setattr(self, attr, None)
+
+        # ---- data -> cards -----------------------------------------------
+        @objc.python_method
+        def _reload(self):
+            self._all = load_history()           # newest-first, best-effort
+            self._rebuild(str(self._search.stringValue() or ""))
+
+        @objc.python_method
+        def _rebuild(self, query):
+            """Tear down and repopulate the stack from self._all, filtered by
+            query. Rebuilding the whole stack is the simplest correct filter; at
+            the 100-cap it is imperceptible."""
+            for v in list(self._stack.arrangedSubviews()):
+                self._stack.removeArrangedSubview_(v)
+                v.removeFromSuperview()
+            self._rows.clear()
+            self._bodies = []
+            self._next_tag = 1
+
+            q = query.strip().lower()
+            items = self._all
+            if q:
+                items = [e for e in items
+                         if q in str(e.get("text", "")).lower()
+                         or q in str(e.get("app") or "").lower()]
+
+            if not items:
+                self._empty.setStringValue_("No matches." if q else "No dictations yet…")
+                self._empty.setHidden_(False)
+                avail = self._scroll.contentSize()
+                self._doc.setFrameSize_(NSMakeSize(avail.width, avail.height))
+                return
+            self._empty.setHidden_(True)
+
+            for e in items:
+                card = self._make_card(e)
+                self._stack.addArrangedSubview_(card)
+                # Now that the card shares the stack's hierarchy, pin its width to
+                # the stack's inset content width (full-width cards, PAD each side).
+                card.widthAnchor().constraintEqualToAnchor_constant_(
+                    self._stack.widthAnchor(), -2 * PAD).setActive_(True)
+            self._resize_doc()
+            # A reload or a filter change should always show results from the top,
+            # not leave the flipped list parked in blank space where it was scrolled.
+            self._doc.scrollPoint_(NSMakePoint(0, 0))
+
+        @objc.python_method
+        def _resize_doc(self):
+            """Let Auto Layout size the stack, then match the flipped doc height to
+            it so the scroller reflects real content height. Re-wraps body labels
+            to the current width first (so they report a correct multi-line height)."""
+            self._stack.layoutSubtreeIfNeeded()
+            for b in self._bodies:
+                w = b.frame().size.width
+                if w > 1:
+                    b.setPreferredMaxLayoutWidth_(w)
+            self._stack.layoutSubtreeIfNeeded()
+            h = self._stack.fittingSize().height
+            avail = self._scroll.contentSize()
+            self._doc.setFrameSize_(NSMakeSize(avail.width, max(h, avail.height)))
+
+        @objc.python_method
+        def _make_card(self, entry):
+            """One translucent glass card: wrapping+selectable body text, a subtle
+            meta line, and a Copy button. Auto Layout sizes the card to its text.
+            The Copy button targets `self` (the retained controller); the row text
+            is stashed in self._rows[tag] — so there is NO per-card objc object
+            that could be GC'd out from under the run loop."""
+            text = str(entry.get("text", ""))
+            app_name = entry.get("app")
+            words = int(entry.get("words") or len(text.split()))
+            when = relative_time(entry.get("ts"))
+            delivered = bool(entry.get("delivered", True))
+
+            container, inner = G.card(NSMakeRect(0, 0, 480, 60), radius=15.0)
+            container.setTranslatesAutoresizingMaskIntoConstraints_(False)
+            inner.setTranslatesAutoresizingMaskIntoConstraints_(False)
+            # (The card's width is pinned to the stack AFTER it's added as an
+            # arranged subview — see _rebuild — so the anchors share an ancestor.)
+            # Inner fills the container (container is the arranged subview).
+            inner.leadingAnchor().constraintEqualToAnchor_(container.leadingAnchor()).setActive_(True)
+            inner.trailingAnchor().constraintEqualToAnchor_(container.trailingAnchor()).setActive_(True)
+            inner.topAnchor().constraintEqualToAnchor_(container.topAnchor()).setActive_(True)
+            inner.bottomAnchor().constraintEqualToAnchor_(container.bottomAnchor()).setActive_(True)
+
+            # Body: wrapping, selectable dictation text. Both horizontal edges are
+            # pinned, so the label wraps to that width and self-sizes its height.
+            body = NSTextField.wrappingLabelWithString_(text)
+            body.setSelectable_(True)
+            body.setFont_(G.rounded_font(14))
+            body.setTextColor_(NSColor.labelColor())
+            body.setTranslatesAutoresizingMaskIntoConstraints_(False)
+            inner.addSubview_(body)
+            self._bodies.append(body)
+
+            # Meta line: "2m ago  ·  7 words  ·  Safari" (+ clipboard note).
+            bits = []
+            if when:
+                bits.append(when)
+            bits.append("1 word" if words == 1 else f"{words} words")
+            if app_name:
+                bits.append(str(app_name))
+            if not delivered:
+                bits.append("clipboard only")
+            meta = NSTextField.labelWithString_("  ·  ".join(bits))
+            meta.setFont_(G.rounded_font(11.5))
+            meta.setTextColor_(NSColor.secondaryLabelColor())
+            meta.setTranslatesAutoresizingMaskIntoConstraints_(False)
+            inner.addSubview_(meta)
+
+            # Per-card Copy button. Target = controller; identity via tag.
+            tag = self._next_tag
+            self._next_tag += 1
+            self._rows[tag] = text
+            copy = NSButton.buttonWithTitle_target_action_("Copy", self, "copyCard:")
+            copy.setTag_(tag)
+            copy.setBezelStyle_(1)   # NSBezelStyleRounded
+            copy.setFont_(G.rounded_font(12))
+            copy.setTranslatesAutoresizingMaskIntoConstraints_(False)
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "doc.on.doc", "Copy")
+            if img is not None:
+                copy.setImage_(img)
+                copy.setImagePosition_(NSImageLeft)
+            inner.addSubview_(copy)
+
+            # --- Auto Layout: 14pt insets; body left of the Copy button; meta below.
+            PADX, PADY = 14.0, 12.0
+            copy.topAnchor().constraintEqualToAnchor_constant_(
+                inner.topAnchor(), PADY - 2).setActive_(True)
+            copy.trailingAnchor().constraintEqualToAnchor_constant_(
+                inner.trailingAnchor(), -PADX).setActive_(True)
+            copy.widthAnchor().constraintEqualToConstant_(74.0).setActive_(True)
+
+            body.leadingAnchor().constraintEqualToAnchor_constant_(
+                inner.leadingAnchor(), PADX).setActive_(True)
+            body.topAnchor().constraintEqualToAnchor_constant_(
+                inner.topAnchor(), PADY).setActive_(True)
+            body.trailingAnchor().constraintEqualToAnchor_constant_(
+                copy.leadingAnchor(), -10.0).setActive_(True)
+
+            meta.leadingAnchor().constraintEqualToAnchor_(body.leadingAnchor()).setActive_(True)
+            meta.trailingAnchor().constraintEqualToAnchor_(body.trailingAnchor()).setActive_(True)
+            meta.topAnchor().constraintEqualToAnchor_constant_(
+                body.bottomAnchor(), 6.0).setActive_(True)
+            meta.bottomAnchor().constraintEqualToAnchor_constant_(
+                inner.bottomAnchor(), -PADY).setActive_(True)
+            return container
+
+        # ---- actions (Obj-C selectors — names match the action strings) --
+        def searchChanged_(self, sender):
+            # Return / search-commit: filter immediately, cancelling any pending
+            # debounced rebuild so the two paths can't both fire.
+            if self._filter_timer is not None:
+                self._filter_timer.invalidate()
+                self._filter_timer = None
+            self._rebuild(str(sender.stringValue() or ""))
+
+        def controlTextDidChange_(self, note):
+            # Debounce live typing: rebuilding up to 100 blur-backed cards on every
+            # keystroke stutters the field, so coalesce to one rebuild ~0.12s after
+            # the last keypress. searchChanged_ (Return) remains the immediate path.
+            if self._filter_timer is not None:
+                self._filter_timer.invalidate()
+            self._filter_timer = NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+                0.12, False, lambda _t: self._rebuild(str(self._search.stringValue() or "")))
+
+        def copyCard_(self, sender):
+            txt = self._rows.get(int(sender.tag()))
+            if not txt:
+                return
+            _clip_set(txt)
+            sender.setTitle_("Copied")
+            # Restore the label after ~1.1s on the main runloop (no UI thread).
+            NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+                1.1, False, lambda _t: self._restore_copy(sender))
+
+        @objc.python_method
+        def _restore_copy(self, sender):
+            try:
+                sender.setTitle_("Copy")
+            except Exception:  # noqa: BLE001
+                pass
+
+        def openTranscribe_(self, sender):
+            try:
+                self._app._show_transcribe_window()
+            except Exception:  # noqa: BLE001
+                pass
+
+        def clearHistory_(self, sender):
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Clear dictation history?")
+            alert.setInformativeText_(
+                "This permanently removes all saved dictations from this list. "
+                "It doesn't affect anything you've already typed.")
+            alert.addButtonWithTitle_("Clear")     # first button -> return 1000
+            alert.addButtonWithTitle_("Cancel")
+            if alert.runModal() == 1000:            # NSAlertFirstButtonReturn
+                clear_history()
+                self._reload()
+
+    _HISTORY_CTRL_CLASS = _HistoryController
+    return _HISTORY_CTRL_CLASS
+
+
 class FlowApp:
     def __init__(self, cfg: dict, transcriber):
         self.cfg = cfg
@@ -1811,6 +2568,8 @@ class FlowApp:
         self._undo_stack: list[str] = []
         # "Transcribe an audio file" window (built lazily on first open).
         self._transcribe_ctrl = None
+        # "History" window — the app's home page (built lazily on first open).
+        self._history_ctrl = None
         # Serialize model access: the mic worker and the file-transcribe window must
         # never call transcribe() on the same model concurrently.
         self._transcribe_lock = threading.Lock()
@@ -1916,6 +2675,7 @@ class FlowApp:
 
     def _process(self, audio: np.ndarray) -> None:
         text = ""
+        recorded = False   # guard: record each dictation to history at most once
         try:
             print("[flow] transcribing...")
             self._set_status("⏳", "● Transcribing…")
@@ -1959,6 +2719,8 @@ class FlowApp:
             # lands, a distinct, louder one when it only made it to the clipboard.
             if delivered:
                 self._remember_insertion(to_insert)   # so a later "never mind" can delete it
+                record_history(text, app=_focused_app_name(), delivered=True)
+                recorded = True
                 play("Glass", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
                 if self.cfg.get("learn_from_edits", True):
                     # Finalize the PREVIOUS paste's pending learn before arming this
@@ -1968,6 +2730,9 @@ class FlowApp:
                     # fix you make becomes a learned correction (no manual --correct).
                     self._arm_edit_learning(text)
             else:
+                # insert_text fell back to clipboard-only: still worth recording.
+                record_history(text, app=_focused_app_name(), delivered=False)
+                recorded = True
                 play("Basso", self.cfg)
             # Learn your vocabulary from the FINAL text (after delivery, so it
             # never delays the paste). No model retraining — just word stats that
@@ -1987,6 +2752,12 @@ class FlowApp:
                     print("[flow] (left text on clipboard — press Cmd-V)")
                 except Exception:  # noqa: BLE001
                     pass
+                # Record even on the error path — unless the delivered/clipboard
+                # branch above already recorded this dictation (an exception raised
+                # AFTER the record, e.g. in edit-learning, must not double-record).
+                # app=None: _focused_app_name may be unhappy here; record never raises.
+                if not recorded:
+                    record_history(text, app=None, delivered=False)
 
     def _remember_insertion(self, inserted: str) -> None:
         """Push the EXACT string we just inserted onto the undo stack (bounded), so a
@@ -2014,6 +2785,7 @@ class FlowApp:
         to_insert = (" " + kept) if self.cfg.get("auto_space", True) else kept
         if insert_text(to_insert, self.cfg):
             self._remember_insertion(to_insert)
+            record_history(kept, app=_focused_app_name(), delivered=True)
             play("Glass", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
             if self.cfg.get("learn_from_edits", True):
                 self._reconcile_edit_learning()
@@ -2074,6 +2846,8 @@ class FlowApp:
         # We just removed it, so don't let the auto-learner mine the deleted text.
         with self._state_lock:
             self._pending_learn = None
+        # It's gone from the target app, so drop it from History too (best-effort).
+        pop_history_matching(tail)
         play("Bottle", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
         return True
 
@@ -2573,6 +3347,18 @@ class FlowApp:
             raw = self.transcriber.transcribe(audio, prompt=prompt, hotwords=hotwords)
         return (clean(raw, self.cfg) or ""), None
 
+    def _show_history_window(self) -> None:
+        """Open (or re-focus) the History window — the app's home page. Built
+        lazily; re-reads history.json and refreshes on every show()."""
+        try:
+            if self._history_ctrl is None:
+                self._history_ctrl = (
+                    _history_controller_class().alloc().initWithApp_(self))
+            self._history_ctrl.show()
+            print("[flow] history window opened.", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[flow] couldn't open the history window: {e}", flush=True)
+
     def _show_transcribe_window(self) -> None:
         """Open (or re-focus) the 'Transcribe an audio file' window. Built lazily."""
         try:
@@ -2640,6 +3426,7 @@ class FlowApp:
         _add("Wispr DIY", None, enabled=False)
         self._status_line = _add(label, None, enabled=False)
         menu.addItem_(NSMenuItem.separatorItem())
+        _add("History…", "historyWindow:")
         _add("Transcribe Audio File…", "transcribeFile:")
         _add("Teach a Word…", "teachWord:")
         menu.addItem_(NSMenuItem.separatorItem())
