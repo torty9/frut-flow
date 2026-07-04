@@ -472,6 +472,13 @@ class ParakeetTranscriber:
     #: Parakeet models can drop very short (<~1s) utterances.
     _MIN_AUDIO_SECONDS = 1.0
 
+    #: Long clips are transcribed in overlapping chunks: Conformer attention is
+    #: ~O(n^2) in frames, so a whole 10-min mel would OOM/crawl. Only clips longer
+    #: than the threshold chunk — short clips keep today's exact whole-clip fast path.
+    _CHUNK_THRESHOLD_SECONDS = 120.0   # only chunk clips longer than this
+    _CHUNK_DURATION_SECONDS = 120.0    # per-chunk window (matches the library default)
+    _CHUNK_OVERLAP_SECONDS = 15.0      # overlap between chunks (the library's default)
+
     def __init__(self, model_name: str, language: str, *, normalize: bool = True,
                  normalize_peak: float = 0.95, normalize_method: str = "rms",
                  normalize_rms_dbfs: float = -20.0, warmup: bool = True):
@@ -481,8 +488,19 @@ class ParakeetTranscriber:
         from parakeet_mlx import from_pretrained
         import mlx.core as mx
         from parakeet_mlx.audio import get_logmel
+        # Long-audio chunking reuses the library's OWN token-merge + sentence
+        # helpers so we inherit its tested overlap-merge behaviour (the file-path
+        # chunk route needs ffmpeg, which isn't installed — see _transcribe_chunked).
+        from parakeet_mlx.alignment import (merge_longest_contiguous,
+            merge_longest_common_subsequence, tokens_to_sentences, sentences_to_result)
+        from parakeet_mlx.parakeet import DecodingConfig
         self._mx = mx
         self._get_logmel = get_logmel
+        self._merge_contig = merge_longest_contiguous
+        self._merge_lcs = merge_longest_common_subsequence
+        self._toks_to_sents = tokens_to_sentences
+        self._sents_to_result = sentences_to_result
+        self._DecodingConfig = DecodingConfig
         self.language = language
         self.normalize = normalize
         self.normalize_peak = normalize_peak
@@ -544,8 +562,56 @@ class ParakeetTranscriber:
         if audio.shape[0] < min_len:
             audio = np.concatenate(
                 [audio, np.zeros(min_len - audio.shape[0], dtype=np.float32)])
+        # Long clips must chunk (a whole 10-min mel would OOM/crawl). Fail-safe:
+        # any error in the chunked path falls through to the whole-clip generate
+        # below, so a long clip never silently returns nothing.
+        dur = audio.shape[0] / SAMPLE_RATE
+        if dur > self._CHUNK_THRESHOLD_SECONDS:
+            try:
+                return self._transcribe_chunked(audio)
+            except Exception as e:  # noqa: BLE001  fall back so a long clip never returns nothing
+                print(f"[flow] long-audio chunking failed ({e}); using whole-clip.",
+                      flush=True)
         mel = self._get_logmel(self._mx.array(audio), self.model.preprocessor_config)
         result = self.model.generate(mel)[0]
+        return (result.text or "").strip()
+
+    def _transcribe_chunked(self, audio: np.ndarray) -> str:
+        """Transcribe a long (>~120s) in-memory clip by chunking, because Conformer
+        attention is ~O(n^2) in frames and a whole 10-min mel would OOM/crawl. This
+        is a faithful port of parakeet_mlx's own file-path chunk loop (the file route
+        needs ffmpeg, which isn't installed), reusing the library's merge helpers so
+        we inherit its tested overlap-merge behaviour. Runs on the mic worker thread
+        under the caller's serialization; MLX's default GPU stream is already live
+        from the main-thread warm-up. Any error here is caught by transcribe(), which
+        falls back to a whole-clip generate."""
+        cfg = self._DecodingConfig()
+        pc = self.model.preprocessor_config
+        chunk_samples = int(self._CHUNK_DURATION_SECONDS * SAMPLE_RATE)
+        overlap_samples = int(self._CHUNK_OVERLAP_SECONDS * SAMPLE_RATE)
+        all_tokens = []
+        for start in range(0, audio.shape[0], chunk_samples - overlap_samples):
+            end = min(start + chunk_samples, audio.shape[0])
+            if end - start < pc.hop_length:
+                break                                  # prevent a zero-length log-mel (same guard as the library)
+            chunk = np.ascontiguousarray(audio[start:end], dtype=np.float32)
+            mel = self._get_logmel(self._mx.array(chunk), pc)
+            res = self.model.generate(mel, decoding_config=cfg)[0]
+            offset = start / SAMPLE_RATE
+            for sent in res.sentences:                 # offset tokens back to absolute time (in place, as the library does)
+                for tok in sent.tokens:
+                    tok.start += offset
+                    tok.end = tok.start + tok.duration
+            if all_tokens:
+                try:
+                    all_tokens = self._merge_contig(all_tokens, res.tokens,
+                                                    overlap_duration=self._CHUNK_OVERLAP_SECONDS)
+                except RuntimeError:
+                    all_tokens = self._merge_lcs(all_tokens, res.tokens,
+                                                 overlap_duration=self._CHUNK_OVERLAP_SECONDS)
+            else:
+                all_tokens = res.tokens
+        result = self._sents_to_result(self._toks_to_sents(all_tokens, cfg.sentence))
         return (result.text or "").strip()
 
 
@@ -1722,6 +1788,12 @@ _VK_BY_NAME = {
 # Option keys are interchangeable for push-to-talk: if the configured hotkey is
 # either Option, accept BOTH so layout/canonicalization quirks can't break it.
 _OPTION_VKS = {58, 61}
+
+# The hands-free "lock recording" key: press ` (backtick) WHILE holding Option to
+# latch the capture, then press it again to stop. Consumed by a SEPARATE active
+# tap (see FlowApp._install_lock_tap) so a real backtick is never eaten unless it
+# actually toggles the lock.
+_VK_GRAVE = 50   # kVK_ANSI_Grave (backtick / tilde key)
 
 # Modifier keys arrive as kCGEventFlagsChanged (a *bare* modifier produces NO
 # keyDown/keyUp). For those we can't tell press from release by the event type,
@@ -4463,11 +4535,18 @@ def _settings_controller_class():
             return pill
 
         @objc.python_method
+        def _fmt_maxrec(self, v):
+            # Compact label for the max-record slider: 45->'45s', 120->'2m',
+            # 300->'5m', 600->'10m', 90->'1m30s'. All fit the 40px label.
+            return f"{v}s" if v < 60 else (f"{v//60}m" if v % 60 == 0
+                                           else f"{v//60}m{v%60:02d}s")
+
+        @objc.python_method
         def _add_maxrec_slider(self, inner, row_idx):
             top = self._row_top(inner, row_idx)
             cur = int(self._cfg("max_record_seconds", 120) or 120)
-            cur = max(30, min(300, cur))
-            lbl = NSTextField.labelWithString_(f"{cur}s")
+            cur = max(30, min(600, cur))
+            lbl = NSTextField.labelWithString_(self._fmt_maxrec(cur))
             lbl.setFont_(G.rounded_font(12.5))
             lbl.setTextColor_(SUB_COL)
             lbl.setAlignment_(NSTextAlignmentRight)
@@ -4480,10 +4559,10 @@ def _settings_controller_class():
                 NSMakeRect(inner.frame().size.width - 14 - 40 - 8 - 140,
                            top - ROW_H / 2 - 10, 140, 20))
             sl.setMinValue_(30.0)
-            sl.setMaxValue_(300.0)
+            sl.setMaxValue_(600.0)
             sl.setDoubleValue_(float(cur))
             try:
-                sl.setNumberOfTickMarks_(28)          # 30..300 step 10
+                sl.setNumberOfTickMarks_(58)          # 30..600 step 10
                 sl.setAllowsTickMarkValuesOnly_(True)
             except Exception:  # noqa: BLE001
                 pass
@@ -4929,12 +5008,12 @@ def _settings_controller_class():
 
         def maxRecChanged_(self, sender):
             v = int(round(sender.doubleValue() / 10.0) * 10)
-            v = max(30, min(300, v))
+            v = max(30, min(600, v))
             # Label tracks the drag live; but persist only when the drag SETTLES
             # (mouse-up / keyboard), not on every tick — one drag would otherwise
-            # do ~27 synchronous config.json writes on the main thread.
+            # do ~57 synchronous config.json writes on the main thread.
             if self._maxrec_label is not None:
-                self._maxrec_label.setStringValue_(f"{v}s")
+                self._maxrec_label.setStringValue_(self._fmt_maxrec(v))
             if self._is_live_drag():
                 return
             self._save("max_record_seconds", v)
@@ -6289,6 +6368,10 @@ class FlowApp:
         self._key_down = False
         self._tap = None          # CFMachPort for the Quartz tap
         self._tap_source = None   # its run-loop source (needed to detach on rebuild)
+        self._lock_tap = None          # CFMachPort for the ACTIVE backtick lock tap (separate from the listen-only main tap)
+        self._lock_tap_source = None   # its run-loop source
+        self._lock_tap_ok = False      # did the lock tap create+enable? (feature is unavailable if False)
+        self._locked = False           # hold-mode hands-free latch (guarded by _state_lock); reset in _end()
         self._loop = None         # the main CFRunLoop (set in run())
         self._last_recover = 0.0  # debounce for _recover_after_wake
         self._tap_disabled_streak = 0  # consecutive watchdog checks finding it dead
@@ -6415,6 +6498,10 @@ class FlowApp:
 
     def _end(self) -> None:
         with self._state_lock:
+            # Authoritative single reset point for the hands-free latch: clear it
+            # BEFORE the recording check so every _end() (even the no-op path) leaves
+            # the lock off — a locked-but-not-recording state can never get stuck.
+            self._locked = False
             if not self.recorder.recording:
                 return
             audio = self.recorder.stop()
@@ -6688,7 +6775,11 @@ class FlowApp:
                 self._begin()
 
     def _on_key_up(self) -> None:
-        if self.cfg["mode"] == "hold":
+        # When LOCKED, releasing Option must NOT stop the capture — that's the whole
+        # point of hands-free mode. This is the single choke point both the normal
+        # release and the drift-resync path in _handle_event funnel through, so the
+        # latch guard lives here (not at the call sites).
+        if self.cfg["mode"] == "hold" and not self._locked:
             self._end()
 
     def _watchdog_loop(self) -> None:
@@ -6744,6 +6835,7 @@ class FlowApp:
                       f"{self._MAX_RECORD_SECONDS:.0f}s — auto-stopping.",
                       flush=True)
                 self._key_down = False
+                self._locked = False   # a runaway LOCKED capture is still capped (belt-and-suspenders; _end clears it too)
                 self._end()
             # (2) tap-health self-heal, escalating to a rebuild if it won't stick
             try:
@@ -6768,6 +6860,15 @@ class FlowApp:
                     warned_dead = False
                     self._tap_disabled_streak = 0
             except Exception:  # noqa: BLE001  never let the watchdog die
+                pass
+            # (2b) lock-tap health — re-enable only, FULLY isolated from the main
+            # tap's escalation: a dead lock tap must never touch _tap_disabled_streak
+            # or trigger _recover_after_wake (the wake path already rebuilds it).
+            try:
+                if (self._lock_tap_ok and self._lock_tap is not None
+                        and not Quartz.CGEventTapIsEnabled(self._lock_tap)):
+                    Quartz.CGEventTapEnable(self._lock_tap, True)
+            except Exception:  # noqa: BLE001
                 pass
             # (3) stuck-processing guard (loud, once per stuck clip)
             with self._state_lock:
@@ -6925,6 +7026,125 @@ class FlowApp:
         except Exception:  # noqa: BLE001
             return False
 
+    # -- hands-free lock key (SEPARATE, ACTIVE tap on the backtick) -----------
+    #
+    # The main tap is listen-only (deliberately — an active tap needs *effective*
+    # Accessibility, the historical dead-hotkey trap), so it CANNOT swallow a
+    # keystroke. To consume the backtick cleanly we add a SECOND, independent,
+    # ACTIVE tap dedicated to vk 50. If it fails to create the lock feature is
+    # simply unavailable and push-to-talk is 100% intact.
+
+    def _on_lock_key(self, is_repeat: bool) -> bool:
+        """Decide what a backtick keyDown means. Returns True to CONSUME it, False to
+        let it type. Hold-mode only.
+
+        `is_repeat` comes straight from the event's autorepeat bit — a DETERMINISTIC
+        signal that this keyDown is macOS auto-repeating a still-held key, not a fresh
+        press. That matters two ways: (1) holding ` to latch must not auto-stop the
+        recording it just latched (repeats while locked are swallowed, never treated
+        as the "second press"); (2) an idle held/fast-typed ` (e.g. a ``` code fence)
+        must still type normally. A wall-clock debounce can't tell these apart — the
+        repeat delay (250-1133ms) is longer than any sane window — so we don't guess.
+
+        Takes _state_lock only for the flag flip. The actual STOP (recorder.stop +
+        a multi-MB concatenate) is dispatched OFF this thread: this callback runs in
+        the ACTIVE lock tap, which sits in the system input-delivery path, so it must
+        return at once or it freezes keys / gets killed by the tap timeout."""
+        latched = False
+        stopping = False
+        with self._state_lock:
+            if self.cfg["mode"] != "hold":
+                return False               # lock is a hold-mode-only feature — let the backtick type
+            if self._locked:
+                # Inside a locked capture the backtick is "ours": a fresh press STOPS,
+                # but an OS repeat of a still-held key is swallowed (a held ` can't
+                # auto-stop the recording it latched a moment ago).
+                if is_repeat:
+                    return True
+                self._locked = False       # clear BEFORE the stop so the auto-cap path can't re-guard
+                stopping = True
+            elif self.recorder.recording and self._key_down and not is_repeat:
+                self._locked = True        # Option genuinely held AND recording -> LATCH
+                latched = True
+            else:
+                return False               # idle backtick (or its repeats) -> real character, pass through
+        if latched:
+            self._set_status("🔴", "🔒 Locked — press ` to stop")  # glyph stays 🔴 so the HUD keeps animating
+            play("Tink", self.cfg)
+            return True
+        if stopping:
+            threading.Thread(target=self._end, daemon=True).start()  # _end off the tap thread; it's idempotent
+            return True
+        return False
+
+    def _lock_tap_callback(self, proxy, etype, event, refcon):  # noqa: ARG002
+        import Quartz
+        try:
+            et = int(etype)
+            if et in (int(Quartz.kCGEventTapDisabledByTimeout),
+                      int(Quartz.kCGEventTapDisabledByUserInput)):
+                if self._lock_tap is not None:
+                    Quartz.CGEventTapEnable(self._lock_tap, True)   # re-arm ourselves; do NOT touch the main tap
+                return event
+            if et != int(Quartz.kCGEventKeyDown):
+                return event                                        # only keyDown is in our mask, but be defensive
+            keycode = Quartz.CGEventGetIntegerValueField(
+                event, Quartz.kCGKeyboardEventKeycode)
+            if keycode != _VK_GRAVE:
+                return event                                        # FAST PATH: one int compare + return
+            # Autorepeat bit distinguishes a held-key OS repeat from a fresh press
+            # deterministically (see _on_lock_key); a time window cannot.
+            is_repeat = bool(Quartz.CGEventGetIntegerValueField(
+                event, Quartz.kCGKeyboardEventAutorepeat))
+            return None if self._on_lock_key(is_repeat) else event  # consume only when it actually toggled the lock
+        except Exception as e:  # noqa: BLE001  never let the lock tap die or eat a key on error
+            print(f"[flow] lock tap callback error: {e}", flush=True)
+            return event
+
+    def _install_lock_tap(self) -> bool:
+        """Create the SEPARATE, ACTIVE tap that consumes the backtick lock key.
+        Independent of the listen-only main tap: if this fails the lock feature is
+        simply unavailable and push-to-talk is 100% intact. Needs Input Monitoring
+        (same as the main tap); does NOT need Accessibility (it only observes+consumes,
+        never synthesizes)."""
+        import Quartz
+        mask = 1 << int(Quartz.kCGEventKeyDown)
+        tap = Quartz.CGEventTapCreate(
+            Quartz.kCGSessionEventTap,
+            Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionDefault,   # ACTIVE (consuming) — the ONE difference the whole feature hinges on
+            mask,
+            self._lock_tap_callback,
+            None,
+        )
+        if not tap:
+            return False
+        source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+        Quartz.CFRunLoopAddSource(self._loop, source, Quartz.kCFRunLoopCommonModes)
+        Quartz.CGEventTapEnable(tap, True)
+        Quartz.CFRunLoopWakeUp(self._loop)
+        self._lock_tap, self._lock_tap_source = tap, source
+        return True
+
+    def _teardown_lock_tap(self) -> None:
+        """Dismantle the lock tap. Kept SEPARATE from _teardown_tap on purpose:
+        _recover_after_wake tears down + reinstalls only the MAIN tap, so folding
+        lock teardown into _teardown_tap would silently kill the lock tap on every
+        wake without reinstalling it."""
+        import Quartz
+        tap, source = self._lock_tap, self._lock_tap_source
+        self._lock_tap = self._lock_tap_source = None
+        try:
+            if tap is not None:
+                Quartz.CGEventTapEnable(tap, False)
+            if source is not None and self._loop is not None:
+                Quartz.CFRunLoopRemoveSource(self._loop, source,
+                                             Quartz.kCFRunLoopCommonModes)
+            if tap is not None:
+                Quartz.CFMachPortInvalidate(tap)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _recover_after_wake(self, reason: str) -> None:
         """Post-sleep recovery: rebuild the hotkey tap and refresh the audio stack.
         Idempotent and debounced — the wake notification, the watchdog's clock-skew
@@ -6939,6 +7159,15 @@ class FlowApp:
             self._teardown_tap()
             ok = self._install_tap() and self._tap_enabled()
             print(f"[flow] hotkey tap rebuilt (enabled={ok}).", flush=True)
+            # Rebuild the lock tap in its OWN inner try so a lock-tap failure NEVER
+            # affects main-tap state or triggers the main tap's escalation.
+            try:
+                self._teardown_lock_tap()
+                self._lock_tap_ok = self._install_lock_tap()
+                print(f"[flow] lock tap rebuilt (ok={self._lock_tap_ok}).", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[flow] lock tap rebuild failed: {e} (lock feature off; "
+                      "hotkey unaffected).", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[flow] tap rebuild failed: {e} — the watchdog will retry.",
                   flush=True)
@@ -7033,6 +7262,17 @@ class FlowApp:
         else:
             print(f"[flow] event tap enabled={self._tap_enabled()}", flush=True)
 
+        # Best-effort: install the SEPARATE active tap for the hands-free lock key.
+        # Runs in BOTH app- and terminal-mode (self._loop is set above, required by
+        # _install_lock_tap). NEVER bail if it fails — push-to-talk is unaffected and
+        # the lock feature simply becomes unavailable.
+        self._lock_tap_ok = self._install_lock_tap()
+        if not self._lock_tap_ok:
+            print("[flow] lock-recording key unavailable (couldn't create its tap) "
+                  "— push-to-talk unaffected.", flush=True)
+        else:
+            print(f"[flow] lock tap enabled={self._lock_tap_ok}.", flush=True)
+
         # Opt out of App Nap so macOS never throttles this (hidden-Terminal-hosted)
         # process's timers/threads. The *AllowingIdleSystemSleep* variant is important:
         # it must NOT keep the Mac awake — only keep us responsive while it is awake.
@@ -7104,6 +7344,7 @@ class FlowApp:
                 self._run_menubar()
             finally:
                 self._teardown_tap()
+                self._teardown_lock_tap()
         else:
             # Classic/terminal mode (e.g. `python flow.py` for debugging): plain
             # CFRunLoop so Ctrl-C still quits and stdout logs stay visible.
@@ -7113,6 +7354,7 @@ class FlowApp:
                 raise
             finally:
                 self._teardown_tap()
+                self._teardown_lock_tap()
 
     def _transcribe_path(self, path: str):
         """Transcribe an audio FILE with the app's already-loaded engine + the full
