@@ -168,6 +168,8 @@ DEFAULT_CONFIG = {
 
     # --- feedback / guards ---
     "play_sounds": True,
+    "show_hud": True,            # floating waveform pill near the bottom of the screen
+                                 # while you dictate (menu-bar/app mode only). Cosmetic.
     "ding_volume": 0.25,         # volume (0.0–1.0) of the success ding; lower = quieter
     "min_seconds": 0.2,          # ignore accidental sub-200ms taps
     "max_record_seconds": 120,   # safety cap: auto-stop a capture this long (guards a
@@ -1664,6 +1666,8 @@ def _menu_actions_class():
                         item.setTitle_(glyph)
                 if app._status_line is not None:
                     app._status_line.setTitle_(label)
+                # Same state, second surface: the floating recording HUD.
+                app._hud_apply(glyph)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -2523,6 +2527,382 @@ def _history_controller_class():
     return _HISTORY_CTRL_CLASS
 
 
+# ---------------------------------------------------------------------------
+# Floating recording HUD — the waveform "pill" that appears near the bottom of
+# the screen while you dictate. Native reimplementation of the redesign mockup:
+# a dark frosted capsule with a breathing status dot, an animated 22-bar
+# waveform, a running mm:ss timer, and a Stop button, plus a hint line beneath.
+#
+# Safety properties that MUST hold (this shows while you dictate into another
+# app): it is a NON-ACTIVATING floating panel shown with orderFrontRegardless,
+# so presenting it never steals key focus — the paste still lands in the app you
+# were typing into. Everything here runs on the main thread (driven from
+# _MenuActions.applyStatus_, which is already marshalled there) and must never
+# raise into the dictation path.
+# ---------------------------------------------------------------------------
+_HUD_CTRL_CLASS = None
+
+
+def _hud_controller_class():
+    """Lazily build & cache the NSObject subclass that owns the recording HUD
+    panel. Deferred AppKit import so CLI paths never touch Cocoa."""
+    global _HUD_CTRL_CLASS
+    if _HUD_CTRL_CLASS is not None:
+        return _HUD_CTRL_CLASS
+
+    import math
+    import objc
+    from Cocoa import (
+        NSObject, NSPanel, NSView, NSVisualEffectView, NSTextField, NSButton,
+        NSImage, NSColor, NSFont, NSScreen,
+        NSMakeRect, NSBackingStoreBuffered,
+        NSTextAlignmentCenter, NSTextAlignmentRight,
+        NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel,
+    )
+
+    G = _glass()
+
+    # Dark HUD vibrancy material (always-dark frosted look, independent of the
+    # system light/dark setting). Fall back to the popover material or the raw
+    # enum value on older AppKit.
+    try:
+        from Cocoa import NSVisualEffectMaterialHUDWindow as _MAT_HUD
+    except ImportError:  # pragma: no cover
+        _MAT_HUD = 13
+
+    # Float above ordinary windows (and over full-screen apps / every Space).
+    try:
+        from Cocoa import (
+            NSStatusWindowLevel as _LEVEL,
+            NSWindowCollectionBehaviorCanJoinAllSpaces as _CB_ALL,
+            NSWindowCollectionBehaviorStationary as _CB_STATIONARY,
+            NSWindowCollectionBehaviorFullScreenAuxiliary as _CB_FSAUX,
+        )
+    except ImportError:  # pragma: no cover
+        _LEVEL, _CB_ALL, _CB_STATIONARY, _CB_FSAUX = 25, 1, 16, 256
+
+    def _white(a):
+        return NSColor.whiteColor().colorWithAlphaComponent_(a)
+
+    def _rgb(r, g, b, a=1.0):
+        return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, a)
+
+    GREEN = _rgb(0.788, 0.925, 0.431)      # #c9ec6e — the früt accent
+    BAR = _rgb(0.745, 0.878, 0.396)        # mid of the mockup's bar gradient
+
+    # --- geometry (see the mockup's RECORDING HUD block) --------------------
+    PILL_W, PILL_H, RADIUS = 384.0, 54.0, 27.0
+    HINT_H, GAP_V = 16.0, 8.0
+    PANEL_W, PANEL_H = PILL_W, PILL_H + GAP_V + HINT_H
+    PILL_Y = HINT_H + GAP_V                 # pill sits above the hint line
+    NBARS = 22
+    WAVE_X, WAVE_W, WAVE_H = 137.0, 129.0, 30.0
+
+    class _HudController(NSObject):
+        def initWithApp_(self, app):
+            self = objc.super(_HudController, self).init()
+            if self is None:
+                return None
+            self._app = app
+            self._built = False
+            self._panel = None
+            self._bars = []
+            self._timer = None
+            self._state = "hidden"          # hidden | listening | transcribing
+            self._t0 = 0.0
+            return self
+
+        # -- build (lazy, first show) ---------------------------------------
+        def _build(self):
+            if self._built:
+                return
+            style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+            panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, PANEL_W, PANEL_H), style,
+                NSBackingStoreBuffered, False)
+            panel.setOpaque_(False)
+            panel.setBackgroundColor_(NSColor.clearColor())
+            panel.setHasShadow_(True)               # server shadow follows the pill shape
+            panel.setLevel_(_LEVEL)
+            panel.setFloatingPanel_(True)
+            panel.setBecomesKeyOnlyIfNeeded_(True)
+            panel.setHidesOnDeactivate_(False)
+            panel.setReleasedWhenClosed_(False)
+            try:
+                panel.setCollectionBehavior_(_CB_ALL | _CB_STATIONARY | _CB_FSAUX)
+            except Exception:  # noqa: BLE001
+                pass
+            self._panel = panel
+
+            content = panel.contentView()
+
+            # The pill: a behind-window frosted capsule (blurs whatever is under it).
+            pill = NSVisualEffectView.alloc().initWithFrame_(
+                NSMakeRect(0, PILL_Y, PILL_W, PILL_H))
+            pill.setBlendingMode_(G.BLEND_BEHIND)
+            pill.setState_(G.STATE_ACTIVE)
+            try:
+                pill.setMaterial_(_MAT_HUD)
+            except Exception:  # noqa: BLE001
+                pass
+            # Force the dark frosted look regardless of the system light/dark
+            # setting (the mockup pill is always dark charcoal glass). Vibrant-dark
+            # also makes the white-on-dark text and the stop button read correctly.
+            try:
+                from Cocoa import NSAppearance
+                ap = NSAppearance.appearanceNamed_("NSAppearanceNameVibrantDark")
+                if ap is not None:
+                    pill.setAppearance_(ap)
+            except Exception:  # noqa: BLE001
+                pass
+            pl = G.round_layer(pill, RADIUS, mask=True)
+            if pl is not None:
+                pl.setBorderWidth_(1.0)
+                pl.setBorderColor_(_white(0.16).CGColor())
+            content.addSubview_(pill)
+            self._pill = pill
+
+            # status dot (breathing green) with a soft glow.
+            dot = NSView.alloc().initWithFrame_(
+                NSMakeRect(20, (PILL_H - 9) / 2.0, 9, 9))
+            dot.setWantsLayer_(True)
+            dl = dot.layer()
+            if dl is not None:
+                dl.setCornerRadius_(4.5)
+                dl.setBackgroundColor_(GREEN.CGColor())
+                dl.setMasksToBounds_(False)
+                dl.setShadowColor_(GREEN.CGColor())
+                dl.setShadowRadius_(5.0)
+                dl.setShadowOpacity_(0.9)
+                dl.setShadowOffset_(_zero_size())
+            pill.addSubview_(dot)
+            self._dot = dot
+
+            # status label ("Listening" / "Transcribing").
+            label = NSTextField.labelWithString_("Listening")
+            label.setFrame_(NSMakeRect(38, (PILL_H - 18) / 2.0, 84, 18))
+            label.setFont_(G.rounded_font(12.5, 0.3))
+            label.setTextColor_(_white(0.75))
+            pill.addSubview_(label)
+            self._label = label
+
+            # waveform: NBARS thin bars, animated in tick_.
+            wave = NSView.alloc().initWithFrame_(
+                NSMakeRect(WAVE_X, (PILL_H - WAVE_H) / 2.0, WAVE_W, WAVE_H))
+            pill.addSubview_(wave)
+            self._bars = []
+            for i in range(NBARS):
+                bar = NSView.alloc().initWithFrame_(
+                    NSMakeRect(i * 6.0, WAVE_H / 2.0 - 4, 3, 8))
+                bar.setWantsLayer_(True)
+                bl = bar.layer()
+                if bl is not None:
+                    bl.setCornerRadius_(1.5)
+                    bl.setBackgroundColor_(BAR.CGColor())
+                wave.addSubview_(bar)
+                self._bars.append(bar)
+            self._wave = wave
+
+            # running timer (mm:ss, tabular figures so it doesn't jitter).
+            tfont = None
+            try:
+                tfont = NSFont.monospacedDigitSystemFontOfSize_weight_(13, 0.3)
+            except Exception:  # noqa: BLE001
+                tfont = G.rounded_font(13, 0.3)
+            tlab = NSTextField.labelWithString_("0:00")
+            tlab.setFrame_(NSMakeRect(281, (PILL_H - 18) / 2.0, 38, 18))
+            tlab.setFont_(tfont)
+            tlab.setTextColor_(_white(0.82))
+            tlab.setAlignment_(NSTextAlignmentRight)
+            pill.addSubview_(tlab)
+            self._time = tlab
+
+            # Stop button — ends the current capture (safe in hold + toggle).
+            stop = self._make_stop_button()
+            stop.setFrame_(NSMakeRect(334, (PILL_H - 30) / 2.0, 30, 30))
+            pill.addSubview_(stop)
+            self._stop = stop
+
+            # hint line beneath the pill.
+            hint = NSTextField.labelWithString_(self._hint_text())
+            hint.setFrame_(NSMakeRect(0, 0, PILL_W, HINT_H))
+            hint.setFont_(G.rounded_font(11.5, 0.0))
+            hint.setTextColor_(_white(0.5))
+            hint.setAlignment_(NSTextAlignmentCenter)
+            self._apply_hint_shadow(hint)
+            content.addSubview_(hint)
+            self._hint = hint
+
+            self._built = True
+
+        def _make_stop_button(self):
+            img = None
+            try:
+                img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                    "stop.fill", "Stop")
+            except Exception:  # noqa: BLE001
+                img = None
+            if img is not None:
+                btn = NSButton.buttonWithImage_target_action_(img, self, "stop:")
+            else:
+                btn = NSButton.buttonWithTitle_target_action_("■", self, "stop:")
+            btn.setBordered_(False)
+            try:
+                btn.setContentTintColor_(_white(0.85))
+            except Exception:  # noqa: BLE001
+                pass
+            btn.setWantsLayer_(True)
+            bl = btn.layer()
+            if bl is not None:
+                bl.setCornerRadius_(15.0)
+                bl.setBackgroundColor_(_white(0.08).CGColor())
+                bl.setBorderWidth_(1.0)
+                bl.setBorderColor_(_white(0.16).CGColor())
+            btn.setToolTip_("Stop")
+            return btn
+
+        def _hint_text(self):
+            sym = {
+                "alt_r": "⌥", "alt_l": "⌥", "alt": "⌥",
+                "ctrl_r": "⌃", "ctrl_l": "⌃", "ctrl": "⌃",
+                "cmd_r": "⌘", "cmd_l": "⌘", "cmd": "⌘",
+                "shift": "⇧", "fn": "fn",
+            }.get(str(self._app.hotkey_name).lower(), str(self._app.hotkey_name))
+            verb = ("Release %s to insert" if self._app.cfg.get("mode") == "hold"
+                    else "Tap %s to stop") % sym
+            return "%s · say “never mind” to undo" % verb
+
+        def _apply_hint_shadow(self, field):
+            # A soft dark shadow keeps the low-alpha hint legible over both light
+            # and dark backgrounds (it floats over whatever app you're in).
+            try:
+                from Cocoa import (
+                    NSShadow, NSAttributedString, NSColor as _C,
+                    NSShadowAttributeName, NSFontAttributeName,
+                    NSForegroundColorAttributeName, NSParagraphStyleAttributeName,
+                    NSMutableParagraphStyle,
+                )
+                sh = NSShadow.alloc().init()
+                sh.setShadowColor_(_C.blackColor().colorWithAlphaComponent_(0.6))
+                sh.setShadowBlurRadius_(3.0)
+                sh.setShadowOffset_(_zero_size())
+                para = NSMutableParagraphStyle.alloc().init()
+                para.setAlignment_(NSTextAlignmentCenter)
+                attrs = {
+                    NSFontAttributeName: field.font(),
+                    NSForegroundColorAttributeName: _white(0.55),
+                    NSShadowAttributeName: sh,
+                    NSParagraphStyleAttributeName: para,
+                }
+                field.setAttributedStringValue_(
+                    NSAttributedString.alloc().initWithString_attributes_(
+                        field.stringValue(), attrs))
+            except Exception:  # noqa: BLE001
+                pass
+
+        # -- placement -------------------------------------------------------
+        def _position(self):
+            screen = NSScreen.mainScreen()
+            if screen is None:
+                screens = NSScreen.screens()
+                screen = screens[0] if screens else None
+            if screen is None:
+                return
+            vf = screen.visibleFrame()
+            x = vf.origin.x + (vf.size.width - PANEL_W) / 2.0
+            y = vf.origin.y + 24.0
+            self._panel.setFrameOrigin_((x, y))
+
+        # -- state transitions (main thread) --------------------------------
+        def showListening(self):
+            try:
+                self._build()
+                fresh = self._state == "hidden"
+                self._state = "listening"
+                self._label.setStringValue_("Listening")
+                self._wave.setAlphaValue_(1.0)
+                if fresh:
+                    self._t0 = time.monotonic()
+                    self._time.setStringValue_("0:00")
+                    self._position()
+                    self._panel.orderFrontRegardless()
+                self._ensure_timer()
+            except Exception:  # noqa: BLE001
+                pass
+
+        def showTranscribing(self):
+            try:
+                if not self._built or self._state == "hidden":
+                    # Transcribing a queued clip while nothing is actively
+                    # recording — surface the pill so state stays visible.
+                    self._build()
+                    self._t0 = time.monotonic()
+                    self._position()
+                    self._panel.orderFrontRegardless()
+                self._state = "transcribing"
+                self._label.setStringValue_("Transcribing")
+                self._wave.setAlphaValue_(0.5)
+                self._ensure_timer()
+            except Exception:  # noqa: BLE001
+                pass
+
+        def hideHud(self):
+            try:
+                self._state = "hidden"
+                self._stop_timer()
+                if self._panel is not None:
+                    self._panel.orderOut_(None)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # -- animation -------------------------------------------------------
+        def _ensure_timer(self):
+            if self._timer is not None:
+                return
+            from Cocoa import NSTimer
+            self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                1.0 / 30.0, self, "tick:", None, True)
+
+        def _stop_timer(self):
+            if self._timer is not None:
+                try:
+                    self._timer.invalidate()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._timer = None
+
+        def tick_(self, _timer):
+            try:
+                t = time.monotonic()
+                listening = self._state == "listening"
+                base, amp, speed = (6.0, 22.0, 7.0) if listening else (5.0, 6.0, 3.0)
+                for i, bar in enumerate(self._bars):
+                    h = base + amp * (0.5 + 0.5 * math.sin(t * speed + i * 0.55))
+                    bar.setFrame_(NSMakeRect(i * 6.0, WAVE_H / 2.0 - h / 2.0, 3, h))
+                # breathing status dot
+                self._dot.setAlphaValue_(0.55 + 0.45 * (0.5 + 0.5 * math.sin(t * 3.0)))
+                # running clock
+                secs = max(0, int(t - self._t0))
+                self._time.setStringValue_("%d:%02d" % (secs // 60, secs % 60))
+            except Exception:  # noqa: BLE001
+                pass
+
+        # -- actions ---------------------------------------------------------
+        def stop_(self, _sender):
+            try:
+                self._app._end()
+            except Exception:  # noqa: BLE001
+                pass
+
+    _HUD_CTRL_CLASS = _HudController
+    return _HUD_CTRL_CLASS
+
+
+def _zero_size():
+    from Cocoa import NSMakeSize
+    return NSMakeSize(0.0, 0.0)
+
+
 class FlowApp:
     def __init__(self, cfg: dict, transcriber):
         self.cfg = cfg
@@ -2584,6 +2964,7 @@ class FlowApp:
             or os.environ.get("__CFBundleIdentifier", "") == APP_BUNDLE_ID
         )
         self._status_item = None   # NSStatusItem (menu-bar glyph)
+        self._hud = None           # _HudController (floating waveform pill; lazy)
         self._status_line = None   # disabled NSMenuItem showing the state text
         self._menu = None          # NSMenu (retained so it isn't GC'd)
         self._menu_target = None   # _MenuActions instance (retained; action target)
@@ -2598,6 +2979,30 @@ class FlowApp:
         try:
             self._menu_target.performSelectorOnMainThread_withObject_waitUntilDone_(
                 "applyStatus:", [glyph, label], False)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _hud_apply(self, glyph: str) -> None:
+        """Drive the floating recording HUD from the dictation state glyph. Runs
+        on the MAIN THREAD only (called from _MenuActions.applyStatus_). Builds
+        the HUD lazily and must never raise into the dictation path.
+          🔴 -> listening   ⏳ -> transcribing   anything else -> hidden."""
+        if not self.cfg.get("show_hud", True):
+            if self._hud is not None:
+                try:
+                    self._hud.hideHud()
+                except Exception:  # noqa: BLE001
+                    pass
+            return
+        try:
+            if self._hud is None:
+                self._hud = _hud_controller_class().alloc().initWithApp_(self)
+            if glyph == "🔴":
+                self._hud.showListening()
+            elif glyph == "⏳":
+                self._hud.showTranscribing()
+            else:
+                self._hud.hideHud()
         except Exception:  # noqa: BLE001
             pass
 
