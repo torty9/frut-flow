@@ -1754,6 +1754,33 @@ def _menu_actions_class():
 # ---------------------------------------------------------------------------
 _GLASS = None
 
+# The redesign windows are dark charcoal glass (the mockup is always dark). This
+# module-level preference lets one place — and the Settings "Appearance" control —
+# re-theme every window at once. Default "dark" to match the redesign; "system"
+# follows macOS; "light" forces Aqua.
+_APPEARANCE_PREF = "dark"   # "system" | "light" | "dark"
+
+
+def _appearance_for(pref):
+    """NSAppearance for the preference, or None to follow the system appearance."""
+    try:
+        from Cocoa import NSAppearance
+        if pref == "light":
+            return NSAppearance.appearanceNamed_("NSAppearanceNameAqua")
+        if pref == "dark":
+            return NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua")
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _apply_appearance(win):
+    """Theme one NSWindow per _APPEARANCE_PREF (None => system). Never raises."""
+    try:
+        win.setAppearance_(_appearance_for(_APPEARANCE_PREF))
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def _glass():
     """Lazily build & cache the glass helper namespace (a class with static
@@ -1839,6 +1866,7 @@ def _glass():
                 win.setTitlebarAppearsTransparent_(True)
                 win.setTitleVisibility_(NSWindowTitleHidden)
                 win.setMovableByWindowBackground_(True)
+                _apply_appearance(win)   # dark charcoal glass to match the redesign
             except Exception:  # noqa: BLE001
                 pass
 
@@ -2137,8 +2165,10 @@ _HISTORY_CTRL_CLASS = None
 def _history_controller_class():
     """Lazily build the History window controller: an iOS 'liquid glass' list of
     the last 100 dictations (newest first) as translucent squircle cards in a
-    flipped NSStackView, with a search field, per-card Copy, a Clear control, and
-    an empty state. Re-reads history.json on every show(). Deferred AppKit import.
+    flipped NSStackView, grouped into Today / Earlier sections, with a rounded
+    search field, a Transcribe button, a Clear control (with confirm), per-card
+    icon Copy, a title-bar count pill (green sparkle), and empty / no-results
+    states. Re-reads history.json on every show(). Deferred AppKit import.
     Mirrors _transcribe_controller_class's patterns."""
     global _HISTORY_CTRL_CLASS
     if _HISTORY_CTRL_CLASS is not None:
@@ -2146,13 +2176,13 @@ def _history_controller_class():
     import objc
     from Cocoa import (
         NSObject, NSView, NSWindow, NSScrollView, NSStackView, NSTextField,
-        NSButton, NSImage, NSSearchField, NSAlert, NSApplication, NSColor,
-        NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
+        NSButton, NSImage, NSImageView, NSSearchField, NSAlert, NSApplication,
+        NSColor, NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
         NSApplicationActivationPolicyRegular, NSApplicationActivationPolicyAccessory,
         NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
         NSWindowStyleMaskResizable, NSWindowStyleMaskMiniaturizable,
         NSBackingStoreBuffered, NSViewWidthSizable, NSViewHeightSizable,
-        NSViewMinXMargin, NSViewMinYMargin, NSViewMaxYMargin,
+        NSViewMinXMargin, NSViewMaxXMargin, NSViewMinYMargin, NSViewMaxYMargin,
         NSTextAlignmentCenter, NSImageLeft,
     )
     # Layout constants that some pyobjc builds don't export by name (raw values
@@ -2165,11 +2195,42 @@ def _history_controller_class():
         )
     except ImportError:  # pragma: no cover
         _VERT, _FILL, _ALIGN_LEADING = 1, 0, 5
+    # Image scaling mode for the mic-in-circle glyph (proportional up/down).
+    try:
+        from Cocoa import NSImageScaleProportionallyUpOrDown as _SCALE_FIT
+    except ImportError:  # pragma: no cover
+        _SCALE_FIT = 3
 
     G = _glass()
     PAD = 16.0          # window inner padding
     CARD_GAP = 10.0     # vertical gap between cards
     TOPBAR_H = 70.0     # search + buttons row (leaves the top strip for traffic lights)
+
+    def _rgb(r, g, b, a=1.0):
+        return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, a)
+
+    GREEN = _rgb(0.788, 0.925, 0.431)      # #c9ec6e — the früt accent
+
+    # Map a few common bundle/app names to an SF Symbol so the meta line can show
+    # a tiny glyph next to the app name (pure lookup; unknown -> just the name).
+    _APP_SYMBOLS = {
+        "safari": "safari", "google chrome": "globe", "chrome": "globe",
+        "arc": "globe", "firefox": "globe",
+        "mail": "envelope", "messages": "message", "notes": "note.text",
+        "slack": "number", "discord": "message", "telegram": "paperplane",
+        "notion": "doc.text", "obsidian": "doc.text",
+        "code": "chevron.left.forwardslash.chevron.right",
+        "visual studio code": "chevron.left.forwardslash.chevron.right",
+        "terminal": "terminal", "iterm2": "terminal", "iterm": "terminal",
+        "textedit": "doc.plaintext", "pages": "doc.richtext",
+        "finder": "folder", "reminders": "checklist", "calendar": "calendar",
+        "whatsapp": "message", "microsoft word": "doc.richtext",
+    }
+
+    def _app_symbol(name):
+        if not name:
+            return None
+        return _APP_SYMBOLS.get(str(name).strip().lower())
 
     # A flipped document view so the stack lays out TOP-DOWN (AppKit's default
     # origin is bottom-left); the newest card ends up at the top like an iOS list.
@@ -2210,6 +2271,42 @@ def _history_controller_class():
             win.setContentView_(content)
             W = frame.size.width
             H = frame.size.height
+
+            # --- title-bar count pill: green sparkle + total, right-aligned -----
+            # Sits in the traffic-light strip, pinned to the top-right corner.
+            pill = NSView.alloc().initWithFrame_(
+                NSMakeRect(W - PAD - 74, H - 34, 74, 22))
+            pill.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            pill.setWantsLayer_(True)
+            pl = pill.layer()
+            if pl is not None:
+                pl.setCornerRadius_(11.0)
+                pl.setBackgroundColor_(
+                    NSColor.whiteColor().colorWithAlphaComponent_(0.06).CGColor())
+                pl.setBorderWidth_(1.0)
+                pl.setBorderColor_(
+                    NSColor.whiteColor().colorWithAlphaComponent_(0.09).CGColor())
+            spark = NSImageView.alloc().initWithFrame_(NSMakeRect(9, 4, 13, 13))
+            spark.setAutoresizingMask_(0)
+            simg = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "sparkle", "Count")
+            if simg is not None:
+                spark.setImage_(simg)
+                try:
+                    spark.setContentTintColor_(GREEN)
+                except Exception:  # noqa: BLE001
+                    pass
+            pill.addSubview_(spark)
+            count = NSTextField.labelWithString_("0")
+            count.setFont_(G.rounded_font(11, 0.3))
+            count.setTextColor_(
+                NSColor.whiteColor().colorWithAlphaComponent_(0.6))
+            count.setFrame_(NSMakeRect(25, 3, 45, 15))
+            count.setAutoresizingMask_(0)
+            pill.addSubview_(count)
+            content.addSubview_(pill)
+            self._count = count
+
             ctrl_y = H - 62      # control row sits just below the traffic-light strip
 
             # --- top bar: search field + Transcribe + Clear -------------------
@@ -2218,6 +2315,10 @@ def _history_controller_class():
             search.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
             search.setFont_(G.rounded_font(13))
             search.setPlaceholderString_("Search dictations")
+            try:
+                search.setBezelStyle_(1)   # NSTextFieldRoundedBezel
+            except Exception:  # noqa: BLE001
+                pass
             search.setDelegate_(self)                 # controlTextDidChange_ -> live filter
             search.setTarget_(self)
             search.setAction_("searchChanged:")
@@ -2225,11 +2326,16 @@ def _history_controller_class():
             self._search = search
 
             trans = NSButton.buttonWithTitle_target_action_(
-                "Transcribe File…", self, "openTranscribe:")
+                "Transcribe", self, "openTranscribe:")
             trans.setFrame_(NSMakeRect(W - PAD - 208, ctrl_y, 122, 30))
             trans.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
             trans.setBezelStyle_(1)   # NSBezelStyleRounded
             trans.setFont_(G.rounded_font(13))
+            timg = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "waveform", "Transcribe")
+            if timg is not None:
+                trans.setImage_(timg)
+                trans.setImagePosition_(NSImageLeft)
             content.addSubview_(trans)
 
             clear = NSButton.buttonWithTitle_target_action_(
@@ -2272,14 +2378,63 @@ def _history_controller_class():
             self._doc = doc
             self._stack = stack
 
-            # Empty-state label, centered; shown only when there are no cards.
-            empty = NSTextField.labelWithString_("No dictations yet…")
-            empty.setFont_(G.rounded_font(17, 0.2))
-            empty.setTextColor_(NSColor.tertiaryLabelColor())
-            empty.setAlignment_(NSTextAlignmentCenter)
-            empty.setFrame_(NSMakeRect(0, (H - TOPBAR_H) / 2 - 16, W, 32))
-            empty.setAutoresizingMask_(
+            # Empty / no-results state: mic-in-circle icon + title + body,
+            # centered in the list area; shown only when there are no cards.
+            empty = NSView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, W, H - TOPBAR_H))
+            empty.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            cy = (H - TOPBAR_H) / 2
+
+            ecircle = NSView.alloc().initWithFrame_(
+                NSMakeRect(W / 2 - 33, cy + 20, 66, 66))
+            ecircle.setAutoresizingMask_(
+                NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin)
+            ecircle.setWantsLayer_(True)
+            ecl = ecircle.layer()
+            if ecl is not None:
+                ecl.setCornerRadius_(33.0)
+                ecl.setBackgroundColor_(
+                    NSColor.whiteColor().colorWithAlphaComponent_(0.05).CGColor())
+                ecl.setBorderWidth_(1.0)
+                ecl.setBorderColor_(
+                    NSColor.whiteColor().colorWithAlphaComponent_(0.08).CGColor())
+            micv = NSImageView.alloc().initWithFrame_(NSMakeRect(18, 18, 30, 30))
+            micv.setImageScaling_(_SCALE_FIT)
+            micimg = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "mic", "Dictations")
+            if micimg is not None:
+                micv.setImage_(micimg)
+                try:
+                    micv.setContentTintColor_(
+                        NSColor.whiteColor().colorWithAlphaComponent_(0.5))
+                except Exception:  # noqa: BLE001
+                    pass
+            ecircle.addSubview_(micv)
+            empty.addSubview_(ecircle)
+
+            etitle = NSTextField.labelWithString_("No dictations yet")
+            etitle.setFont_(G.rounded_font(15, 0.3))
+            etitle.setTextColor_(
+                NSColor.whiteColor().colorWithAlphaComponent_(0.62))
+            etitle.setAlignment_(NSTextAlignmentCenter)
+            etitle.setFrame_(NSMakeRect(0, cy - 6, W, 22))
+            etitle.setAutoresizingMask_(
                 NSViewWidthSizable | NSViewMinYMargin | NSViewMaxYMargin)
+            empty.addSubview_(etitle)
+            self._empty_title = etitle
+
+            ebody = NSTextField.wrappingLabelWithString_(
+                "Your dictations will appear here as you use früt Flow.")
+            ebody.setFont_(G.rounded_font(12.5))
+            ebody.setTextColor_(
+                NSColor.whiteColor().colorWithAlphaComponent_(0.4))
+            ebody.setAlignment_(NSTextAlignmentCenter)
+            ebody.setFrame_(NSMakeRect(W / 2 - 130, cy - 46, 260, 34))
+            ebody.setAutoresizingMask_(
+                NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin)
+            empty.addSubview_(ebody)
+            self._empty_body = ebody
+
             empty.setHidden_(True)
             content.addSubview_(empty)
             self._empty = empty
@@ -2329,13 +2484,39 @@ def _history_controller_class():
         @objc.python_method
         def _reload(self):
             self._all = load_history()           # newest-first, best-effort
+            try:
+                self._count.setStringValue_(str(len(self._all)))
+            except Exception:  # noqa: BLE001
+                pass
             self._rebuild(str(self._search.stringValue() or ""))
+
+        @objc.python_method
+        def _is_today(self, ts):
+            """True iff `ts` (epoch) falls on the same local calendar day as now."""
+            try:
+                a = time.localtime()
+                b = time.localtime(float(ts))
+                return (a.tm_year, a.tm_yday) == (b.tm_year, b.tm_yday)
+            except Exception:  # noqa: BLE001
+                return False
+
+        @objc.python_method
+        def _section_header(self, title):
+            """A small dimmed section label ('Today' / 'Earlier'). Full-width, so
+            it lays out like a card row but with no background."""
+            lbl = NSTextField.labelWithString_(title)
+            lbl.setFont_(G.rounded_font(12, 0.3))
+            lbl.setTextColor_(
+                NSColor.whiteColor().colorWithAlphaComponent_(0.46))
+            lbl.setTranslatesAutoresizingMaskIntoConstraints_(False)
+            return lbl
 
         @objc.python_method
         def _rebuild(self, query):
             """Tear down and repopulate the stack from self._all, filtered by
-            query. Rebuilding the whole stack is the simplest correct filter; at
-            the 100-cap it is imperceptible."""
+            query and grouped Today / Earlier (newest-first within each group).
+            Rebuilding the whole stack is the simplest correct filter; at the
+            100-cap it is imperceptible."""
             for v in list(self._stack.arrangedSubviews()):
                 self._stack.removeArrangedSubview_(v)
                 v.removeFromSuperview()
@@ -2351,20 +2532,37 @@ def _history_controller_class():
                          or q in str(e.get("app") or "").lower()]
 
             if not items:
-                self._empty.setStringValue_("No matches." if q else "No dictations yet…")
+                # Empty (no history at all) vs no-results (search matched nothing).
+                if q:
+                    self._empty_title.setStringValue_("No matches")
+                    self._empty_body.setStringValue_(
+                        "No dictations match “%s”. Try a different search."
+                        % query.strip())
+                else:
+                    self._empty_title.setStringValue_("No dictations yet")
+                    self._empty_body.setStringValue_(
+                        "Your dictations will appear here as you use früt Flow.")
                 self._empty.setHidden_(False)
                 avail = self._scroll.contentSize()
                 self._doc.setFrameSize_(NSMakeSize(avail.width, avail.height))
                 return
             self._empty.setHidden_(True)
 
-            for e in items:
-                card = self._make_card(e)
-                self._stack.addArrangedSubview_(card)
-                # Now that the card shares the stack's hierarchy, pin its width to
-                # the stack's inset content width (full-width cards, PAD each side).
-                card.widthAnchor().constraintEqualToAnchor_constant_(
+            # items are already newest-first; partition preserving order.
+            today = [e for e in items if self._is_today(e.get("ts"))]
+            earlier = [e for e in items if not self._is_today(e.get("ts"))]
+
+            def _add_full_width(view):
+                self._stack.addArrangedSubview_(view)
+                view.widthAnchor().constraintEqualToAnchor_constant_(
                     self._stack.widthAnchor(), -2 * PAD).setActive_(True)
+
+            for title, group in (("Today", today), ("Earlier", earlier)):
+                if not group:
+                    continue
+                _add_full_width(self._section_header(title))
+                for e in group:
+                    _add_full_width(self._make_card(e))
             self._resize_doc()
             # A reload or a filter change should always show results from the top,
             # not leave the flipped list parked in blank space where it was scrolled.
@@ -2387,18 +2585,20 @@ def _history_controller_class():
 
         @objc.python_method
         def _make_card(self, entry):
-            """One translucent glass card: wrapping+selectable body text, a subtle
-            meta line, and a Copy button. Auto Layout sizes the card to its text.
-            The Copy button targets `self` (the retained controller); the row text
-            is stashed in self._rows[tag] — so there is NO per-card objc object
-            that could be GC'd out from under the run loop."""
+            """One translucent glass card: wrapping+selectable body text, an
+            icon-only Copy button top-right, and a rich meta row (relative time ·
+            N words · app-with-glyph, + a 'clipboard only' pill when not
+            delivered). Auto Layout sizes the card to its text. The Copy button
+            targets `self` (the retained controller); the row text is stashed in
+            self._rows[tag] — so there is NO per-card objc object that could be
+            GC'd out from under the run loop."""
             text = str(entry.get("text", ""))
             app_name = entry.get("app")
             words = int(entry.get("words") or len(text.split()))
             when = relative_time(entry.get("ts"))
             delivered = bool(entry.get("delivered", True))
 
-            container, inner = G.card(NSMakeRect(0, 0, 480, 60), radius=15.0)
+            container, inner = G.card(NSMakeRect(0, 0, 480, 60), radius=13.0)
             container.setTranslatesAutoresizingMaskIntoConstraints_(False)
             inner.setTranslatesAutoresizingMaskIntoConstraints_(False)
             # (The card's width is pinned to the stack AFTER it's added as an
@@ -2419,44 +2619,101 @@ def _history_controller_class():
             inner.addSubview_(body)
             self._bodies.append(body)
 
-            # Meta line: "2m ago  ·  7 words  ·  Safari" (+ clipboard note).
-            bits = []
-            if when:
-                bits.append(when)
-            bits.append("1 word" if words == 1 else f"{words} words")
-            if app_name:
-                bits.append(str(app_name))
-            if not delivered:
-                bits.append("clipboard only")
-            meta = NSTextField.labelWithString_("  ·  ".join(bits))
-            meta.setFont_(G.rounded_font(11.5))
-            meta.setTextColor_(NSColor.secondaryLabelColor())
-            meta.setTranslatesAutoresizingMaskIntoConstraints_(False)
-            inner.addSubview_(meta)
-
-            # Per-card Copy button. Target = controller; identity via tag.
+            # Per-card Copy button — icon-only (doc.on.doc), top-right corner.
+            # Target = controller; identity via tag.
             tag = self._next_tag
             self._next_tag += 1
             self._rows[tag] = text
-            copy = NSButton.buttonWithTitle_target_action_("Copy", self, "copyCard:")
+            cimg = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "doc.on.doc", "Copy")
+            if cimg is not None:
+                copy = NSButton.buttonWithImage_target_action_(cimg, self, "copyCard:")
+            else:
+                copy = NSButton.buttonWithTitle_target_action_("Copy", self, "copyCard:")
             copy.setTag_(tag)
             copy.setBezelStyle_(1)   # NSBezelStyleRounded
             copy.setFont_(G.rounded_font(12))
+            try:
+                copy.setContentTintColor_(
+                    NSColor.whiteColor().colorWithAlphaComponent_(0.6))
+            except Exception:  # noqa: BLE001
+                pass
             copy.setTranslatesAutoresizingMaskIntoConstraints_(False)
-            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-                "doc.on.doc", "Copy")
-            if img is not None:
-                copy.setImage_(img)
-                copy.setImagePosition_(NSImageLeft)
             inner.addSubview_(copy)
 
-            # --- Auto Layout: 14pt insets; body left of the Copy button; meta below.
-            PADX, PADY = 14.0, 12.0
+            # Meta row: relative time · N words · <glyph> app  (+ clipboard pill).
+            # Built as a small horizontal stack so the optional app glyph and the
+            # 'clipboard only' pill lay out cleanly beside the text.
+            from Cocoa import NSStackView as _HStack
+            try:
+                from Cocoa import (
+                    NSUserInterfaceLayoutOrientationHorizontal as _HORIZ,
+                    NSLayoutAttributeCenterY as _ALIGN_CY,
+                )
+            except ImportError:  # pragma: no cover
+                _HORIZ, _ALIGN_CY = 0, 9
+            meta = _HStack.alloc().initWithFrame_(NSMakeRect(0, 0, 300, 16))
+            meta.setOrientation_(_HORIZ)
+            try:
+                meta.setAlignment_(_ALIGN_CY)
+            except Exception:  # noqa: BLE001
+                pass
+            meta.setSpacing_(6.0)
+            meta.setTranslatesAutoresizingMaskIntoConstraints_(False)
+
+            def _meta_label(s, alpha=0.42):
+                lbl = NSTextField.labelWithString_(s)
+                lbl.setFont_(G.rounded_font(11.5))
+                lbl.setTextColor_(
+                    NSColor.whiteColor().colorWithAlphaComponent_(alpha))
+                return lbl
+
+            if when:
+                meta.addArrangedSubview_(_meta_label(when, 0.5))
+                meta.addArrangedSubview_(_meta_label("·", 0.28))
+            meta.addArrangedSubview_(
+                _meta_label("1 word" if words == 1 else "%d words" % words))
+            if app_name:
+                meta.addArrangedSubview_(_meta_label("·", 0.28))
+                sym = _app_symbol(app_name)
+                if sym:
+                    aimg = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                        sym, str(app_name))
+                    if aimg is not None:
+                        av = NSImageView.alloc().initWithFrame_(
+                            NSMakeRect(0, 0, 13, 13))
+                        av.setImage_(aimg)
+                        try:
+                            av.setContentTintColor_(
+                                NSColor.whiteColor().colorWithAlphaComponent_(0.5))
+                        except Exception:  # noqa: BLE001
+                            pass
+                        meta.addArrangedSubview_(av)
+                meta.addArrangedSubview_(_meta_label(str(app_name)))
+            if not delivered:
+                clip = NSTextField.labelWithString_("clipboard only")
+                clip.setFont_(G.rounded_font(10.5))
+                clip.setTextColor_(
+                    NSColor.whiteColor().colorWithAlphaComponent_(0.5))
+                clip.setWantsLayer_(True)
+                cl = clip.layer()
+                if cl is not None:
+                    cl.setCornerRadius_(5.0)
+                    cl.setBackgroundColor_(
+                        NSColor.whiteColor().colorWithAlphaComponent_(0.06).CGColor())
+                # A little horizontal breathing room inside the pill.
+                clip.setFrame_(NSMakeRect(0, 0, 92, 16))
+                meta.addArrangedSubview_(clip)
+            inner.addSubview_(meta)
+
+            # --- Auto Layout: 13pt insets; body left of the Copy button; meta below.
+            PADX, PADY = 13.0, 12.0
             copy.topAnchor().constraintEqualToAnchor_constant_(
                 inner.topAnchor(), PADY - 2).setActive_(True)
             copy.trailingAnchor().constraintEqualToAnchor_constant_(
                 inner.trailingAnchor(), -PADX).setActive_(True)
-            copy.widthAnchor().constraintEqualToConstant_(74.0).setActive_(True)
+            copy.widthAnchor().constraintEqualToConstant_(28.0).setActive_(True)
+            copy.heightAnchor().constraintEqualToConstant_(26.0).setActive_(True)
 
             body.leadingAnchor().constraintEqualToAnchor_constant_(
                 inner.leadingAnchor(), PADX).setActive_(True)
@@ -2466,9 +2723,10 @@ def _history_controller_class():
                 copy.leadingAnchor(), -10.0).setActive_(True)
 
             meta.leadingAnchor().constraintEqualToAnchor_(body.leadingAnchor()).setActive_(True)
-            meta.trailingAnchor().constraintEqualToAnchor_(body.trailingAnchor()).setActive_(True)
+            meta.trailingAnchor().constraintLessThanOrEqualToAnchor_constant_(
+                inner.trailingAnchor(), -PADX).setActive_(True)
             meta.topAnchor().constraintEqualToAnchor_constant_(
-                body.bottomAnchor(), 6.0).setActive_(True)
+                body.bottomAnchor(), 8.0).setActive_(True)
             meta.bottomAnchor().constraintEqualToAnchor_constant_(
                 inner.bottomAnchor(), -PADY).setActive_(True)
             return container
@@ -2496,15 +2754,25 @@ def _history_controller_class():
             if not txt:
                 return
             _clip_set(txt)
-            sender.setTitle_("Copied")
-            # Restore the label after ~1.1s on the main runloop (no UI thread).
+            # Icon-only button: flash a checkmark instead of a title, then restore.
+            done = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "checkmark", "Copied")
+            if done is not None:
+                sender.setImage_(done)
+            else:
+                sender.setTitle_("✓")
             NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
                 1.1, False, lambda _t: self._restore_copy(sender))
 
         @objc.python_method
         def _restore_copy(self, sender):
             try:
-                sender.setTitle_("Copy")
+                back = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                    "doc.on.doc", "Copy")
+                if back is not None:
+                    sender.setImage_(back)
+                else:
+                    sender.setTitle_("Copy")
             except Exception:  # noqa: BLE001
                 pass
 
