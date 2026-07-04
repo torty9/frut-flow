@@ -1716,6 +1716,12 @@ def _menu_actions_class():
             except Exception:  # noqa: BLE001
                 pass
 
+        def onboardingWindow_(self, sender):
+            try:
+                self._app._show_onboarding_window()
+            except Exception:  # noqa: BLE001
+                pass
+
         # NSApplication delegate: fires when you double-click the app (or click its
         # Dock icon) while it's ALREADY running. A menu-bar app has no main window,
         # so without this "opening" the app does nothing visible — here we open the
@@ -4622,6 +4628,682 @@ def _settings_controller_class():
     return _SETTINGS_CTRL_CLASS
 
 
+_ONBOARDING_CTRL_CLASS = None
+
+
+def _onboarding_controller_class():
+    """Lazily build & cache the Onboarding window controller: a titled glass
+    NSWindow with a 3-step flow (Welcome → Permissions → All set) and a bottom
+    bar (Back / progress dots / primary green button). Deferred AppKit import so
+    CLI paths never touch Cocoa. Mirrors _history_controller_class's patterns."""
+    global _ONBOARDING_CTRL_CLASS
+    if _ONBOARDING_CTRL_CLASS is not None:
+        return _ONBOARDING_CTRL_CLASS
+
+    import objc
+    from pathlib import Path as _Path
+    from Cocoa import (
+        NSObject, NSView, NSWindow, NSTextField, NSButton, NSImage,
+        NSImageView, NSApplication, NSColor, NSFont, NSBezierPath,
+        NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
+        NSApplicationActivationPolicyRegular,
+        NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
+        NSWindowStyleMaskMiniaturizable,
+        NSBackingStoreBuffered, NSViewWidthSizable, NSViewHeightSizable,
+        NSViewMinXMargin, NSViewMinYMargin, NSViewMaxYMargin, NSViewMaxXMargin,
+        NSTextAlignmentCenter, NSTextAlignmentLeft, NSLineBreakByWordWrapping,
+    )
+    try:
+        from Cocoa import (
+            NSImageScaleProportionallyUpOrDown as _SCALE_FILL,
+            NSImageAlignmentCenter as _IMG_CENTER,
+        )
+    except ImportError:  # pragma: no cover
+        _SCALE_FILL, _IMG_CENTER = 3, 0
+
+    G = _glass()
+
+    def _white(a):
+        return NSColor.whiteColor().colorWithAlphaComponent_(a)
+
+    def _rgb(r, g, b, a=1.0):
+        return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, a)
+
+    GREEN = _rgb(0.788, 0.925, 0.431)          # #c9ec6e
+    GREEN_HI = _rgb(0.831, 0.941, 0.475)       # #d4f079
+    GREEN_LO = _rgb(0.753, 0.878, 0.361)       # #c0e05c
+    DARK_TXT = _rgb(0.078, 0.090, 0.043)       # #14170b — text on green
+
+    WIN_W, WIN_H = 500.0, 590.0
+    PAD_X = 34.0
+    BAR_H = 74.0                                # bottom bar height
+
+    # --- live permission readers (all cheap boolean checks) -----------------
+    def _mic_granted():
+        try:
+            import AVFoundation
+            AV = AVFoundation.AVCaptureDevice
+            media = AVFoundation.AVMediaTypeAudio
+            return AV.authorizationStatusForMediaType_(media) == 3
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _ax_granted():
+        try:
+            from ApplicationServices import AXIsProcessTrusted
+            return bool(AXIsProcessTrusted())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _input_granted():
+        try:
+            from Quartz import CGPreflightListenEventAccess
+            return bool(CGPreflightListenEventAccess())
+        except Exception:  # noqa: BLE001
+            return False
+
+    # -----------------------------------------------------------------------
+    # A layer-backed view whose background is a vertical green gradient — the
+    # primary button's fill (an NSButton can't paint a CSS-style gradient, so we
+    # host a bordered NSButton over a gradient container and click the container).
+    class _GreenButton(NSView):
+        def isFlipped(self):
+            return False
+
+    class _OnboardingController(NSObject):
+        def initWithApp_(self, app):
+            self = objc.super(_OnboardingController, self).init()
+            if self is None:
+                return None
+            self._app = app
+            self._step = 0
+            self._perm_timer = None
+            self._perm_rows = {}     # 'mic'/'ax'/'input' -> {'granted','button','pill'}
+            self._step_views = []    # container views, one per step
+            self._built = False
+            self._build()
+            return self
+
+        # ---- construction --------------------------------------------------
+        @objc.python_method
+        def _build(self):
+            style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                     | NSWindowStyleMaskMiniaturizable)
+            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, WIN_W, WIN_H), style, NSBackingStoreBuffered, False)
+            win.setTitle_("Welcome — früt Flow")
+            win.setReleasedWhenClosed_(False)
+            win.setDelegate_(self)
+            G.dress_window(win)
+
+            frame = win.contentView().frame()
+            content = G.backing(frame, G.MAT_WINDOW)
+            win.setContentView_(content)
+            self._content = content
+
+            # Build all three step containers, stacked in the SAME rect (the area
+            # above the bottom bar, below the traffic-light strip). Only one is
+            # unhidden at a time. Each container is scroll-free & fixed-height.
+            body_y = BAR_H
+            body_h = WIN_H - BAR_H
+            self._step_views = []
+            for builder in (self._build_step0, self._build_step1, self._build_step2):
+                v = NSView.alloc().initWithFrame_(
+                    NSMakeRect(0, body_y, WIN_W, body_h))
+                v.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+                builder(v, WIN_W, body_h)
+                v.setHidden_(True)
+                content.addSubview_(v)
+                self._step_views.append(v)
+
+            self._build_bottom_bar(content)
+
+            win.center()
+            self._win = win
+            self._built = True
+            self._apply_step()
+
+        # ---- reusable pieces ----------------------------------------------
+        @objc.python_method
+        def _label(self, parent, text, x, y, w, h, size, weight, color, align):
+            lbl = NSTextField.labelWithString_(text)
+            lbl.setFrame_(NSMakeRect(x, y, w, h))
+            lbl.setFont_(G.rounded_font(size, weight))
+            lbl.setTextColor_(color)
+            lbl.setAlignment_(align)
+            lbl.setLineBreakMode_(NSLineBreakByWordWrapping)
+            lbl.setSelectable_(False)
+            parent.addSubview_(lbl)
+            return lbl
+
+        @objc.python_method
+        def _sf_symbol(self, name, size, color):
+            """An NSImageView with an SF Symbol tinted `color`. Returns None if
+            the symbol is unavailable (very old macOS) so callers can skip it."""
+            img = None
+            try:
+                img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                    name, None)
+            except Exception:  # noqa: BLE001
+                img = None
+            if img is None:
+                return None
+            iv = NSImageView.alloc().init()
+            try:
+                from Cocoa import NSImageSymbolConfiguration
+                cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+                    size, 0)
+                img = img.imageWithSymbolConfiguration_(cfg)
+            except Exception:  # noqa: BLE001
+                pass
+            iv.setImage_(img)
+            iv.setContentTintColor_(color)
+            iv.setImageScaling_(_SCALE_FILL)
+            return iv
+
+        @objc.python_method
+        def _icon_tile(self, parent, symbol, x, y, side, radius, sym_pt):
+            """A green-tinted rounded tile with a centered SF Symbol."""
+            tile = NSView.alloc().initWithFrame_(NSMakeRect(x, y, side, side))
+            G.round_layer(tile, radius, mask=True)
+            lay = tile.layer()
+            if lay is not None:
+                lay.setBackgroundColor_(GREEN.colorWithAlphaComponent_(0.10).CGColor())
+            iv = self._sf_symbol(symbol, sym_pt, GREEN)
+            if iv is not None:
+                inset = (side - sym_pt - 6) / 2.0
+                iv.setFrame_(NSMakeRect(inset, inset, side - inset * 2,
+                                        side - inset * 2))
+                tile.addSubview_(iv)
+            parent.addSubview_(tile)
+            return tile
+
+        @objc.python_method
+        def _feature_row(self, parent, symbol, title, subtitle, x, y, w):
+            """A left-aligned feature row: green icon tile + title + subtitle.
+            Row height fixed at 44; returns the row's height for stacking."""
+            row = NSView.alloc().initWithFrame_(NSMakeRect(x, y, w, 44))
+            self._icon_tile(row, symbol, 0, 3, 38, 10, 19)
+            tx = 38 + 13
+            self._label(row, title, tx, 23, w - tx, 18, 13.5, 0.35,
+                        _white(0.9), NSTextAlignmentLeft)
+            self._label(row, subtitle, tx, 3, w - tx, 17, 12.0, 0.0,
+                        _white(0.5), NSTextAlignmentLeft)
+            parent.addSubview_(row)
+            return row
+
+        # ---- STEP 0: Welcome ----------------------------------------------
+        @objc.python_method
+        def _build_step0(self, v, W, H):
+            top = H - 20
+            # App icon (rounded 88x88).
+            ic = 88.0
+            icon = NSView.alloc().initWithFrame_(
+                NSMakeRect((W - ic) / 2.0, top - ic, ic, ic))
+            G.round_layer(icon, 21.0, mask=True)
+            path = _Path(__file__).resolve().parent / "assets" / "frut-flow-icon.png"
+            img = NSImage.alloc().initWithContentsOfFile_(str(path))
+            iv = NSImageView.alloc().initWithFrame_(NSMakeRect(0, 0, ic, ic))
+            if img is not None:
+                iv.setImage_(img)
+            iv.setImageScaling_(_SCALE_FILL)
+            icon.addSubview_(iv)
+            v.addSubview_(icon)
+
+            y = top - ic - 22 - 30
+            self._label(v, "Welcome to früt Flow", 0, y, W, 30, 23, 0.6,
+                        _white(1.0), NSTextAlignmentCenter)
+            self._label(
+                v, "Private, on-device dictation. Hold a key, speak, and your "
+                "words appear in whatever app you're using.",
+                (W - 340) / 2.0, y - 52, 340, 46, 13.5, 0.0,
+                _white(0.6), NSTextAlignmentCenter)
+
+            # 3 feature rows, left-aligned, centered block (max-width 322).
+            fw = 322.0
+            fx = (W - fw) / 2.0
+            fy = y - 52 - 24 - 44
+            feats = [
+                ("checkmark.shield.fill", "On-device & private",
+                 "No account — nothing leaves your Mac"),
+                ("brain.head.profile", "Learns your words",
+                 "Fixes names automatically from your edits"),
+                ("arrow.counterclockwise", "“Never mind” undo",
+                 "Just say it to delete the last dictation"),
+            ]
+            for sym, title, sub in feats:
+                self._feature_row(v, sym, title, sub, fx, fy, fw)
+                fy -= 44 + 11
+
+        # ---- STEP 1: Permissions ------------------------------------------
+        @objc.python_method
+        def _build_step1(self, v, W, H):
+            top = H - 12
+            side = 56.0
+            self._icon_tile(v, "lock.open", (W - side) / 2.0, top - side,
+                            side, 15, 26)
+            y = top - side - 18 - 26
+            self._label(v, "Two quick permissions", 0, y, W, 26, 21, 0.6,
+                        _white(1.0), NSTextAlignmentCenter)
+            self._label(
+                v, "früt Flow needs these to hear you and type for you. They "
+                "stay on this Mac.",
+                (W - 320) / 2.0, y - 44, 320, 40, 13.5, 0.0,
+                _white(0.58), NSTextAlignmentCenter)
+
+            rows = [
+                ("mic", "mic.fill", "Microphone", "Hear what you dictate"),
+                ("ax", "cursorarrow.click", "Accessibility",
+                 "Paste text into other apps"),
+                ("input", "keyboard", "Input Monitoring",
+                 "Detect the global hotkey"),
+            ]
+            rw = W - PAD_X * 2
+            rx = PAD_X
+            ry = y - 44 - 24 - 60
+            self._perm_rows = {}
+            tag = 1
+            for key, sym, title, sub in rows:
+                self._perm_row(v, key, sym, title, sub, rx, ry, rw, tag)
+                ry -= 60 + 10
+                tag += 1
+
+        @objc.python_method
+        def _perm_row(self, parent, key, sym, title, sub, x, y, w, tag):
+            row = NSView.alloc().initWithFrame_(NSMakeRect(x, y, w, 60))
+            G.round_layer(row, 13.0, mask=True)
+            rl = row.layer()
+            if rl is not None:
+                rl.setBackgroundColor_(_white(0.045).CGColor())
+                rl.setBorderWidth_(1.0)
+                rl.setBorderColor_(_white(0.07).CGColor())
+
+            # neutral icon tile (not green — matches mockup rgba(255,255,255,.06))
+            side = 34.0
+            tile = NSView.alloc().initWithFrame_(NSMakeRect(13, 13, side, side))
+            G.round_layer(tile, 9.0, mask=True)
+            tl = tile.layer()
+            if tl is not None:
+                tl.setBackgroundColor_(_white(0.06).CGColor())
+            iv = self._sf_symbol(sym, 18, GREEN)
+            if iv is not None:
+                iv.setFrame_(NSMakeRect(6, 6, side - 12, side - 12))
+                tile.addSubview_(iv)
+            row.addSubview_(tile)
+
+            tx = 13 + side + 12
+            self._label(row, title, tx, 31, w - tx - 110, 18, 13.5, 0.35,
+                        _white(0.9), NSTextAlignmentLeft)
+            self._label(row, sub, tx, 11, w - tx - 110, 16, 11.5, 0.0,
+                        _white(0.48), NSTextAlignmentLeft)
+
+            # right-side status control: a "Granted" pill + a "Grant" button,
+            # stacked in the same spot; visibility toggled by _refresh_perms.
+            pw, ph = 90.0, 26.0
+            px = w - pw - 14
+            py = (60 - ph) / 2.0
+
+            pill = self._pill_view("Granted", px, py, pw, ph)
+            row.addSubview_(pill)
+
+            grant = NSButton.buttonWithTitle_target_action_(
+                "Grant", self, "grantClicked:")
+            grant.setFrame_(NSMakeRect(px + pw - 66, py, 66, ph))
+            grant.setFont_(G.rounded_font(12.5, 0.4))
+            grant.setBezelStyle_(1)
+            grant.setBordered_(False)
+            grant.setWantsLayer_(True)
+            gl = grant.layer()
+            if gl is not None:
+                G.round_layer(grant, 8.0, mask=True)
+                gl.setBackgroundColor_(GREEN.colorWithAlphaComponent_(0.12).CGColor())
+                gl.setBorderWidth_(1.0)
+                gl.setBorderColor_(GREEN.colorWithAlphaComponent_(0.4).CGColor())
+            self._tint_button_title(grant, "Grant", GREEN)
+            grant.setTag_(tag)
+            row.addSubview_(grant)
+
+            parent.addSubview_(row)
+            self._perm_rows[key] = {
+                "tag": tag, "pill": pill, "button": grant, "granted": False}
+
+        @objc.python_method
+        def _pill_view(self, text, x, y, w, h):
+            pill = NSView.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
+            G.round_layer(pill, h / 2.0, mask=True)
+            pl = pill.layer()
+            if pl is not None:
+                pl.setBackgroundColor_(GREEN.colorWithAlphaComponent_(0.14).CGColor())
+            lbl = NSTextField.labelWithString_(text)
+            lbl.setFrame_(NSMakeRect(0, (h - 16) / 2.0, w, 16))
+            lbl.setFont_(G.rounded_font(12, 0.4))
+            lbl.setTextColor_(GREEN)
+            lbl.setAlignment_(NSTextAlignmentCenter)
+            pill.addSubview_(lbl)
+            return pill
+
+        @objc.python_method
+        def _tint_button_title(self, btn, text, color):
+            try:
+                from Cocoa import (
+                    NSAttributedString, NSForegroundColorAttributeName,
+                    NSFontAttributeName, NSParagraphStyleAttributeName,
+                    NSMutableParagraphStyle,
+                )
+                ps = NSMutableParagraphStyle.alloc().init()
+                ps.setAlignment_(NSTextAlignmentCenter)
+                attrs = {
+                    NSForegroundColorAttributeName: color,
+                    NSFontAttributeName: G.rounded_font(12.5, 0.4),
+                    NSParagraphStyleAttributeName: ps,
+                }
+                btn.setAttributedTitle_(
+                    NSAttributedString.alloc().initWithString_attributes_(
+                        text, attrs))
+            except Exception:  # noqa: BLE001
+                pass
+
+        # ---- STEP 2: All set ----------------------------------------------
+        @objc.python_method
+        def _build_step2(self, v, W, H):
+            top = H - 26
+            side = 74.0
+            tile = NSView.alloc().initWithFrame_(
+                NSMakeRect((W - side) / 2.0, top - side, side, side))
+            G.round_layer(tile, side / 2.0, mask=True)
+            tl = tile.layer()
+            if tl is not None:
+                tl.setBackgroundColor_(GREEN.colorWithAlphaComponent_(0.10).CGColor())
+                tl.setBorderWidth_(1.0)
+                tl.setBorderColor_(GREEN.colorWithAlphaComponent_(0.25).CGColor())
+            iv = self._sf_symbol("mic.fill", 34, GREEN)
+            if iv is not None:
+                iv.setFrame_(NSMakeRect(18, 18, side - 36, side - 36))
+                tile.addSubview_(iv)
+            v.addSubview_(tile)
+
+            y = top - side - 20 - 26
+            self._label(v, "You're all set", 0, y, W, 26, 22, 0.6,
+                        _white(1.0), NSTextAlignmentCenter)
+            self._label(
+                v, "Hold %s, say something, and release to insert it wherever "
+                "your cursor is." % self._hotkey_hint(),
+                (W - 340) / 2.0, y - 54, 340, 48, 13.5, 0.0,
+                _white(0.6), NSTextAlignmentCenter)
+
+            # faux "Try typing with your voice" field.
+            fw = 330.0
+            field = NSView.alloc().initWithFrame_(
+                NSMakeRect((W - fw) / 2.0, y - 54 - 26 - 48, fw, 48))
+            G.round_layer(field, 12.0, mask=True)
+            fl = field.layer()
+            if fl is not None:
+                fl.setBackgroundColor_(_rgb(0, 0, 0, 0.26).CGColor())
+                fl.setBorderWidth_(1.0)
+                fl.setBorderColor_(_white(0.08).CGColor())
+            self._label(field, "Try typing with your voice", 15, 16, fw - 30, 18,
+                        13.5, 0.0, _white(0.5), NSTextAlignmentLeft)
+            v.addSubview_(field)
+
+            self._label(
+                v, "You can change the hotkey anytime in Settings.",
+                0, y - 54 - 26 - 48 - 16 - 16, W, 16, 12, 0.0,
+                _white(0.4), NSTextAlignmentCenter)
+
+        @objc.python_method
+        def _hotkey_hint(self):
+            sym = {
+                "alt_r": "⌥ Right Option", "alt_l": "⌥ Left Option",
+                "alt": "⌥ Option", "ctrl_r": "⌃ Right Control",
+                "ctrl_l": "⌃ Left Control", "ctrl": "⌃ Control",
+                "cmd_r": "⌘ Right Command", "cmd_l": "⌘ Left Command",
+                "cmd": "⌘ Command", "shift": "⇧ Shift", "fn": "fn",
+            }.get(str(self._app.hotkey_name).lower(),
+                  str(self._app.hotkey_name))
+            return sym
+
+        # ---- bottom bar ---------------------------------------------------
+        @objc.python_method
+        def _build_bottom_bar(self, content):
+            bar = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, WIN_W, BAR_H))
+            bar.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
+            content.addSubview_(bar)
+            self._bar = bar
+
+            # Back button (left; hidden on step 0).
+            back = NSButton.buttonWithTitle_target_action_(
+                "Back", self, "backClicked:")
+            back.setFrame_(NSMakeRect(26, 20, 66, 33))
+            back.setFont_(G.rounded_font(13, 0.0))
+            back.setBezelStyle_(1)
+            back.setBordered_(False)
+            back.setWantsLayer_(True)
+            bl = back.layer()
+            if bl is not None:
+                G.round_layer(back, 9.0, mask=True)
+                bl.setBackgroundColor_(_white(0.06).CGColor())
+                bl.setBorderWidth_(1.0)
+                bl.setBorderColor_(_white(0.09).CGColor())
+            self._tint_button_title(back, "Back", _white(0.72))
+            back.setAutoresizingMask_(NSViewMaxXMargin | NSViewMaxYMargin)
+            bar.addSubview_(back)
+            self._back = back
+
+            # Progress dots (center).
+            self._dots = []
+            dot_gap = 7.0
+            widths = [18.0, 6.0, 6.0]
+            total = sum(widths) + dot_gap * 2
+            dx = (WIN_W - total) / 2.0
+            dy = (BAR_H - 6) / 2.0
+            for i in range(3):
+                dw = widths[i]
+                dot = NSView.alloc().initWithFrame_(NSMakeRect(dx, dy, dw, 6))
+                G.round_layer(dot, 3.0, mask=True)
+                dot.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxXMargin
+                                         | NSViewMaxYMargin)
+                bar.addSubview_(dot)
+                self._dots.append(dot)
+                dx += dw + dot_gap
+
+            # Primary green button (right). Gradient fill via a layer under a
+            # transparent-title NSButton for the click.
+            pbw, pbh = 128.0, 33.0
+            pbx = WIN_W - 26 - pbw
+            pby = 20.0
+            gcont = _GreenButton.alloc().initWithFrame_(
+                NSMakeRect(pbx, pby, pbw, pbh))
+            gcont.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            G.round_layer(gcont, 9.0, mask=True)
+            self._prime_gradient(gcont, pbw, pbh)
+            btn = NSButton.buttonWithTitle_target_action_(
+                "Get Started", self, "primaryClicked:")
+            btn.setFrame_(NSMakeRect(0, 0, pbw, pbh))
+            btn.setBezelStyle_(1)
+            btn.setBordered_(False)
+            btn.setFont_(G.rounded_font(13, 0.5))
+            self._tint_button_title(btn, "Get Started", DARK_TXT)
+            gcont.addSubview_(btn)
+            bar.addSubview_(gcont)
+            self._primary = btn
+            self._primary_cont = gcont
+
+        @objc.python_method
+        def _prime_gradient(self, view, w, h):
+            try:
+                from Quartz import CAGradientLayer
+                lay = view.layer()
+                if lay is None:
+                    return
+                grad = CAGradientLayer.layer()
+                grad.setFrame_(NSMakeRect(0, 0, w, h))
+                grad.setColors_([GREEN_HI.CGColor(), GREEN_LO.CGColor()])
+                grad.setStartPoint_(NSMakePoint(0.5, 1.0))
+                grad.setEndPoint_(NSMakePoint(0.5, 0.0))
+                grad.setCornerRadius_(9.0)
+                lay.insertSublayer_atIndex_(grad, 0)
+                self._grad_layer = grad
+            except Exception:  # noqa: BLE001
+                lay = view.layer()
+                if lay is not None:
+                    lay.setBackgroundColor_(GREEN.CGColor())
+
+        # ---- step navigation ----------------------------------------------
+        @objc.python_method
+        def _apply_step(self):
+            for i, v in enumerate(self._step_views):
+                v.setHidden_(i != self._step)
+            self._back.setHidden_(self._step == 0)
+            # dot widths/colors: active dot wider + green.
+            for i, dot in enumerate(self._dots):
+                lay = dot.layer()
+                active = (i == self._step)
+                nf = dot.frame()
+                neww = 18.0 if active else 6.0
+                dot.setFrame_(NSMakeRect(nf.origin.x, nf.origin.y, neww,
+                                         nf.size.height))
+                if lay is not None:
+                    col = GREEN if active else _white(0.22)
+                    lay.setBackgroundColor_(col.CGColor())
+            # re-center the dot row for the new widths.
+            self._recenter_dots()
+            # primary button label per step.
+            labels = ["Get Started", "Continue", "Start dictating"]
+            self._primary.setTitle_(labels[self._step])
+            self._tint_button_title(self._primary, labels[self._step], DARK_TXT)
+
+            # permission timer only runs on step 1.
+            if self._step == 1:
+                self._refresh_perms()
+                self._start_perm_timer()
+            else:
+                self._stop_perm_timer()
+
+        @objc.python_method
+        def _recenter_dots(self):
+            widths = [d.frame().size.width for d in self._dots]
+            dot_gap = 7.0
+            total = sum(widths) + dot_gap * 2
+            dx = (WIN_W - total) / 2.0
+            dy = (BAR_H - 6) / 2.0
+            for d in self._dots:
+                w = d.frame().size.width
+                d.setFrame_(NSMakeRect(dx, dy, w, 6))
+                dx += w + dot_gap
+
+        # ---- permission status --------------------------------------------
+        @objc.python_method
+        def _refresh_perms(self):
+            states = {"mic": _mic_granted(), "ax": _ax_granted(),
+                      "input": _input_granted()}
+            for key, granted in states.items():
+                row = self._perm_rows.get(key)
+                if row is None:
+                    continue
+                row["granted"] = granted
+                row["pill"].setHidden_(not granted)
+                row["button"].setHidden_(granted)
+            # Emphasize Continue only when all three granted (still allow proceed).
+            self._all_granted = all(states.values())
+
+        @objc.python_method
+        def _start_perm_timer(self):
+            self._stop_perm_timer()
+            self._perm_timer = (
+                NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    1.5, self, "permTick:", None, True))
+
+        @objc.python_method
+        def _stop_perm_timer(self):
+            if self._perm_timer is not None:
+                self._perm_timer.invalidate()
+                self._perm_timer = None
+
+        def permTick_(self, timer):
+            # low-frequency: only reads booleans + flips pill/button visibility.
+            if self._step == 1:
+                self._refresh_perms()
+            else:
+                self._stop_perm_timer()
+
+        # ---- actions -------------------------------------------------------
+        def primaryClicked_(self, sender):
+            if self._step >= 2:
+                self._win.performClose_(None)
+                return
+            self._step += 1
+            self._apply_step()
+
+        def backClicked_(self, sender):
+            if self._step > 0:
+                self._step -= 1
+                self._apply_step()
+
+        def grantClicked_(self, sender):
+            tag = sender.tag()
+            key = None
+            for k, r in self._perm_rows.items():
+                if r["tag"] == tag:
+                    key = k
+                    break
+            if key == "mic":
+                self._grant_mic()
+            elif key == "ax":
+                self._open_pane("Privacy_Accessibility")
+            elif key == "input":
+                self._open_pane("Privacy_ListenEvent")
+
+        @objc.python_method
+        def _grant_mic(self):
+            # Trigger the AVFoundation prompt off the main thread (the module-level
+            # helper blocks/polls up to 120s — must never run on the UI thread).
+            def _work():
+                try:
+                    ensure_microphone_access()
+                except Exception:  # noqa: BLE001
+                    pass
+                # marshal a refresh back to the main thread.
+                self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                    "permRefreshMain:", None, False)
+            threading.Thread(target=_work, daemon=True).start()
+
+        def permRefreshMain_(self, obj):
+            if self._step == 1:
+                self._refresh_perms()
+
+        @objc.python_method
+        def _open_pane(self, anchor):
+            try:
+                subprocess.Popen([
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security"
+                    "?%s" % anchor])
+            except Exception:  # noqa: BLE001
+                pass
+
+        # ---- show / window delegate ---------------------------------------
+        @objc.python_method
+        def show(self):
+            app = NSApplication.sharedApplication()
+            app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+            app.activateIgnoringOtherApps_(True)
+            self._step = 0
+            self._apply_step()
+            self._win.makeKeyAndOrderFront_(None)
+
+        def windowDidBecomeKey_(self, note):
+            if self._step == 1:
+                self._refresh_perms()
+
+        def windowWillClose_(self, note):
+            self._stop_perm_timer()
+            NSOperationQueue.mainQueue().addOperationWithBlock_(
+                lambda: _sync_activation_policy())
+
+    _ONBOARDING_CTRL_CLASS = _OnboardingController
+    return _ONBOARDING_CTRL_CLASS
+
+
 class FlowApp:
     def __init__(self, cfg: dict, transcriber):
         self.cfg = cfg
@@ -4669,6 +5351,8 @@ class FlowApp:
         self._transcribe_ctrl = None
         # "History" window — the app's home page (built lazily on first open).
         self._history_ctrl = None
+        # Onboarding window (built lazily on first open).
+        self._onboarding_ctrl = None
         # "Settings" window (built lazily on first open).
         self._settings_ctrl = None
         # Serialize model access: the mic worker and the file-transcribe window must
@@ -5505,6 +6189,17 @@ class FlowApp:
         except Exception as e:  # noqa: BLE001
             print(f"[flow] couldn't open the history window: {e}", flush=True)
 
+    def _show_onboarding_window(self) -> None:
+        """Open (or re-focus) the first-run Onboarding window. Built lazily."""
+        try:
+            if self._onboarding_ctrl is None:
+                self._onboarding_ctrl = (
+                    _onboarding_controller_class().alloc().initWithApp_(self))
+            self._onboarding_ctrl.show()
+            print("[flow] onboarding window opened.", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[flow] couldn't open the onboarding window: {e}", flush=True)
+
     def _show_transcribe_window(self) -> None:
         """Open (or re-focus) the 'Transcribe an audio file' window. Built lazily."""
         try:
@@ -5578,6 +6273,7 @@ class FlowApp:
         _add("Transcribe Audio File…", "transcribeFile:")
         _add("Teach a Word…", "teachWord:")
         _add("Settings…", "settings:")
+        _add("Welcome / Setup…", "onboardingWindow:")
         menu.addItem_(NSMenuItem.separatorItem())
         _add("Restart", "restart:")
         _add("Open Log", "openLog:")
