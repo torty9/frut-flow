@@ -55,6 +55,9 @@ DEFAULT_CONFIG = {
                                  # holding it doesn't type into your document.
     "mode": "hold",              # "hold"  = push-to-talk (hold while speaking)
                                  # "toggle"= tap to start, tap again to stop
+    "appearance": "dark",      # UI theme for the app's own windows:
+                                 # "system" (follow macOS) | "light" | "dark".
+                                 # Applied live via NSApp.setAppearance_.
     "debug": False,              # when true, log repr(key)+vk for EVERY key event
                                  # so real human keypresses are visible in flow.log
 
@@ -1707,6 +1710,12 @@ def _menu_actions_class():
             except Exception:  # noqa: BLE001
                 pass
 
+        def settings_(self, sender):
+            try:
+                self._app._show_settings_window()
+            except Exception:  # noqa: BLE001
+                pass
+
         # NSApplication delegate: fires when you double-click the app (or click its
         # Dock icon) while it's ALREADY running. A menu-bar app has no main window,
         # so without this "opening" the app does nothing visible — here we open the
@@ -1778,6 +1787,27 @@ def _apply_appearance(win):
     """Theme one NSWindow per _APPEARANCE_PREF (None => system). Never raises."""
     try:
         win.setAppearance_(_appearance_for(_APPEARANCE_PREF))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _set_appearance_pref(pref):
+    """Change the global UI theme and apply it EVERYWHERE at once: the app-wide
+    appearance plus every open window (our glass windows carry a per-window
+    appearance that overrides the app's, so they must be re-applied explicitly).
+    Used by the Settings 'Appearance' control and at launch. Never raises."""
+    global _APPEARANCE_PREF
+    _APPEARANCE_PREF = pref if pref in ("system", "light", "dark") else "dark"
+    try:
+        from Cocoa import NSApplication
+        app = NSApplication.sharedApplication()
+        ap = _appearance_for(_APPEARANCE_PREF)
+        app.setAppearance_(ap)
+        for w in app.windows():
+            try:
+                w.setAppearance_(ap)
+            except Exception:  # noqa: BLE001
+                pass
     except Exception:  # noqa: BLE001
         pass
 
@@ -3704,6 +3734,894 @@ def _zero_size():
     return NSMakeSize(0.0, 0.0)
 
 
+_SETTINGS_CTRL_CLASS = None
+
+
+def _settings_config_save(key, value):
+    """Read-modify-write a SINGLE key in ~/.flowdictate/config.json, preserving
+    every other key. Atomic (same-dir temp file + os.replace) so a concurrent
+    reader never sees a torn file. Pure-Python; never raises. Returns True on ok."""
+    import json
+    import os
+    import tempfile
+    from pathlib import Path
+    path = Path.home() / ".flowdictate" / "config.json"
+    try:
+        try:
+            cur = json.loads(path.read_text())
+            if not isinstance(cur, dict):
+                cur = {}
+        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+            cur = {}
+        cur[key] = value
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(cur, ensure_ascii=False, indent=2) + "\n"
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent),
+                                   prefix=path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)          # atomic on same filesystem
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _settings_controller_class():
+    """Lazily build the Settings window controller: a titled glass window with a
+    top segmented tab bar (General / Dictation / Model / Privacy) that swaps a
+    scrolling content pane. Native controls (NSSwitch / NSSegmentedControl /
+    NSSlider) grouped into rounded glass cards, mirroring the redesign mockup.
+    Deferred AppKit import so CLI paths never load Cocoa. Mirrors the History /
+    Transcribe controller patterns."""
+    global _SETTINGS_CTRL_CLASS
+    if _SETTINGS_CTRL_CLASS is not None:
+        return _SETTINGS_CTRL_CLASS
+    import objc
+    from Cocoa import (
+        NSObject, NSView, NSWindow, NSScrollView, NSTextField, NSButton,
+        NSSwitch, NSSlider, NSSegmentedControl, NSImageView, NSImage,
+        NSApplication, NSColor,
+        NSApplicationActivationPolicyRegular,
+        NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
+        NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
+        NSWindowStyleMaskMiniaturizable,
+        NSBackingStoreBuffered, NSViewWidthSizable, NSViewHeightSizable,
+        NSViewMinXMargin, NSViewMinYMargin, NSViewMaxYMargin,
+        NSTextAlignmentCenter, NSTextAlignmentRight,
+    )
+    # Control-state / segment-tracking constants (raw values are stable if a
+    # given pyobjc build doesn't export the names).
+    try:
+        from Cocoa import (
+            NSControlStateValueOn as _ON, NSControlStateValueOff as _OFF,
+            NSSegmentSwitchTrackingSelectOne as _SELECT_ONE,
+        )
+    except ImportError:  # pragma: no cover
+        _ON, _OFF, _SELECT_ONE = 1, 0, 0
+
+    G = _glass()
+
+    # A flipped document view so panes lay out TOP-DOWN (AppKit's origin is
+    # bottom-left). One tiny subclass, built once and cached on the module.
+    global _SETTINGS_FLIPPED_CLASS
+    try:
+        _flipped_cls = _SETTINGS_FLIPPED_CLASS
+    except NameError:
+        _flipped_cls = None
+    if _flipped_cls is None:
+        class _FlippedPane(NSView):
+            def isFlipped(self):
+                return True
+        _flipped_cls = _FlippedPane
+        _SETTINGS_FLIPPED_CLASS = _FlippedPane
+
+    # --- palette (mockup values, built with sRGB) -------------------------
+    def _c(r, g, b, a=1.0):
+        return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, a)
+    ACCENT = _c(0.788, 0.925, 0.431, 1.0)
+    CARD_BG = _c(1, 1, 1, 0.038)
+    CARD_RIM = _c(1, 1, 1, 0.07)
+    ROW_DIV = _c(1, 1, 1, 0.055)
+    TITLE_COL = _c(1, 1, 1, 0.90)
+    SUB_COL = _c(1, 1, 1, 0.45)
+    SECTION_COL = _c(1, 1, 1, 0.50)
+    OK_BG = _c(0.788, 0.925, 0.431, 0.14)
+    BAD_BG = _c(1.0, 0.62, 0.40, 0.16)
+    BAD_FG = _c(1.0, 0.70, 0.48, 1.0)
+    BANNER_BG = _c(0.788, 0.925, 0.431, 0.08)
+    BANNER_RIM = _c(0.788, 0.925, 0.431, 0.20)
+    CHIP_BG = _c(0, 0, 0, 0.26)
+    CHIP_RIM = _c(1, 1, 1, 0.09)
+    TILE_BG = _c(1, 1, 1, 0.06)
+
+    WIN_W, WIN_H = 520.0, 500.0
+    PAD = 18.0
+    CONTENT_W = WIN_W - PAD * 2
+    ROW_H = 54.0
+    TABS = ("General", "Dictation", "Model", "Privacy")
+
+    PK_V2 = "mlx-community/parakeet-tdt-0.6b-v2"
+    PK_V3 = "mlx-community/parakeet-tdt-0.6b-v3"
+
+    URL_MIC = ("x-apple.systempreferences:com.apple.preference.security"
+               "?Privacy_Microphone")
+    URL_AX = ("x-apple.systempreferences:com.apple.preference.security"
+              "?Privacy_Accessibility")
+    URL_INPUT = ("x-apple.systempreferences:com.apple.preference.security"
+                 "?Privacy_ListenEvent")
+
+    class _SettingsController(NSObject):
+        def initWithApp_(self, app):
+            self = objc.super(_SettingsController, self).init()
+            if self is None:
+                return None
+            self._app = app
+            self._tab = "General"
+            self._panes = {}            # name -> flipped pane view
+            self._switch_meta = {}      # tag -> (cfg_key, apply_name_or_None)
+            self._seg_meta = {}         # tag -> (values, cfg_key_or_None, apply_name_or_None)
+            self._perm_rows = {}        # key -> {"pill":btn, "url":str, "tag":int}
+            self._perm_tag_to_key = {}  # button tag -> perm key
+            self._maxrec_label = None
+            self._maxrec_slider = None
+            self._perm_timer = None
+            self._next_tag = 100
+            self._build()
+            return self
+
+        # ---- tiny pure-Python helpers ------------------------------------
+        @objc.python_method
+        def _tag(self):
+            t = self._next_tag
+            self._next_tag += 1
+            return t
+
+        @objc.python_method
+        def _cfg(self, key, default=None):
+            try:
+                return self._app.cfg.get(key, default)
+            except Exception:  # noqa: BLE001
+                return default
+
+        @objc.python_method
+        def _save(self, key, value):
+            _settings_config_save(key, value)
+            try:
+                self._app.cfg[key] = value
+            except Exception:  # noqa: BLE001
+                pass
+
+        # ---- window construction -----------------------------------------
+        @objc.python_method
+        def _build(self):
+            style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                     | NSWindowStyleMaskMiniaturizable)
+            win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, WIN_W, WIN_H), style, NSBackingStoreBuffered, False)
+            win.setTitle_("Settings — früt Flow")
+            win.setReleasedWhenClosed_(False)
+            win.setDelegate_(self)
+            G.dress_window(win)
+            frame = win.contentView().frame()
+            content = G.backing(frame, G.MAT_WINDOW)
+            win.setContentView_(content)
+            H = frame.size.height
+
+            # Tab switcher (segmented), centered under the traffic-light strip.
+            seg = NSSegmentedControl.alloc().initWithFrame_(
+                NSMakeRect(0, H - 44, 360, 26))
+            seg.setSegmentCount_(len(TABS))
+            total = 0.0
+            for i, t in enumerate(TABS):
+                seg.setLabel_forSegment_(t, i)
+                w = 92.0
+                seg.setWidth_forSegment_(w, i)
+                total += w
+            try:
+                seg.setSegmentStyle_(8)   # NSSegmentStyleSeparated
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                seg.setTrackingMode_(_SELECT_ONE)
+            except Exception:  # noqa: BLE001
+                pass
+            seg.setSelectedSegment_(0)
+            seg.setTarget_(self)
+            seg.setAction_("tabChanged:")
+            seg.setFont_(G.rounded_font(12))
+            seg.setFrame_(NSMakeRect((frame.size.width - total) / 2.0, H - 44,
+                                     total, 26))
+            seg.setAutoresizingMask_(
+                NSViewMinYMargin | NSViewMinXMargin | NSViewMaxYMargin)
+            content.addSubview_(seg)
+            self._seg_tabs = seg
+
+            top = H - 58
+            scroll = NSScrollView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, frame.size.width, top))
+            scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            scroll.setHasVerticalScroller_(True)
+            scroll.setDrawsBackground_(False)
+            scroll.setBorderType_(0)          # NSNoBorder
+            content.addSubview_(scroll)
+            self._scroll = scroll
+
+            for name in TABS:
+                self._panes[name] = self._build_pane(name)
+            self._show_pane("General")
+
+            win.center()
+            self._win = win
+
+        @objc.python_method
+        def _flipped(self, w, h):
+            return _flipped_cls.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
+
+        # ---- top-anchored building blocks (y_top measured from pane top) --
+        @objc.python_method
+        def _card_at(self, pane, y_top, n_rows):
+            h = ROW_H * n_rows
+            container, inner = G.card(NSMakeRect(PAD, y_top, CONTENT_W, h),
+                                      radius=12.0)
+            try:
+                il = inner.layer()
+                if il is not None:
+                    il.setBackgroundColor_(CARD_BG.CGColor())
+                    il.setBorderColor_(CARD_RIM.CGColor())
+            except Exception:  # noqa: BLE001
+                pass
+            pane.addSubview_(container)
+            return inner, h
+
+        @objc.python_method
+        def _section_at(self, pane, text, y_top):
+            lbl = NSTextField.labelWithString_(text.upper())
+            lbl.setFont_(G.rounded_font(11, 0.3))
+            lbl.setTextColor_(SECTION_COL)
+            lbl.setFrame_(NSMakeRect(PAD + 2, y_top, CONTENT_W - 4, 15))
+            pane.addSubview_(lbl)
+            return 15 + 7        # consumed height incl. gap
+
+        @objc.python_method
+        def _place_top(self, pane, view, y_top, h):
+            f = view.frame()
+            view.setFrame_(NSMakeRect(f.origin.x, y_top, f.size.width, h))
+            pane.addSubview_(view)
+
+        @objc.python_method
+        def _row_top(self, inner, row_idx):
+            # y (bottom-left space) of the TOP edge of a row inside a card.
+            return inner.frame().size.height - ROW_H * row_idx
+
+        @objc.python_method
+        def _row_divider(self, inner, row_idx):
+            if row_idx == 0:
+                return
+            top = self._row_top(inner, row_idx)
+            div = NSView.alloc().initWithFrame_(
+                NSMakeRect(0, top, inner.frame().size.width, 1))
+            div.setWantsLayer_(True)
+            div.layer().setBackgroundColor_(ROW_DIV.CGColor())
+            div.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+            inner.addSubview_(div)
+
+        @objc.python_method
+        def _row_text(self, inner, row_idx, title, subtitle, right_x=150.0):
+            top = self._row_top(inner, row_idx)
+            width = inner.frame().size.width - right_x
+            if subtitle:
+                t = NSTextField.labelWithString_(title)
+                t.setFont_(G.rounded_font(13.5))
+                t.setTextColor_(TITLE_COL)
+                t.setFrame_(NSMakeRect(14, top - 24, width, 18))
+                t.setAutoresizingMask_(NSViewMinYMargin)
+                inner.addSubview_(t)
+                s = NSTextField.labelWithString_(subtitle)
+                s.setFont_(G.rounded_font(11.5))
+                s.setTextColor_(SUB_COL)
+                s.setFrame_(NSMakeRect(14, top - 42, width, 16))
+                s.setAutoresizingMask_(NSViewMinYMargin)
+                inner.addSubview_(s)
+            else:
+                t = NSTextField.labelWithString_(title)
+                t.setFont_(G.rounded_font(13.5))
+                t.setTextColor_(TITLE_COL)
+                t.setFrame_(NSMakeRect(14, top - ROW_H / 2 - 9, width, 18))
+                t.setAutoresizingMask_(NSViewMinYMargin)
+                inner.addSubview_(t)
+
+        @objc.python_method
+        def _add_switch(self, inner, row_idx, cfg_key, cur_on, apply_name=None):
+            top = self._row_top(inner, row_idx)
+            sw = NSSwitch.alloc().initWithFrame_(NSMakeRect(0, 0, 42, 25))
+            sw.setState_(_ON if cur_on else _OFF)
+            tag = self._tag()
+            sw.setTag_(tag)
+            sw.setTarget_(self)
+            sw.setAction_("switchToggled:")
+            self._switch_meta[tag] = (cfg_key, apply_name)
+            x = inner.frame().size.width - 14 - 42
+            sw.setFrame_(NSMakeRect(x, top - ROW_H / 2 - 12, 42, 25))
+            sw.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            inner.addSubview_(sw)
+            return sw
+
+        @objc.python_method
+        def _add_segment(self, inner, row_idx, labels, values, cur_value,
+                         cfg_key=None, apply_name=None, seg_w=None):
+            top = self._row_top(inner, row_idx)
+            seg = NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(0, 0, 60, 24))
+            seg.setSegmentCount_(len(labels))
+            total = 0.0
+            for i, lb in enumerate(labels):
+                seg.setLabel_forSegment_(lb, i)
+                w = seg_w if seg_w else max(54.0, 12.0 + 6.6 * len(lb))
+                seg.setWidth_forSegment_(w, i)
+                total += w
+            try:
+                seg.setSegmentStyle_(1)   # NSSegmentStyleRounded
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                seg.setTrackingMode_(_SELECT_ONE)
+            except Exception:  # noqa: BLE001
+                pass
+            seg.setFont_(G.rounded_font(11.5))
+            sel = 0
+            for i, v in enumerate(values):
+                if v == cur_value:
+                    sel = i
+                    break
+            seg.setSelectedSegment_(sel)
+            tag = self._tag()
+            seg.setTag_(tag)
+            seg.setTarget_(self)
+            seg.setAction_("segmentChanged:")
+            self._seg_meta[tag] = (tuple(values), cfg_key, apply_name)
+            x = inner.frame().size.width - 14 - total
+            seg.setFrame_(NSMakeRect(x, top - ROW_H / 2 - 12, total, 24))
+            seg.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            inner.addSubview_(seg)
+            return seg
+
+        @objc.python_method
+        def _add_chip(self, inner, row_idx, glyph, text):
+            top = self._row_top(inner, row_idx)
+            lbl = NSTextField.labelWithString_(
+                (glyph + "  " if glyph else "") + text)
+            lbl.setFont_(G.rounded_font(12.5, 0.2))
+            lbl.setTextColor_(TITLE_COL)
+            lbl.sizeToFit()
+            lw = lbl.frame().size.width + 22
+            box = NSView.alloc().initWithFrame_(
+                NSMakeRect(inner.frame().size.width - 14 - lw,
+                           top - ROW_H / 2 - 13, lw, 26))
+            box.setWantsLayer_(True)
+            G.round_layer(box, 8.0)
+            box.layer().setBackgroundColor_(CHIP_BG.CGColor())
+            box.layer().setBorderWidth_(1.0)
+            box.layer().setBorderColor_(CHIP_RIM.CGColor())
+            box.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            lbl.setFrame_(NSMakeRect(11, 5, lw - 22, 16))
+            box.addSubview_(lbl)
+            inner.addSubview_(box)
+            return box
+
+        @objc.python_method
+        def _add_status_pill(self, inner, row_idx, text, good):
+            top = self._row_top(inner, row_idx)
+            pill = NSView.alloc().initWithFrame_(
+                NSMakeRect(inner.frame().size.width - 14 - 60,
+                           top - ROW_H / 2 - 11, 60, 22))
+            pill.setWantsLayer_(True)
+            G.round_layer(pill, 11.0)
+            pill.layer().setBackgroundColor_((OK_BG if good else CHIP_BG).CGColor())
+            pill.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            lbl = NSTextField.labelWithString_(text)
+            lbl.setFont_(G.rounded_font(11.5, 0.3))
+            lbl.setTextColor_(ACCENT if good else SUB_COL)
+            lbl.setAlignment_(NSTextAlignmentCenter)
+            lbl.setFrame_(NSMakeRect(0, 3, 60, 15))
+            pill.addSubview_(lbl)
+            inner.addSubview_(pill)
+            return pill
+
+        @objc.python_method
+        def _add_maxrec_slider(self, inner, row_idx):
+            top = self._row_top(inner, row_idx)
+            cur = int(self._cfg("max_record_seconds", 120) or 120)
+            cur = max(30, min(300, cur))
+            lbl = NSTextField.labelWithString_(f"{cur}s")
+            lbl.setFont_(G.rounded_font(12.5))
+            lbl.setTextColor_(SUB_COL)
+            lbl.setAlignment_(NSTextAlignmentRight)
+            lbl.setFrame_(NSMakeRect(inner.frame().size.width - 14 - 40,
+                                     top - ROW_H / 2 - 8, 40, 16))
+            lbl.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            inner.addSubview_(lbl)
+            self._maxrec_label = lbl
+            sl = NSSlider.alloc().initWithFrame_(
+                NSMakeRect(inner.frame().size.width - 14 - 40 - 8 - 140,
+                           top - ROW_H / 2 - 10, 140, 20))
+            sl.setMinValue_(30.0)
+            sl.setMaxValue_(300.0)
+            sl.setDoubleValue_(float(cur))
+            try:
+                sl.setNumberOfTickMarks_(28)          # 30..300 step 10
+                sl.setAllowsTickMarkValuesOnly_(True)
+            except Exception:  # noqa: BLE001
+                pass
+            sl.setTarget_(self)
+            sl.setAction_("maxRecChanged:")
+            sl.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            inner.addSubview_(sl)
+            self._maxrec_slider = sl
+            return sl
+
+        # ---- panes --------------------------------------------------------
+        @objc.python_method
+        def _build_pane(self, name):
+            return {
+                "General": self._pane_general,
+                "Dictation": self._pane_dictation,
+                "Model": self._pane_model,
+                "Privacy": self._pane_privacy,
+            }[name]()
+
+        @objc.python_method
+        def _pane_general(self):
+            pane = self._flipped(WIN_W, 320)
+            y = PAD
+            inner, h = self._card_at(pane, y, 3)
+            self._row_text(inner, 0, "Launch at login",
+                           "Start früt Flow when you sign in")
+            self._add_status_pill(inner, 0,
+                                  "On" if self._agent_loaded() else "Off",
+                                  self._agent_loaded())
+            self._row_divider(inner, 1)
+            self._row_text(inner, 1, "Play sounds",
+                           "A soft chime when recording starts and stops")
+            self._add_switch(inner, 1, "play_sounds",
+                             bool(self._cfg("play_sounds", True)))
+            self._row_divider(inner, 2)
+            self._row_text(inner, 2, "Show recording HUD",
+                           "Floating waveform pill while you talk")
+            self._add_switch(inner, 2, "show_hud",
+                             bool(self._cfg("show_hud", False)))
+            y += h + 16
+            y += self._section_at(pane, "Appearance", y)
+            inner2, h2 = self._card_at(pane, y, 1)
+            self._row_text(inner2, 0, "Theme", None, right_x=210.0)
+            self._add_segment(inner2, 0, ("System", "Light", "Dark"),
+                              ("system", "light", "dark"),
+                              self._cfg("appearance", "system"),
+                              apply_name="apply_appearance", seg_w=62.0)
+            y += h2 + PAD
+            self._finish_pane(pane, y)
+            return pane
+
+        @objc.python_method
+        def _pane_dictation(self):
+            pane = self._flipped(WIN_W, 340)
+            y = PAD
+            inner, h = self._card_at(pane, y, 4)
+            self._row_text(inner, 0, "Push-to-talk key",
+                           "Hold this to dictate anywhere", right_x=210.0)
+            self._add_chip(inner, 0, self._hotkey_glyph(), self._hotkey_display())
+            self._row_divider(inner, 1)
+            self._row_text(inner, 1, "Activation",
+                           "Hold to talk, or tap to start and stop", right_x=180.0)
+            self._add_segment(inner, 1, ("Hold", "Toggle"), ("hold", "toggle"),
+                              self._cfg("mode", "hold"), cfg_key="mode", seg_w=64.0)
+            self._row_divider(inner, 2)
+            self._row_text(inner, 2, "Insert method",
+                           "Paste, or type character by character", right_x=180.0)
+            self._add_segment(inner, 2, ("Paste", "Type"), ("paste", "type"),
+                              self._cfg("insert_method", "paste"),
+                              cfg_key="insert_method", seg_w=64.0)
+            self._row_divider(inner, 3)
+            self._row_text(inner, 3, "Max recording length",
+                           "Auto-stops a runaway capture", right_x=210.0)
+            self._add_maxrec_slider(inner, 3)
+            y += h + PAD
+            self._finish_pane(pane, y)
+            return pane
+
+        @objc.python_method
+        def _pane_model(self):
+            pane = self._flipped(WIN_W, 380)
+            y = PAD
+            inner, h = self._card_at(pane, y, 4)
+            self._row_text(inner, 0, "Transcription engine",
+                           "Parakeet runs on the Apple-Silicon GPU", right_x=230.0)
+            self._add_segment(inner, 0, ("Parakeet", "Whisper", "Cloud"),
+                              ("parakeet", "local", "openai"),
+                              self._cfg("transcribe_backend", "parakeet"),
+                              cfg_key="transcribe_backend", seg_w=66.0)
+            self._row_divider(inner, 1)
+            self._row_text(inner, 1, "Language model",
+                           "v2 English, or v3 for 25 languages", right_x=210.0)
+            cur_pk = "v3" if str(self._cfg("parakeet_model", PK_V2)).endswith(
+                "v3") else "v2"
+            self._add_segment(inner, 1, ("English", "Multilingual"),
+                              ("v2", "v3"), cur_pk,
+                              apply_name="apply_pkmodel", seg_w=94.0)
+            self._row_divider(inner, 2)
+            self._row_text(inner, 2, "Cleanup",
+                           "Strip filler words and fix punctuation", right_x=220.0)
+            self._add_segment(inner, 2, ("None", "Basic", "AI polish"),
+                              ("none", "basic", "llm"),
+                              self._cfg("cleanup", "basic"),
+                              cfg_key="cleanup", seg_w=70.0)
+            self._row_divider(inner, 3)
+            self._row_text(inner, 3, "Normalize audio",
+                           "Boost quiet or whispered speech")
+            self._add_switch(inner, 3, "normalize_audio",
+                             bool(self._cfg("normalize_audio", True)))
+            y += h + 12
+            note = NSTextField.wrappingLabelWithString_(
+                "Engine and language-model changes take effect after Restart.")
+            note.setFont_(G.rounded_font(11.5))
+            note.setTextColor_(SUB_COL)
+            note.setFrame_(NSMakeRect(PAD + 2, 0, CONTENT_W - 4, 30))
+            self._place_top(pane, note, y, 30)
+            y += 30 + PAD
+            self._finish_pane(pane, y)
+            return pane
+
+        @objc.python_method
+        def _pane_privacy(self):
+            pane = self._flipped(WIN_W, 420)
+            y = PAD
+            y += self._privacy_banner(pane, y) + 12
+            y += self._section_at(pane, "macOS permissions", y)
+            inner, h = self._card_at(pane, y, 3)
+            self._perm_row(inner, 0, "mic", "Microphone",
+                           "Hear what you dictate", URL_MIC)
+            self._row_divider(inner, 1)
+            self._perm_row(inner, 1, "ax", "Accessibility",
+                           "Paste text into other apps", URL_AX)
+            self._row_divider(inner, 2)
+            self._perm_row(inner, 2, "input", "Input Monitoring",
+                           "Detect the global hotkey", URL_INPUT)
+            y += h + PAD
+            inner2, h2 = self._card_at(pane, y, 1)
+            self._row_text(inner2, 0, "Learn from my edits",
+                           "Auto-correct names you fix after pasting")
+            self._add_switch(inner2, 0, "learn_from_edits",
+                             bool(self._cfg("learn_from_edits", True)))
+            y += h2 + PAD
+            self._finish_pane(pane, y)
+            self._refresh_permissions()
+            return pane
+
+        @objc.python_method
+        def _finish_pane(self, pane, total_h):
+            f = pane.frame()
+            pane.setFrameSize_(NSMakeSize(f.size.width, max(total_h, 10)))
+
+        @objc.python_method
+        def _privacy_banner(self, pane, y_top):
+            h = 64.0
+            box = NSView.alloc().initWithFrame_(NSMakeRect(PAD, y_top, CONTENT_W, h))
+            box.setWantsLayer_(True)
+            G.round_layer(box, 12.0)
+            box.layer().setBackgroundColor_(BANNER_BG.CGColor())
+            box.layer().setBorderWidth_(1.0)
+            box.layer().setBorderColor_(BANNER_RIM.CGColor())
+            iv = NSImageView.alloc().initWithFrame_(NSMakeRect(15, 20, 24, 24))
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "checkmark.shield.fill", "on-device")
+            if img is not None:
+                iv.setImage_(img)
+                try:
+                    iv.setContentTintColor_(ACCENT)
+                except Exception:  # noqa: BLE001
+                    pass
+            box.addSubview_(iv)
+            t = NSTextField.labelWithString_("Everything runs on-device")
+            t.setFont_(G.rounded_font(13, 0.3))
+            t.setTextColor_(TITLE_COL)
+            t.setFrame_(NSMakeRect(50, h - 27, CONTENT_W - 64, 18))
+            box.addSubview_(t)
+            s = NSTextField.wrappingLabelWithString_(
+                "No account, no cloud. Your voice and text never leave this Mac.")
+            s.setFont_(G.rounded_font(11.5))
+            s.setTextColor_(SUB_COL)
+            s.setFrame_(NSMakeRect(50, 9, CONTENT_W - 64, 30))
+            box.addSubview_(s)
+            pane.addSubview_(box)
+            return h
+
+        @objc.python_method
+        def _perm_row(self, inner, row_idx, key, title, subtitle, url):
+            top = self._row_top(inner, row_idx)
+            tile = NSView.alloc().initWithFrame_(
+                NSMakeRect(14, top - ROW_H / 2 - 16, 32, 32))
+            tile.setWantsLayer_(True)
+            G.round_layer(tile, 8.0)
+            tile.layer().setBackgroundColor_(TILE_BG.CGColor())
+            tile.setAutoresizingMask_(NSViewMinYMargin)
+            sym = {"mic": "mic.fill", "ax": "cursorarrow.click",
+                   "input": "keyboard"}.get(key, "lock")
+            iv = NSImageView.alloc().initWithFrame_(NSMakeRect(6, 6, 20, 20))
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                sym, title)
+            if img is not None:
+                iv.setImage_(img)
+                try:
+                    iv.setContentTintColor_(ACCENT)
+                except Exception:  # noqa: BLE001
+                    pass
+            tile.addSubview_(iv)
+            inner.addSubview_(tile)
+            t = NSTextField.labelWithString_(title)
+            t.setFont_(G.rounded_font(13.5))
+            t.setTextColor_(TITLE_COL)
+            t.setFrame_(NSMakeRect(54, top - 24, 200, 18))
+            t.setAutoresizingMask_(NSViewMinYMargin)
+            inner.addSubview_(t)
+            s = NSTextField.labelWithString_(subtitle)
+            s.setFont_(G.rounded_font(11.5))
+            s.setTextColor_(SUB_COL)
+            s.setFrame_(NSMakeRect(54, top - 40, 240, 16))
+            s.setAutoresizingMask_(NSViewMinYMargin)
+            inner.addSubview_(s)
+            pill = NSButton.alloc().initWithFrame_(
+                NSMakeRect(inner.frame().size.width - 14 - 92,
+                           top - ROW_H / 2 - 11, 92, 22))
+            pill.setBezelStyle_(1)
+            pill.setBordered_(False)
+            pill.setTitle_("…")
+            pill.setFont_(G.rounded_font(11.5, 0.3))
+            pill.setWantsLayer_(True)
+            G.round_layer(pill, 11.0)
+            tag = self._tag()
+            pill.setTag_(tag)
+            pill.setTarget_(self)
+            pill.setAction_("permClicked:")
+            pill.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            inner.addSubview_(pill)
+            self._perm_rows[key] = {"pill": pill, "url": url, "tag": tag}
+            self._perm_tag_to_key[tag] = key
+
+        # ---- hotkey display ----------------------------------------------
+        @objc.python_method
+        def _hotkey_display(self):
+            name = str(getattr(self._app, "hotkey_name", "") or
+                       self._cfg("hotkey", "alt_r"))
+            return {
+                "alt_r": "Right Option", "alt_l": "Left Option",
+                "cmd_r": "Right Command", "cmd_l": "Left Command",
+                "ctrl_r": "Right Control", "ctrl_l": "Left Control",
+                "shift_r": "Right Shift", "shift_l": "Left Shift",
+            }.get(name.lower(), name)
+
+        @objc.python_method
+        def _hotkey_glyph(self):
+            name = str(getattr(self._app, "hotkey_name", "") or
+                       self._cfg("hotkey", "alt_r")).lower()
+            for pfx, gl in (("alt", "⌥"), ("cmd", "⌘"), ("ctrl", "⌃"),
+                            ("shift", "⇧")):
+                if name.startswith(pfx):
+                    return gl
+            return ""
+
+        # ---- launchd agent reflection (read-only) ------------------------
+        @objc.python_method
+        def _agent_loaded(self):
+            import subprocess
+            import os
+            try:
+                r = subprocess.run(
+                    ["launchctl", "print",
+                     f"gui/{os.getuid()}/com.wisprdiy.dictation"],
+                    capture_output=True, timeout=3)
+                return r.returncode == 0
+            except Exception:  # noqa: BLE001
+                return False
+
+        # ---- permission status -------------------------------------------
+        @objc.python_method
+        def _mic_granted(self):
+            try:
+                import AVFoundation
+                st = AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(
+                    AVFoundation.AVMediaTypeAudio)
+                return st == 3
+            except Exception:  # noqa: BLE001
+                return None
+
+        @objc.python_method
+        def _ax_granted(self):
+            try:
+                from ApplicationServices import AXIsProcessTrusted
+                return bool(AXIsProcessTrusted())
+            except Exception:  # noqa: BLE001
+                return None
+
+        @objc.python_method
+        def _input_granted(self):
+            try:
+                from Quartz import CGPreflightListenEventAccess
+                return bool(CGPreflightListenEventAccess())
+            except Exception:  # noqa: BLE001
+                return None
+
+        @objc.python_method
+        def _refresh_permissions(self):
+            for key, granted in (("mic", self._mic_granted()),
+                                 ("ax", self._ax_granted()),
+                                 ("input", self._input_granted())):
+                row = self._perm_rows.get(key)
+                if not row:
+                    continue
+                pill = row["pill"]
+                if granted is True:
+                    try:
+                        pill.layer().setBackgroundColor_(OK_BG.CGColor())
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._tint_button_title(pill, "Granted", ACCENT)
+                    pill.setEnabled_(False)
+                else:
+                    try:
+                        pill.layer().setBackgroundColor_(BAD_BG.CGColor())
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._tint_button_title(
+                        pill, "Grant…" if granted is False else "Unknown", BAD_FG)
+                    pill.setEnabled_(True)
+
+        @objc.python_method
+        def _tint_button_title(self, button, text, color):
+            try:
+                from Cocoa import (NSMutableAttributedString,
+                                   NSForegroundColorAttributeName,
+                                   NSFontAttributeName,
+                                   NSParagraphStyleAttributeName,
+                                   NSMutableParagraphStyle)
+                s = NSMutableAttributedString.alloc().initWithString_(text)
+                rng = (0, s.length())
+                s.addAttribute_value_range_(NSForegroundColorAttributeName,
+                                            color, rng)
+                s.addAttribute_value_range_(NSFontAttributeName,
+                                            G.rounded_font(11.5, 0.3), rng)
+                para = NSMutableParagraphStyle.alloc().init()
+                para.setAlignment_(NSTextAlignmentCenter)
+                s.addAttribute_value_range_(NSParagraphStyleAttributeName,
+                                            para, rng)
+                button.setAttributedTitle_(s)
+            except Exception:  # noqa: BLE001
+                try:
+                    button.setTitle_(text)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        # ---- pane swap ----------------------------------------------------
+        @objc.python_method
+        def _show_pane(self, name):
+            pane = self._panes.get(name)
+            if pane is None:
+                return
+            self._tab = name
+            self._scroll.setDocumentView_(pane)
+            vh = self._scroll.contentSize().height
+            if pane.frame().size.height < vh:
+                pane.setFrameSize_(NSMakeSize(pane.frame().size.width, vh))
+            # Flipped doc: top is origin (0,0).
+            pane.scrollPoint_(NSMakePoint(0, 0))
+
+        # ---- show / activation policy ------------------------------------
+        @objc.python_method
+        def show(self):
+            app = NSApplication.sharedApplication()
+            app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
+            app.activateIgnoringOtherApps_(True)
+            self._refresh_permissions()
+            self._win.makeKeyAndOrderFront_(None)
+            self._ensure_perm_timer()
+
+        @objc.python_method
+        def _ensure_perm_timer(self):
+            if self._perm_timer is not None:
+                return
+            # 1 Hz: reads permission status and sets labels only (allowed by the
+            # no-fast-timer rule; nothing animated, no layout thrash).
+            self._perm_timer = NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+                1.0, True, lambda _t: self._refresh_permissions())
+
+        @objc.python_method
+        def _stop_perm_timer(self):
+            if self._perm_timer is not None:
+                try:
+                    self._perm_timer.invalidate()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._perm_timer = None
+
+        def windowWillClose_(self, note):
+            self._stop_perm_timer()
+            NSOperationQueue.mainQueue().addOperationWithBlock_(
+                lambda: _sync_activation_policy())
+
+        # ---- Obj-C action selectors --------------------------------------
+        def tabChanged_(self, sender):
+            i = int(sender.selectedSegment())
+            if 0 <= i < len(TABS):
+                self._show_pane(TABS[i])
+
+        def switchToggled_(self, sender):
+            meta = self._switch_meta.get(int(sender.tag()))
+            if not meta:
+                return
+            key, apply_name = meta
+            on = int(sender.state()) == int(_ON)
+            self._save(key, bool(on))
+            if apply_name:
+                fn = getattr(self, apply_name, None)
+                if fn:
+                    fn(bool(on))
+
+        def segmentChanged_(self, sender):
+            meta = self._seg_meta.get(int(sender.tag()))
+            if not meta:
+                return
+            values, cfg_key, apply_name = meta
+            i = int(sender.selectedSegment())
+            if not (0 <= i < len(values)):
+                return
+            val = values[i]
+            if apply_name:
+                fn = getattr(self, apply_name, None)
+                if fn:
+                    fn(val)
+            elif cfg_key:
+                self._save(cfg_key, val)
+
+        def maxRecChanged_(self, sender):
+            v = int(round(sender.doubleValue() / 10.0) * 10)
+            v = max(30, min(300, v))
+            if self._maxrec_label is not None:
+                self._maxrec_label.setStringValue_(f"{v}s")
+            self._save("max_record_seconds", v)
+
+        def permClicked_(self, sender):
+            key = self._perm_tag_to_key.get(int(sender.tag()))
+            row = self._perm_rows.get(key) if key else None
+            if not row:
+                return
+            import subprocess
+            try:
+                subprocess.Popen(["open", row["url"]])
+            except Exception:  # noqa: BLE001
+                pass
+
+        # ---- apply_* callables (named; resolved via getattr) -------------
+        @objc.python_method
+        def apply_appearance(self, value):
+            self._save("appearance", value)
+            # Drive the shared theme mechanism so every glass window (which carries
+            # its own per-window appearance) re-themes live, not just NSApp.
+            _set_appearance_pref(value)
+
+        @objc.python_method
+        def apply_pkmodel(self, value):
+            self._save("parakeet_model", PK_V3 if value == "v3" else PK_V2)
+
+    _SETTINGS_CTRL_CLASS = _SettingsController
+    return _SETTINGS_CTRL_CLASS
+
+
 class FlowApp:
     def __init__(self, cfg: dict, transcriber):
         self.cfg = cfg
@@ -3751,6 +4669,8 @@ class FlowApp:
         self._transcribe_ctrl = None
         # "History" window — the app's home page (built lazily on first open).
         self._history_ctrl = None
+        # "Settings" window (built lazily on first open).
+        self._settings_ctrl = None
         # Serialize model access: the mic worker and the file-transcribe window must
         # never call transcribe() on the same model concurrently.
         self._transcribe_lock = threading.Lock()
@@ -4553,6 +5473,26 @@ class FlowApp:
             raw = self.transcriber.transcribe(audio, prompt=prompt, hotwords=hotwords)
         return (clean(raw, self.cfg) or ""), None
 
+    def _show_settings_window(self) -> None:
+        """Open (or re-focus) the Settings window. Built lazily."""
+        try:
+            if self._settings_ctrl is None:
+                self._settings_ctrl = (
+                    _settings_controller_class().alloc().initWithApp_(self))
+            self._settings_ctrl.show()
+            print("[flow] settings window opened.", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[flow] couldn't open the settings window: {e}", flush=True)
+
+    def _apply_saved_appearance(self) -> None:
+        """Apply the persisted 'appearance' preference at launch so the app's own
+        windows honor Dark/Light/System from the start. Defaults to 'dark' to
+        match the redesign. Main thread; never raises into startup."""
+        try:
+            _set_appearance_pref(str(self.cfg.get("appearance", "dark")))
+        except Exception:  # noqa: BLE001
+            pass
+
     def _show_history_window(self) -> None:
         """Open (or re-focus) the History window — the app's home page. Built
         lazily; re-reads history.json and refreshes on every show()."""
@@ -4589,6 +5529,8 @@ class FlowApp:
         # LSBackgroundOnly agent, an accessory app can still present the mic
         # prompt and appears in the Privacy & Security lists.
         app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        # Honor the saved Light/Dark/System preference for our own windows.
+        self._apply_saved_appearance()
 
         # NOW that we're a real app, request microphone access. Doing this before
         # NSApplication existed (in main) never surfaced the TCC dialog and left
@@ -4635,6 +5577,7 @@ class FlowApp:
         _add("History…", "historyWindow:")
         _add("Transcribe Audio File…", "transcribeFile:")
         _add("Teach a Word…", "teachWord:")
+        _add("Settings…", "settings:")
         menu.addItem_(NSMenuItem.separatorItem())
         _add("Restart", "restart:")
         _add("Open Log", "openLog:")
