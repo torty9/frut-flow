@@ -168,13 +168,11 @@ DEFAULT_CONFIG = {
 
     # --- feedback / guards ---
     "play_sounds": True,
-    "show_hud": False,           # floating waveform pill near the bottom of the screen
+    "show_hud": True,            # floating waveform pill near the bottom of the screen
                                  # while you dictate (menu-bar/app mode only). Cosmetic.
-                                 # OPT-IN for now: an early version's main-thread
-                                 # animation could starve the hotkey event tap; the
-                                 # waveform is now GPU-animated, but this stays OFF by
-                                 # default until confirmed smooth on real use. Set true
-                                 # in ~/.flowdictate/config.json to try it.
+                                 # Waveform is GPU-animated (CALayer/CABasicAnimation) so
+                                 # it never touches the main thread / hotkey event tap;
+                                 # confirmed smooth in real use. Set false to disable.
     "ding_volume": 0.25,         # volume (0.0–1.0) of the success ding; lower = quieter
     "min_seconds": 0.2,          # ignore accidental sub-200ms taps
     "max_record_seconds": 120,   # safety cap: auto-stop a capture this long (guards a
