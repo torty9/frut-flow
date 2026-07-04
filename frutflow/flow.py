@@ -4246,7 +4246,7 @@ def _settings_controller_class():
     PAD = 18.0
     CONTENT_W = WIN_W - PAD * 2
     ROW_H = 54.0
-    TABS = ("General", "Dictation", "Model", "Privacy")
+    TABS = ("General", "Dictation", "Model", "Privacy", "Help")
 
     PK_V2 = "mlx-community/parakeet-tdt-0.6b-v2"
     PK_V3 = "mlx-community/parakeet-tdt-0.6b-v3"
@@ -4581,6 +4581,7 @@ def _settings_controller_class():
                 "Dictation": self._pane_dictation,
                 "Model": self._pane_model,
                 "Privacy": self._pane_privacy,
+                "Help": self._pane_help,
             }[name]()
 
         @objc.python_method
@@ -4710,6 +4711,203 @@ def _settings_controller_class():
             self._finish_pane(pane, y)
             self._refresh_permissions()
             return pane
+
+        # ---- Help pane ----------------------------------------------------
+        # Plain-language explanation of every setting, grouped to mirror the
+        # other tabs so a reader can map each entry back to the control that
+        # changes it. Descriptions wrap, so cards are laid out at a measured
+        # height rather than the fixed ROW_H grid the control panes use.
+        HELP_GROUPS = (
+            ("General", (
+                ("Launch at login",
+                 "Registers a small background helper so früt Flow starts "
+                 "automatically after you sign in to your Mac. When it's on you "
+                 "never have to open the app yourself — the hotkey just works."),
+                ("Play sounds",
+                 "Plays a soft chime when a recording starts and another when it "
+                 "stops, so you get an audio cue without having to watch the "
+                 "screen. Turn it off for silent dictation."),
+                ("Show recording HUD",
+                 "Shows a small floating pill with a live waveform while you talk, "
+                 "so you can see it's listening. The pill never takes keyboard "
+                 "focus, so it won't interrupt whatever you're typing into."),
+                ("Theme",
+                 "Switches früt Flow's own windows between light and dark. "
+                 "“System” follows your macOS appearance automatically."),
+            )),
+            ("Dictation", (
+                ("Push-to-talk key",
+                 "The key you press to dictate. It works in any app, anywhere. "
+                 "The right Option key is the default because it's rarely used "
+                 "for anything else."),
+                ("Activation",
+                 "“Hold” records only while the key is held down — let go "
+                 "and the text is inserted. “Toggle” starts on one press "
+                 "and stops on the next, so you don't have to keep holding for a "
+                 "long dictation."),
+                ("Insert method",
+                 "“Paste” drops the whole transcript in at once — fast, "
+                 "and what you'll usually want. “Type” simulates "
+                 "keystrokes one character at a time; it's slower but works in the "
+                 "few apps that block pasting."),
+                ("Max recording length",
+                 "A safety cap. If a recording ever runs this long without "
+                 "stopping, früt Flow ends it automatically so a stuck key can't "
+                 "record forever. It doesn't shorten normal dictations."),
+            )),
+            ("Model", (
+                ("Transcription engine",
+                 "The engine that turns speech into text. “Parakeet” "
+                 "runs on your Apple-Silicon GPU — fast, private, and "
+                 "recommended. “Whisper” is an alternative on-device "
+                 "model. “Cloud” sends audio to OpenAI: very accurate, "
+                 "but your voice leaves the Mac."),
+                ("Language model",
+                 "Which Parakeet model to load. “English” is tuned for "
+                 "English only; “Multilingual” understands about 25 "
+                 "languages. This one takes effect after you Restart the app."),
+                ("Cleanup",
+                 "How much früt Flow tidies the raw transcript before inserting "
+                 "it. “None” inserts it word-for-word. “Basic” "
+                 "fixes spacing, capitalization, and words you've taught it. "
+                 "“AI polish” uses a cloud model to smooth grammar. "
+                 "“On-device” uses a local model to fix misheard words "
+                 "from context — no cloud, still private."),
+                ("Normalize audio",
+                 "Boosts quiet or whispered speech before transcription so soft "
+                 "talking is still picked up clearly. Leave it on unless your "
+                 "microphone already runs hot."),
+            )),
+            ("Privacy", (
+                ("macOS permissions",
+                 "The three system permissions früt Flow needs. Microphone lets "
+                 "it hear your dictation, Accessibility lets it paste into other "
+                 "apps, and Input Monitoring lets it detect your global hotkey. "
+                 "Grant them from the Privacy tab — you're only asked once."),
+                ("Learn from my edits",
+                 "When on, if you correct a word right after früt Flow pastes it "
+                 "(a name it misheard, say), it remembers the fix and applies it "
+                 "next time. Everything it learns is stored on this Mac only."),
+            )),
+        )
+
+        @objc.python_method
+        def _pane_help(self):
+            pane = self._flipped(WIN_W, 640)
+            y = PAD
+            intro = NSTextField.wrappingLabelWithString_(
+                "What each setting does. Everything below runs entirely on your "
+                "Mac — there's no account and nothing to configure online.")
+            intro.setFont_(G.rounded_font(12.5))
+            intro.setTextColor_(SUB_COL)
+            intro.setPreferredMaxLayoutWidth_(CONTENT_W - 4)
+            ih = self._wrap_height(intro, CONTENT_W - 4)
+            intro.setFrame_(NSMakeRect(PAD + 2, 0, CONTENT_W - 4, ih))
+            self._place_top(pane, intro, y, ih)
+            y += ih + 14
+            for title, entries in self.HELP_GROUPS:
+                y += self._section_at(pane, title, y)
+                y += self._help_card(pane, y, entries) + 16
+            y += PAD - 16
+            self._finish_pane(pane, y)
+            return pane
+
+        @objc.python_method
+        def _wrap_height(self, label, width):
+            """Height a wrapping label needs at `width`. Measures the text's
+            word-wrapped bounding rect (deterministic across macOS versions);
+            falls back to a crude char-count estimate so a pyobjc quirk can never
+            zero-height a card and clip the text."""
+            import math
+            label.setPreferredMaxLayoutWidth_(width)
+            h = 0.0
+            try:
+                from Cocoa import (NSAttributedString, NSFontAttributeName,
+                                   NSStringDrawingUsesLineFragmentOrigin as _LFO)
+                s = NSAttributedString.alloc().initWithString_attributes_(
+                    str(label.stringValue()), {NSFontAttributeName: label.font()})
+                rect = s.boundingRectWithSize_options_(
+                    NSMakeSize(width, 100000.0), _LFO)
+                h = math.ceil(rect.size.height) + 3.0
+            except Exception:  # noqa: BLE001
+                h = 0.0
+            if h < 15.0:
+                txt = str(label.stringValue())
+                cpl = max(1, int(width / 6.6))
+                lines = 0
+                for para in (txt.split("\n") or [txt]):
+                    lines += max(1, math.ceil(len(para) / cpl))
+                h = 16.0 * lines
+            return h
+
+        @objc.python_method
+        def _help_card(self, pane, y_top, entries):
+            """One glass card whose rows are (title, wrapping description). Returns
+            the card's height so the caller can advance its running y."""
+            from Cocoa import NSViewWidthSizable as _WSZ
+            text_w = CONTENT_W - 28
+            title_font = G.rounded_font(13.5, 0.2)
+            body_font = G.rounded_font(12.3)
+            PAD_TB = 13.0        # top / bottom padding inside the card
+            GAP = 16.0           # vertical space between entries (divider centered)
+            TBG = 4.0            # gap between an entry's title and its body
+
+            # Build + measure every body label first so we know the card height.
+            built = []
+            total = PAD_TB
+            for i, (title, body) in enumerate(entries):
+                b = NSTextField.wrappingLabelWithString_(body)
+                b.setFont_(body_font)
+                b.setTextColor_(SUB_COL)
+                b.setSelectable_(False)
+                bh = self._wrap_height(b, text_w)
+                b.setFrame_(NSMakeRect(0, 0, text_w, bh))
+                eh = 18.0 + TBG + bh
+                built.append((title, b, eh))
+                total += eh + (GAP if i < len(entries) - 1 else 0)
+            total += PAD_TB
+
+            inner = self._card_h(pane, y_top, total)
+            flip = self._flipped(inner.frame().size.width, total)
+            flip.setAutoresizingMask_(_WSZ)
+            inner.addSubview_(flip)
+
+            y = PAD_TB
+            for i, (title, b, eh) in enumerate(built):
+                if i > 0:
+                    div = NSView.alloc().initWithFrame_(
+                        NSMakeRect(0, y - GAP / 2.0,
+                                   inner.frame().size.width, 1))
+                    div.setWantsLayer_(True)
+                    div.layer().setBackgroundColor_(ROW_DIV.CGColor())
+                    div.setAutoresizingMask_(_WSZ)
+                    flip.addSubview_(div)
+                t = NSTextField.labelWithString_(title)
+                t.setFont_(title_font)
+                t.setTextColor_(TITLE_COL)
+                t.setFrame_(NSMakeRect(14, y, text_w, 18))
+                flip.addSubview_(t)
+                b.setFrame_(NSMakeRect(14, y + 18.0 + TBG, text_w,
+                                       b.frame().size.height))
+                flip.addSubview_(b)
+                y += eh + GAP
+            return total
+
+        @objc.python_method
+        def _card_h(self, pane, y_top, h):
+            """Like _card_at but at an explicit pixel height (help cards don't fit
+            the fixed ROW_H grid)."""
+            container, inner = G.card(NSMakeRect(PAD, y_top, CONTENT_W, h),
+                                      radius=12.0)
+            try:
+                il = inner.layer()
+                if il is not None:
+                    il.setBackgroundColor_(CARD_BG.CGColor())
+                    il.setBorderColor_(CARD_RIM.CGColor())
+            except Exception:  # noqa: BLE001
+                pass
+            pane.addSubview_(container)
+            return inner
 
         @objc.python_method
         def _finish_pane(self, pane, total_h):
