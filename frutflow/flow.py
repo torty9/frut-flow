@@ -2608,6 +2608,7 @@ def _hud_controller_class():
             self._panel = None
             self._bars = []
             self._timer = None
+            self._anim_on = False
             self._state = "hidden"          # hidden | listening | transcribing
             self._t0 = 0.0
             return self
@@ -2686,21 +2687,28 @@ def _hud_controller_class():
             pill.addSubview_(label)
             self._label = label
 
-            # waveform: NBARS thin bars, animated in tick_.
+            # waveform: NBARS thin bars as raw CALayers (NOT NSViews) so they're
+            # unmanaged by AppKit layout and animate purely on the render server —
+            # zero per-frame main-thread work, so the event tap / dictation never
+            # competes with the animation. Each bar has a static base height (the
+            # mockup's sine-of-index profile) and pulses via a scale.y animation.
+            from Quartz import CALayer
             wave = NSView.alloc().initWithFrame_(
                 NSMakeRect(WAVE_X, (PILL_H - WAVE_H) / 2.0, WAVE_W, WAVE_H))
+            wave.setWantsLayer_(True)
             pill.addSubview_(wave)
-            self._bars = []
+            self._bars = []                 # list of (CALayer, half_period, phase)
             for i in range(NBARS):
-                bar = NSView.alloc().initWithFrame_(
-                    NSMakeRect(i * 6.0, WAVE_H / 2.0 - 4, 3, 8))
-                bar.setWantsLayer_(True)
-                bl = bar.layer()
-                if bl is not None:
-                    bl.setCornerRadius_(1.5)
-                    bl.setBackgroundColor_(BAR.CGColor())
-                wave.addSubview_(bar)
-                self._bars.append(bar)
+                base_h = 9.0 + round(17.0 * abs(math.sin(i * 0.9 + 0.3)))
+                bl = CALayer.layer()
+                bl.setBounds_(NSMakeRect(0, 0, 3, base_h))
+                bl.setPosition_((i * 6.0 + 1.5, WAVE_H / 2.0))   # anchor (0.5,0.5)
+                bl.setCornerRadius_(1.5)
+                bl.setBackgroundColor_(BAR.CGColor())
+                if wave.layer() is not None:
+                    wave.layer().addSublayer_(bl)
+                half = (0.6 + (i % 5) * 0.13) / 2.0   # full ping-pong ≈ mockup dur
+                self._bars.append((bl, half, (i % 7) * 0.09))
             self._wave = wave
 
             # running timer (mm:ss, tabular figures so it doesn't jitter).
@@ -2826,6 +2834,7 @@ def _hud_controller_class():
                     self._time.setStringValue_("0:00")
                     self._position()
                     self._panel.orderFrontRegardless()
+                self._start_anim()
                 self._ensure_timer()
             except Exception:  # noqa: BLE001
                 pass
@@ -2842,6 +2851,7 @@ def _hud_controller_class():
                 self._state = "transcribing"
                 self._label.setStringValue_("Transcribing")
                 self._wave.setAlphaValue_(0.5)
+                self._start_anim()
                 self._ensure_timer()
             except Exception:  # noqa: BLE001
                 pass
@@ -2849,19 +2859,62 @@ def _hud_controller_class():
         def hideHud(self):
             try:
                 self._state = "hidden"
+                self._stop_anim()
                 self._stop_timer()
                 if self._panel is not None:
                     self._panel.orderOut_(None)
             except Exception:  # noqa: BLE001
                 pass
 
-        # -- animation -------------------------------------------------------
+        # -- animation (render-server / Core Animation, NOT the main thread) --
+        def _start_anim(self):
+            if self._anim_on:
+                return
+            try:
+                from Quartz import CABasicAnimation
+                for bl, half, phase in self._bars:
+                    a = CABasicAnimation.animationWithKeyPath_("transform.scale.y")
+                    a.setFromValue_(0.30)
+                    a.setToValue_(1.0)
+                    a.setDuration_(half)
+                    a.setAutoreverses_(True)
+                    a.setRepeatCount_(1.0e9)
+                    a.setTimeOffset_(phase)
+                    a.setRemovedOnCompletion_(False)
+                    bl.addAnimation_forKey_(a, "wave")
+                dl = self._dot.layer() if self._dot is not None else None
+                if dl is not None:
+                    d = CABasicAnimation.animationWithKeyPath_("opacity")
+                    d.setFromValue_(0.5)
+                    d.setToValue_(1.0)
+                    d.setDuration_(0.75)
+                    d.setAutoreverses_(True)
+                    d.setRepeatCount_(1.0e9)
+                    d.setRemovedOnCompletion_(False)
+                    dl.addAnimation_forKey_(d, "breathe")
+                self._anim_on = True
+            except Exception:  # noqa: BLE001
+                pass
+
+        def _stop_anim(self):
+            self._anim_on = False
+            try:
+                for bl, _half, _phase in self._bars:
+                    bl.removeAnimationForKey_("wave")
+                dl = self._dot.layer() if self._dot is not None else None
+                if dl is not None:
+                    dl.removeAnimationForKey_("breathe")
+            except Exception:  # noqa: BLE001
+                pass
+
+        # A LIGHT 1-second timer for the clock label only (the waveform + dot are
+        # GPU-animated above, so the main thread stays idle while you dictate).
         def _ensure_timer(self):
             if self._timer is not None:
                 return
             from Cocoa import NSTimer
             self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                1.0 / 30.0, self, "tick:", None, True)
+                1.0, self, "tick:", None, True)
 
         def _stop_timer(self):
             if self._timer is not None:
@@ -2873,16 +2926,7 @@ def _hud_controller_class():
 
         def tick_(self, _timer):
             try:
-                t = time.monotonic()
-                listening = self._state == "listening"
-                base, amp, speed = (6.0, 22.0, 7.0) if listening else (5.0, 6.0, 3.0)
-                for i, bar in enumerate(self._bars):
-                    h = base + amp * (0.5 + 0.5 * math.sin(t * speed + i * 0.55))
-                    bar.setFrame_(NSMakeRect(i * 6.0, WAVE_H / 2.0 - h / 2.0, 3, h))
-                # breathing status dot
-                self._dot.setAlphaValue_(0.55 + 0.45 * (0.5 + 0.5 * math.sin(t * 3.0)))
-                # running clock
-                secs = max(0, int(t - self._t0))
+                secs = max(0, int(time.monotonic() - self._t0))
                 self._time.setStringValue_("%d:%02d" % (secs // 60, secs % 60))
             except Exception:  # noqa: BLE001
                 pass
