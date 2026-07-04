@@ -2099,6 +2099,149 @@ def _appearance_for(pref):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Light-mode readability: the redesign was built dark-only — nearly every color
+# is a hardcoded white-on-dark sRGB literal. When the user picks Light, the
+# glass turns light but those whites stay white (white-on-white). These helpers
+# make a color adapt to the appearance WITHOUT changing Dark at all: every dark
+# rgba passed here is the exact literal already in the file, so under DarkAqua
+# the resolved color is byte-identical, and on any old-pyobjc/macOS failure the
+# helpers fall back to that same static dark color (today's behavior).
+#
+#   _dyn(dark, light)  -> a dynamic NSColor for TEXT/tint (setTextColor_ /
+#                         setContentTintColor_ / attributed foreground). It
+#                         re-resolves LIVE when the window/app appearance flips,
+#                         so no per-view rewiring is needed.
+#   _paint(layer, which, dyn) -> for CALayer CGColor sites (a CGColor carries no
+#                         appearance, so it is resolved under the CURRENT app
+#                         appearance at build time and REGISTERED so it can be
+#                         re-resolved on every theme switch).
+#
+# NOTE: the registry holds each layer via objc.WeakRef, NOT the stdlib
+# weakref.ref — pyobjc Cocoa objects (a CALayer here) are not weakly-
+# referenceable by weakref.ref (it raises TypeError), whereas objc.WeakRef is
+# pyobjc's zeroing weak reference and reads back the same way (wr() -> obj/None).
+# ---------------------------------------------------------------------------
+_THEMED_LAYERS = []   # list of (objc.WeakRef(layer), which_str, dyn_NSColor)
+
+
+def _dyn(dark_rgba, light_rgba):
+    """A dynamic NSColor: the DARK color under DarkAqua, the LIGHT color under
+    Aqua. `dark_rgba` MUST be the exact literal already in the file so Dark is
+    unchanged. Falls back to the plain dark sRGB color on old pyobjc/macOS."""
+    from Cocoa import NSColor
+    dr, dg, db, da = dark_rgba
+    dark = NSColor.colorWithSRGBRed_green_blue_alpha_(dr, dg, db, da)
+    try:
+        lr, lg, lb, la = light_rgba
+        light = NSColor.colorWithSRGBRed_green_blue_alpha_(lr, lg, lb, la)
+
+        def _provider(ap):
+            try:
+                names = ["NSAppearanceNameAqua", "NSAppearanceNameDarkAqua"]
+                best = ap.bestMatchFromAppearancesWithNames_(names)
+                return light if best == "NSAppearanceNameAqua" else dark
+            except Exception:  # noqa: BLE001
+                return dark
+        return NSColor.colorWithName_dynamicProvider_("frutDyn", _provider)
+    except Exception:  # noqa: BLE001
+        return dark   # old pyobjc / macOS < 10.15 -> identical to today
+
+
+def _current_appearance():
+    from Cocoa import NSApplication
+    try:
+        return NSApplication.sharedApplication().effectiveAppearance()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cgcolor_under(dyn, appearance):
+    """Resolve `dyn` to a CGColor UNDER `appearance` explicitly (not whatever
+    ambient drawing appearance happens to be current), so build order can't
+    matter. Never raises; falls back to the ambient CGColor."""
+    from Cocoa import NSAppearance
+    try:
+        box = {}
+
+        def _do():
+            box["cg"] = dyn.CGColor()
+        try:
+            appearance.performAsCurrentDrawingAppearance_(_do)   # macOS 12+
+            if "cg" in box:
+                return box["cg"]
+        except Exception:  # noqa: BLE001
+            pass
+        try:  # older-macOS fallback: set-current then restore
+            saved = (NSAppearance.currentDrawingAppearance()
+                     if hasattr(NSAppearance, "currentDrawingAppearance")
+                     else None)
+            NSAppearance.setCurrentAppearance_(appearance)
+            try:
+                return dyn.CGColor()
+            finally:
+                NSAppearance.setCurrentAppearance_(saved)
+        except Exception:  # noqa: BLE001
+            return dyn.CGColor()   # final fallback: ambient
+    except Exception:  # noqa: BLE001
+        try:
+            return dyn.CGColor()
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def _paint(layer, which, dyn):
+    """Set layer.<which>(dyn resolved to CGColor UNDER the current app
+    appearance) and register it so it re-resolves on theme switch. `which` is
+    the ObjC setter name: 'setBackgroundColor_','setBorderColor_',
+    'setShadowColor_'. Never raises."""
+    if layer is None:
+        return
+    try:
+        ap = _current_appearance()
+        cg = _cgcolor_under(dyn, ap) if ap is not None else dyn.CGColor()
+        if cg is not None:
+            getattr(layer, which)(cg)
+        try:
+            import objc
+            # Dedup by (layer identity, which): callers like the permissions
+            # refresh and the onboarding step-dots re-_paint the SAME layer
+            # repeatedly, so drop any prior record for this exact layer+setter
+            # before re-registering. Keeps the registry bounded; behavior is
+            # unchanged (last write already won). Identity via `is` on the
+            # deref'd object avoids CALayer's own equality semantics.
+            _THEMED_LAYERS[:] = [
+                (r, w, d) for (r, w, d) in _THEMED_LAYERS
+                if not (w == which and r() is layer)
+            ]
+            _THEMED_LAYERS.append((objc.WeakRef(layer), which, dyn))
+        except Exception:  # noqa: BLE001
+            pass   # can't register -> build-time color still set, just no live re-theme
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _reresolve_layer_colors(appearance):
+    """Re-set each live registered layer's color under `appearance`; prune dead
+    weakrefs. Never raises. Called by _set_appearance_pref after flipping the
+    window appearances so layer CGColors track the new theme live."""
+    if appearance is None:
+        appearance = _current_appearance()
+    live = []
+    for ref, which, dyn in _THEMED_LAYERS:
+        layer = ref()
+        if layer is None:
+            continue
+        live.append((ref, which, dyn))
+        try:
+            cg = _cgcolor_under(dyn, appearance)
+            if cg is not None:
+                getattr(layer, which)(cg)
+        except Exception:  # noqa: BLE001
+            pass
+    _THEMED_LAYERS[:] = live
+
+
 def _apply_appearance(win):
     """Theme one NSWindow per _APPEARANCE_PREF (None => system). Never raises."""
     try:
@@ -2124,6 +2267,10 @@ def _set_appearance_pref(pref):
                 w.setAppearance_(ap)
             except Exception:  # noqa: BLE001
                 pass
+        # Layer CGColors carry no appearance, so re-resolve every registered
+        # themed layer under the new appearance (text colors are dynamic and
+        # adapt on their own). Also runs at launch (7592) => correct first paint.
+        _reresolve_layer_colors(ap if ap is not None else app.effectiveAppearance())
     except Exception:  # noqa: BLE001
         pass
 
@@ -2374,8 +2521,14 @@ def _glass():
             il = _Glass.round_layer(inner, radius, mask=True)
             if il is not None:
                 il.setBorderWidth_(1.0)
-                il.setBorderColor_(
-                    NSColor.whiteColor().colorWithAlphaComponent_(0.14).CGColor())
+                # Shared rim: route through _paint so it re-themes live and reads
+                # on Light. Dark is byte-identical (sRGB white .14 == the former
+                # whiteColor .14 to the eye). History cards inherit this rim as-is;
+                # Settings cards override it afterwards with CARD_RIM (last _paint
+                # wins). Only History/Settings ever call card() — neither of the
+                # VibrantDark-pinned regions (Transcribe/HUD/Popover) does — so
+                # this cannot alter those.
+                _paint(il, "setBorderColor_", _dyn((1, 1, 1, 0.14), (0, 0, 0, 0.12)))
             container.addSubview_(inner)
             return container, inner
 
@@ -3196,11 +3349,11 @@ def _history_controller_class():
             pl = pill.layer()
             if pl is not None:
                 pl.setCornerRadius_(11.0)
-                pl.setBackgroundColor_(
-                    NSColor.whiteColor().colorWithAlphaComponent_(0.06).CGColor())
+                _paint(pl, "setBackgroundColor_",
+                       _dyn((1, 1, 1, 0.06), (0, 0, 0, 0.05)))
                 pl.setBorderWidth_(1.0)
-                pl.setBorderColor_(
-                    NSColor.whiteColor().colorWithAlphaComponent_(0.09).CGColor())
+                _paint(pl, "setBorderColor_",
+                       _dyn((1, 1, 1, 0.09), (0, 0, 0, 0.12)))
             spark = NSImageView.alloc().initWithFrame_(NSMakeRect(9, 4, 13, 13))
             spark.setAutoresizingMask_(0)
             simg = _phosphor_sf(
@@ -3208,14 +3361,14 @@ def _history_controller_class():
             if simg is not None:
                 spark.setImage_(simg)
                 try:
-                    spark.setContentTintColor_(GREEN)
+                    spark.setContentTintColor_(
+                        _dyn((0.788, 0.925, 0.431, 1.0), (0.34, 0.52, 0.10, 1.0)))
                 except Exception:  # noqa: BLE001
                     pass
             pill.addSubview_(spark)
             count = NSTextField.labelWithString_("0")
             count.setFont_(G.rounded_font(11, 0.3))
-            count.setTextColor_(
-                NSColor.whiteColor().colorWithAlphaComponent_(0.6))
+            count.setTextColor_(_dyn((1, 1, 1, 0.6), (0, 0, 0, 0.6)))
             count.setFrame_(NSMakeRect(25, 3, 45, 15))
             count.setAutoresizingMask_(0)
             pill.addSubview_(count)
@@ -3308,11 +3461,11 @@ def _history_controller_class():
             ecl = ecircle.layer()
             if ecl is not None:
                 ecl.setCornerRadius_(33.0)
-                ecl.setBackgroundColor_(
-                    NSColor.whiteColor().colorWithAlphaComponent_(0.05).CGColor())
+                _paint(ecl, "setBackgroundColor_",
+                       _dyn((1, 1, 1, 0.05), (0, 0, 0, 0.04)))
                 ecl.setBorderWidth_(1.0)
-                ecl.setBorderColor_(
-                    NSColor.whiteColor().colorWithAlphaComponent_(0.08).CGColor())
+                _paint(ecl, "setBorderColor_",
+                       _dyn((1, 1, 1, 0.08), (0, 0, 0, 0.12)))
             micv = NSImageView.alloc().initWithFrame_(NSMakeRect(18, 18, 30, 30))
             micv.setImageScaling_(_SCALE_FIT)
             micimg = _phosphor_sf(
@@ -3321,7 +3474,7 @@ def _history_controller_class():
                 micv.setImage_(micimg)
                 try:
                     micv.setContentTintColor_(
-                        NSColor.whiteColor().colorWithAlphaComponent_(0.5))
+                        _dyn((1, 1, 1, 0.5), (0, 0, 0, 0.5)))
                 except Exception:  # noqa: BLE001
                     pass
             ecircle.addSubview_(micv)
@@ -3329,8 +3482,7 @@ def _history_controller_class():
 
             etitle = NSTextField.labelWithString_("No dictations yet")
             etitle.setFont_(G.rounded_font(15, 0.3))
-            etitle.setTextColor_(
-                NSColor.whiteColor().colorWithAlphaComponent_(0.62))
+            etitle.setTextColor_(_dyn((1, 1, 1, 0.62), (0, 0, 0, 0.72)))
             etitle.setAlignment_(NSTextAlignmentCenter)
             etitle.setFrame_(NSMakeRect(0, cy - 6, W, 22))
             etitle.setAutoresizingMask_(
@@ -3341,8 +3493,7 @@ def _history_controller_class():
             ebody = NSTextField.wrappingLabelWithString_(
                 "Your dictations will appear here as you use früt Flow.")
             ebody.setFont_(G.rounded_font(12.5))
-            ebody.setTextColor_(
-                NSColor.whiteColor().colorWithAlphaComponent_(0.4))
+            ebody.setTextColor_(_dyn((1, 1, 1, 0.4), (0, 0, 0, 0.52)))
             ebody.setAlignment_(NSTextAlignmentCenter)
             ebody.setFrame_(NSMakeRect(W / 2 - 130, cy - 46, 260, 34))
             ebody.setAutoresizingMask_(
@@ -3421,8 +3572,7 @@ def _history_controller_class():
             it lays out like a card row but with no background."""
             lbl = NSTextField.labelWithString_(title)
             lbl.setFont_(G.rounded_font(12, 0.3))
-            lbl.setTextColor_(
-                NSColor.whiteColor().colorWithAlphaComponent_(0.46))
+            lbl.setTextColor_(_dyn((1, 1, 1, 0.46), (0, 0, 0, 0.50)))
             lbl.setTranslatesAutoresizingMaskIntoConstraints_(False)
             return lbl
 
@@ -3550,7 +3700,7 @@ def _history_controller_class():
             copy.setFont_(G.rounded_font(12))
             try:
                 copy.setContentTintColor_(
-                    NSColor.whiteColor().colorWithAlphaComponent_(0.6))
+                    _dyn((1, 1, 1, 0.6), (0, 0, 0, 0.55)))
             except Exception:  # noqa: BLE001
                 pass
             copy.setTranslatesAutoresizingMaskIntoConstraints_(False)
@@ -3579,8 +3729,11 @@ def _history_controller_class():
             def _meta_label(s, alpha=0.42):
                 lbl = NSTextField.labelWithString_(s)
                 lbl.setFont_(G.rounded_font(11.5))
+                # Light mirrors the muted dark weight at ~+0.08 alpha (light
+                # backgrounds need a touch more to read equally): .42->.50 words,
+                # .5->.58 relative-time, .28->.36 dot separators.
                 lbl.setTextColor_(
-                    NSColor.whiteColor().colorWithAlphaComponent_(alpha))
+                    _dyn((1, 1, 1, alpha), (0, 0, 0, min(1.0, alpha + 0.08))))
                 return lbl
 
             if when:
@@ -3600,7 +3753,7 @@ def _history_controller_class():
                         av.setImage_(aimg)
                         try:
                             av.setContentTintColor_(
-                                NSColor.whiteColor().colorWithAlphaComponent_(0.5))
+                                _dyn((1, 1, 1, 0.5), (0, 0, 0, 0.5)))
                         except Exception:  # noqa: BLE001
                             pass
                         meta.addArrangedSubview_(av)
@@ -3608,14 +3761,13 @@ def _history_controller_class():
             if not delivered:
                 clip = NSTextField.labelWithString_("clipboard only")
                 clip.setFont_(G.rounded_font(10.5))
-                clip.setTextColor_(
-                    NSColor.whiteColor().colorWithAlphaComponent_(0.5))
+                clip.setTextColor_(_dyn((1, 1, 1, 0.5), (0, 0, 0, 0.55)))
                 clip.setWantsLayer_(True)
                 cl = clip.layer()
                 if cl is not None:
                     cl.setCornerRadius_(5.0)
-                    cl.setBackgroundColor_(
-                        NSColor.whiteColor().colorWithAlphaComponent_(0.06).CGColor())
+                    _paint(cl, "setBackgroundColor_",
+                           _dyn((1, 1, 1, 0.06), (0, 0, 0, 0.05)))
                 # A little horizontal breathing room inside the pill.
                 clip.setFrame_(NSMakeRect(0, 0, 92, 16))
                 meta.addArrangedSubview_(clip)
@@ -4226,21 +4378,29 @@ def _settings_controller_class():
     # --- palette (mockup values, built with sRGB) -------------------------
     def _c(r, g, b, a=1.0):
         return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, a)
-    ACCENT = _c(0.788, 0.925, 0.431, 1.0)
-    CARD_BG = _c(1, 1, 1, 0.038)
-    CARD_RIM = _c(1, 1, 1, 0.07)
-    ROW_DIV = _c(1, 1, 1, 0.055)
-    TITLE_COL = _c(1, 1, 1, 0.90)
-    SUB_COL = _c(1, 1, 1, 0.45)
-    SECTION_COL = _c(1, 1, 1, 0.50)
-    OK_BG = _c(0.788, 0.925, 0.431, 0.14)
-    BAD_BG = _c(1.0, 0.62, 0.40, 0.16)
-    BAD_FG = _c(1.0, 0.70, 0.48, 1.0)
-    BANNER_BG = _c(0.788, 0.925, 0.431, 0.08)
-    BANNER_RIM = _c(0.788, 0.925, 0.431, 0.20)
-    CHIP_BG = _c(0, 0, 0, 0.26)
-    CHIP_RIM = _c(1, 1, 1, 0.09)
-    TILE_BG = _c(1, 1, 1, 0.06)
+    # Dark stays byte-identical: each _dyn passes the ORIGINAL literal as its
+    # dark arg (resolves to the same color under DarkAqua) and only splits in a
+    # readable Light variant. Text constants (TITLE/SUB/SECTION/BAD_FG) are
+    # dynamic NSColors and auto-adapt at their setTextColor_ sites; layer
+    # constants are routed through _paint at their .setXColor_ sites so their
+    # frozen CGColors re-resolve on a theme switch. ACCENT stays lime in BOTH
+    # themes (icon tints / fill base); only accent-as-TEXT splits to ACCENT_TXT.
+    ACCENT = _c(0.788, 0.925, 0.431, 1.0)                              # lime (both)
+    ACCENT_TXT = _dyn((0.788, 0.925, 0.431, 1.0), (0.34, 0.52, 0.10, 1.0))  # accent-as-text
+    CARD_BG = _dyn((1, 1, 1, 0.038), (0, 0, 0, 0.03))
+    CARD_RIM = _dyn((1, 1, 1, 0.07), (0, 0, 0, 0.10))
+    ROW_DIV = _dyn((1, 1, 1, 0.055), (0, 0, 0, 0.08))
+    TITLE_COL = _dyn((1, 1, 1, 0.90), (0, 0, 0, 0.85))
+    SUB_COL = _dyn((1, 1, 1, 0.45), (0, 0, 0, 0.55))
+    SECTION_COL = _dyn((1, 1, 1, 0.50), (0, 0, 0, 0.50))
+    OK_BG = _dyn((0.788, 0.925, 0.431, 0.14), (0.788, 0.925, 0.431, 0.20))
+    BAD_BG = _dyn((1.0, 0.62, 0.40, 0.16), (0.85, 0.35, 0.15, 0.16))
+    BAD_FG = _dyn((1.0, 0.70, 0.48, 1.0), (0.80, 0.34, 0.10, 1.0))
+    BANNER_BG = _dyn((0.788, 0.925, 0.431, 0.08), (0.788, 0.925, 0.431, 0.16))
+    BANNER_RIM = _dyn((0.788, 0.925, 0.431, 0.20), (0.34, 0.52, 0.10, 0.35))
+    CHIP_BG = _dyn((0, 0, 0, 0.26), (0, 0, 0, 0.06))
+    CHIP_RIM = _dyn((1, 1, 1, 0.09), (0, 0, 0, 0.12))
+    TILE_BG = _dyn((1, 1, 1, 0.06), (0, 0, 0, 0.05))
 
     WIN_W, WIN_H = 520.0, 500.0
     PAD = 18.0
@@ -4374,8 +4534,8 @@ def _settings_controller_class():
             try:
                 il = inner.layer()
                 if il is not None:
-                    il.setBackgroundColor_(CARD_BG.CGColor())
-                    il.setBorderColor_(CARD_RIM.CGColor())
+                    _paint(il, "setBackgroundColor_", CARD_BG)
+                    _paint(il, "setBorderColor_", CARD_RIM)
             except Exception:  # noqa: BLE001
                 pass
             pane.addSubview_(container)
@@ -4409,7 +4569,7 @@ def _settings_controller_class():
             div = NSView.alloc().initWithFrame_(
                 NSMakeRect(0, top, inner.frame().size.width, 1))
             div.setWantsLayer_(True)
-            div.layer().setBackgroundColor_(ROW_DIV.CGColor())
+            _paint(div.layer(), "setBackgroundColor_", ROW_DIV)
             div.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
             inner.addSubview_(div)
 
@@ -4506,9 +4666,9 @@ def _settings_controller_class():
                            top - ROW_H / 2 - 13, lw, 26))
             box.setWantsLayer_(True)
             G.round_layer(box, 8.0)
-            box.layer().setBackgroundColor_(CHIP_BG.CGColor())
+            _paint(box.layer(), "setBackgroundColor_", CHIP_BG)
             box.layer().setBorderWidth_(1.0)
-            box.layer().setBorderColor_(CHIP_RIM.CGColor())
+            _paint(box.layer(), "setBorderColor_", CHIP_RIM)
             box.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
             lbl.setFrame_(NSMakeRect(11, 5, lw - 22, 16))
             box.addSubview_(lbl)
@@ -4523,11 +4683,12 @@ def _settings_controller_class():
                            top - ROW_H / 2 - 11, 60, 22))
             pill.setWantsLayer_(True)
             G.round_layer(pill, 11.0)
-            pill.layer().setBackgroundColor_((OK_BG if good else CHIP_BG).CGColor())
+            _paint(pill.layer(), "setBackgroundColor_",
+                   OK_BG if good else CHIP_BG)
             pill.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
             lbl = NSTextField.labelWithString_(text)
             lbl.setFont_(G.rounded_font(11.5, 0.3))
-            lbl.setTextColor_(ACCENT if good else SUB_COL)
+            lbl.setTextColor_(ACCENT_TXT if good else SUB_COL)
             lbl.setAlignment_(NSTextAlignmentCenter)
             lbl.setFrame_(NSMakeRect(0, 3, 60, 15))
             pill.addSubview_(lbl)
@@ -4879,7 +5040,7 @@ def _settings_controller_class():
                         NSMakeRect(0, y - GAP / 2.0,
                                    inner.frame().size.width, 1))
                     div.setWantsLayer_(True)
-                    div.layer().setBackgroundColor_(ROW_DIV.CGColor())
+                    _paint(div.layer(), "setBackgroundColor_", ROW_DIV)
                     div.setAutoresizingMask_(_WSZ)
                     flip.addSubview_(div)
                 t = NSTextField.labelWithString_(title)
@@ -4902,8 +5063,8 @@ def _settings_controller_class():
             try:
                 il = inner.layer()
                 if il is not None:
-                    il.setBackgroundColor_(CARD_BG.CGColor())
-                    il.setBorderColor_(CARD_RIM.CGColor())
+                    _paint(il, "setBackgroundColor_", CARD_BG)
+                    _paint(il, "setBorderColor_", CARD_RIM)
             except Exception:  # noqa: BLE001
                 pass
             pane.addSubview_(container)
@@ -4920,9 +5081,9 @@ def _settings_controller_class():
             box = NSView.alloc().initWithFrame_(NSMakeRect(PAD, y_top, CONTENT_W, h))
             box.setWantsLayer_(True)
             G.round_layer(box, 12.0)
-            box.layer().setBackgroundColor_(BANNER_BG.CGColor())
+            _paint(box.layer(), "setBackgroundColor_", BANNER_BG)
             box.layer().setBorderWidth_(1.0)
-            box.layer().setBorderColor_(BANNER_RIM.CGColor())
+            _paint(box.layer(), "setBorderColor_", BANNER_RIM)
             iv = NSImageView.alloc().initWithFrame_(NSMakeRect(15, 20, 24, 24))
             img = _phosphor_sf(
                 "checkmark.shield.fill", "on-device", point=22.0)
@@ -4954,7 +5115,7 @@ def _settings_controller_class():
                 NSMakeRect(14, top - ROW_H / 2 - 16, 32, 32))
             tile.setWantsLayer_(True)
             G.round_layer(tile, 8.0)
-            tile.layer().setBackgroundColor_(TILE_BG.CGColor())
+            _paint(tile.layer(), "setBackgroundColor_", TILE_BG)
             tile.setAutoresizingMask_(NSViewMinYMargin)
             sym = {"mic": "mic.fill", "ax": "cursorarrow.click",
                    "input": "keyboard"}.get(key, "lock")
@@ -5072,17 +5233,13 @@ def _settings_controller_class():
                     continue
                 pill = row["pill"]
                 if granted is True:
-                    try:
-                        pill.layer().setBackgroundColor_(OK_BG.CGColor())
-                    except Exception:  # noqa: BLE001
-                        pass
-                    self._tint_button_title(pill, "Granted", ACCENT)
+                    # Re-runs on each _refresh_permissions; _paint re-registers
+                    # (idempotent, last-set wins), matching the current state.
+                    _paint(pill.layer(), "setBackgroundColor_", OK_BG)
+                    self._tint_button_title(pill, "Granted", ACCENT_TXT)
                     pill.setEnabled_(False)
                 else:
-                    try:
-                        pill.layer().setBackgroundColor_(BAD_BG.CGColor())
-                    except Exception:  # noqa: BLE001
-                        pass
+                    _paint(pill.layer(), "setBackgroundColor_", BAD_BG)
                     self._tint_button_title(
                         pill, "Grant…" if granted is False else "Unknown", BAD_FG)
                     pill.setEnabled_(True)
@@ -5293,7 +5450,11 @@ def _onboarding_controller_class():
     GREEN = _rgb(0.788, 0.925, 0.431)          # #c9ec6e
     GREEN_HI = _rgb(0.831, 0.941, 0.475)       # #d4f079
     GREEN_LO = _rgb(0.753, 0.878, 0.361)       # #c0e05c
-    DARK_TXT = _rgb(0.078, 0.090, 0.043)       # #14170b — text on green
+    DARK_TXT = _rgb(0.078, 0.090, 0.043)       # #14170b — text on green (both themes)
+    # Green used as TEXT washes out on light glass; this darker-green variant is
+    # used ONLY at the two text sites ('Granted' pill label + 'Grant' title).
+    # The GREEN constant stays lime for chip fills/tints.
+    GREEN_TXT = _dyn((0.788, 0.925, 0.431, 1.0), (0.34, 0.52, 0.10, 1.0))
 
     WIN_W, WIN_H = 500.0, 590.0
     PAD_X = 34.0
@@ -5417,7 +5578,9 @@ def _onboarding_controller_class():
             G.round_layer(tile, radius, mask=True)
             lay = tile.layer()
             if lay is not None:
-                lay.setBackgroundColor_(GREEN.colorWithAlphaComponent_(0.10).CGColor())
+                _paint(lay, "setBackgroundColor_",
+                       _dyn((0.788, 0.925, 0.431, 0.10),
+                            (0.788, 0.925, 0.431, 0.18)))
             iv = self._sf_symbol(symbol, sym_pt, GREEN)
             if iv is not None:
                 inset = (side - sym_pt - 6) / 2.0
@@ -5435,9 +5598,9 @@ def _onboarding_controller_class():
             self._icon_tile(row, symbol, 0, 3, 38, 10, 19)
             tx = 38 + 13
             self._label(row, title, tx, 23, w - tx, 18, 13.5, 0.35,
-                        _white(0.9), NSTextAlignmentLeft)
+                        _dyn((1, 1, 1, 0.9), (0, 0, 0, 0.85)), NSTextAlignmentLeft)
             self._label(row, subtitle, tx, 3, w - tx, 17, 12.0, 0.0,
-                        _white(0.5), NSTextAlignmentLeft)
+                        _dyn((1, 1, 1, 0.5), (0, 0, 0, 0.55)), NSTextAlignmentLeft)
             parent.addSubview_(row)
             return row
 
@@ -5461,12 +5624,12 @@ def _onboarding_controller_class():
 
             y = top - ic - 22 - 30
             self._label(v, "Welcome to früt Flow", 0, y, W, 30, 23, 0.6,
-                        _white(1.0), NSTextAlignmentCenter)
+                        _dyn((1, 1, 1, 1.0), (0, 0, 0, 0.88)), NSTextAlignmentCenter)
             self._label(
                 v, "Private, on-device dictation. Hold a key, speak, and your "
                 "words appear in whatever app you're using.",
                 (W - 340) / 2.0, y - 52, 340, 46, 13.5, 0.0,
-                _white(0.6), NSTextAlignmentCenter)
+                _dyn((1, 1, 1, 0.6), (0, 0, 0, 0.60)), NSTextAlignmentCenter)
 
             # 3 feature rows, left-aligned, centered block (max-width 322).
             fw = 322.0
@@ -5493,12 +5656,12 @@ def _onboarding_controller_class():
                             side, 15, 26)
             y = top - side - 18 - 26
             self._label(v, "Two quick permissions", 0, y, W, 26, 21, 0.6,
-                        _white(1.0), NSTextAlignmentCenter)
+                        _dyn((1, 1, 1, 1.0), (0, 0, 0, 0.88)), NSTextAlignmentCenter)
             self._label(
                 v, "früt Flow needs these to hear you and type for you. They "
                 "stay on this Mac.",
                 (W - 320) / 2.0, y - 44, 320, 40, 13.5, 0.0,
-                _white(0.58), NSTextAlignmentCenter)
+                _dyn((1, 1, 1, 0.58), (0, 0, 0, 0.60)), NSTextAlignmentCenter)
 
             rows = [
                 ("mic", "mic.fill", "Microphone", "Hear what you dictate"),
@@ -5523,9 +5686,11 @@ def _onboarding_controller_class():
             G.round_layer(row, 13.0, mask=True)
             rl = row.layer()
             if rl is not None:
-                rl.setBackgroundColor_(_white(0.045).CGColor())
+                _paint(rl, "setBackgroundColor_",
+                       _dyn((1, 1, 1, 0.045), (0, 0, 0, 0.03)))
                 rl.setBorderWidth_(1.0)
-                rl.setBorderColor_(_white(0.07).CGColor())
+                _paint(rl, "setBorderColor_",
+                       _dyn((1, 1, 1, 0.07), (0, 0, 0, 0.10)))
 
             # neutral icon tile (not green — matches mockup rgba(255,255,255,.06))
             side = 34.0
@@ -5533,7 +5698,8 @@ def _onboarding_controller_class():
             G.round_layer(tile, 9.0, mask=True)
             tl = tile.layer()
             if tl is not None:
-                tl.setBackgroundColor_(_white(0.06).CGColor())
+                _paint(tl, "setBackgroundColor_",
+                       _dyn((1, 1, 1, 0.06), (0, 0, 0, 0.05)))
             iv = self._sf_symbol(sym, 18, GREEN)
             if iv is not None:
                 iv.setFrame_(NSMakeRect(6, 6, side - 12, side - 12))
@@ -5542,9 +5708,9 @@ def _onboarding_controller_class():
 
             tx = 13 + side + 12
             self._label(row, title, tx, 31, w - tx - 110, 18, 13.5, 0.35,
-                        _white(0.9), NSTextAlignmentLeft)
+                        _dyn((1, 1, 1, 0.9), (0, 0, 0, 0.85)), NSTextAlignmentLeft)
             self._label(row, sub, tx, 11, w - tx - 110, 16, 11.5, 0.0,
-                        _white(0.48), NSTextAlignmentLeft)
+                        _dyn((1, 1, 1, 0.48), (0, 0, 0, 0.55)), NSTextAlignmentLeft)
 
             # right-side status control: a "Granted" pill + a "Grant" button,
             # stacked in the same spot; visibility toggled by _refresh_perms.
@@ -5565,10 +5731,13 @@ def _onboarding_controller_class():
             gl = grant.layer()
             if gl is not None:
                 G.round_layer(grant, 8.0, mask=True)
-                gl.setBackgroundColor_(GREEN.colorWithAlphaComponent_(0.12).CGColor())
+                _paint(gl, "setBackgroundColor_",
+                       _dyn((0.788, 0.925, 0.431, 0.12),
+                            (0.788, 0.925, 0.431, 0.20)))
                 gl.setBorderWidth_(1.0)
-                gl.setBorderColor_(GREEN.colorWithAlphaComponent_(0.4).CGColor())
-            self._tint_button_title(grant, "Grant", GREEN)
+                _paint(gl, "setBorderColor_",
+                       _dyn((0.788, 0.925, 0.431, 0.4), (0.34, 0.52, 0.10, 0.45)))
+            self._tint_button_title(grant, "Grant", GREEN_TXT)
             grant.setTag_(tag)
             row.addSubview_(grant)
 
@@ -5582,11 +5751,13 @@ def _onboarding_controller_class():
             G.round_layer(pill, h / 2.0, mask=True)
             pl = pill.layer()
             if pl is not None:
-                pl.setBackgroundColor_(GREEN.colorWithAlphaComponent_(0.14).CGColor())
+                _paint(pl, "setBackgroundColor_",
+                       _dyn((0.788, 0.925, 0.431, 0.14),
+                            (0.788, 0.925, 0.431, 0.20)))
             lbl = NSTextField.labelWithString_(text)
             lbl.setFrame_(NSMakeRect(0, (h - 16) / 2.0, w, 16))
             lbl.setFont_(G.rounded_font(12, 0.4))
-            lbl.setTextColor_(GREEN)
+            lbl.setTextColor_(GREEN_TXT)
             lbl.setAlignment_(NSTextAlignmentCenter)
             pill.addSubview_(lbl)
             return pill
@@ -5622,9 +5793,12 @@ def _onboarding_controller_class():
             G.round_layer(tile, side / 2.0, mask=True)
             tl = tile.layer()
             if tl is not None:
-                tl.setBackgroundColor_(GREEN.colorWithAlphaComponent_(0.10).CGColor())
+                _paint(tl, "setBackgroundColor_",
+                       _dyn((0.788, 0.925, 0.431, 0.10),
+                            (0.788, 0.925, 0.431, 0.18)))
                 tl.setBorderWidth_(1.0)
-                tl.setBorderColor_(GREEN.colorWithAlphaComponent_(0.25).CGColor())
+                _paint(tl, "setBorderColor_",
+                       _dyn((0.788, 0.925, 0.431, 0.25), (0.34, 0.52, 0.10, 0.35)))
             iv = self._sf_symbol("mic.fill", 34, GREEN)
             if iv is not None:
                 iv.setFrame_(NSMakeRect(18, 18, side - 36, side - 36))
@@ -5633,12 +5807,12 @@ def _onboarding_controller_class():
 
             y = top - side - 20 - 26
             self._label(v, "You're all set", 0, y, W, 26, 22, 0.6,
-                        _white(1.0), NSTextAlignmentCenter)
+                        _dyn((1, 1, 1, 1.0), (0, 0, 0, 0.88)), NSTextAlignmentCenter)
             self._label(
                 v, "Hold %s, say something, and release to insert it wherever "
                 "your cursor is." % self._hotkey_hint(),
                 (W - 340) / 2.0, y - 54, 340, 48, 13.5, 0.0,
-                _white(0.6), NSTextAlignmentCenter)
+                _dyn((1, 1, 1, 0.6), (0, 0, 0, 0.60)), NSTextAlignmentCenter)
 
             # faux "Try typing with your voice" field.
             fw = 330.0
@@ -5647,17 +5821,20 @@ def _onboarding_controller_class():
             G.round_layer(field, 12.0, mask=True)
             fl = field.layer()
             if fl is not None:
-                fl.setBackgroundColor_(_rgb(0, 0, 0, 0.26).CGColor())
+                _paint(fl, "setBackgroundColor_",
+                       _dyn((0, 0, 0, 0.26), (0, 0, 0, 0.06)))
                 fl.setBorderWidth_(1.0)
-                fl.setBorderColor_(_white(0.08).CGColor())
+                _paint(fl, "setBorderColor_",
+                       _dyn((1, 1, 1, 0.08), (0, 0, 0, 0.12)))
             self._label(field, "Try typing with your voice", 15, 16, fw - 30, 18,
-                        13.5, 0.0, _white(0.5), NSTextAlignmentLeft)
+                        13.5, 0.0, _dyn((1, 1, 1, 0.5), (0, 0, 0, 0.45)),
+                        NSTextAlignmentLeft)
             v.addSubview_(field)
 
             self._label(
                 v, "You can change the hotkey anytime in Settings.",
                 0, y - 54 - 26 - 48 - 16 - 16, W, 16, 12, 0.0,
-                _white(0.4), NSTextAlignmentCenter)
+                _dyn((1, 1, 1, 0.4), (0, 0, 0, 0.50)), NSTextAlignmentCenter)
 
         @objc.python_method
         def _hotkey_hint(self):
@@ -5690,10 +5867,13 @@ def _onboarding_controller_class():
             bl = back.layer()
             if bl is not None:
                 G.round_layer(back, 9.0, mask=True)
-                bl.setBackgroundColor_(_white(0.06).CGColor())
+                _paint(bl, "setBackgroundColor_",
+                       _dyn((1, 1, 1, 0.06), (0, 0, 0, 0.05)))
                 bl.setBorderWidth_(1.0)
-                bl.setBorderColor_(_white(0.09).CGColor())
-            self._tint_button_title(back, "Back", _white(0.72))
+                _paint(bl, "setBorderColor_",
+                       _dyn((1, 1, 1, 0.09), (0, 0, 0, 0.12)))
+            self._tint_button_title(back, "Back",
+                                    _dyn((1, 1, 1, 0.72), (0, 0, 0, 0.65)))
             back.setAutoresizingMask_(NSViewMaxXMargin | NSViewMaxYMargin)
             bar.addSubview_(back)
             self._back = back
@@ -5772,8 +5952,17 @@ def _onboarding_controller_class():
                 dot.setFrame_(NSMakeRect(nf.origin.x, nf.origin.y, neww,
                                          nf.size.height))
                 if lay is not None:
-                    col = GREEN if active else _white(0.22)
-                    lay.setBackgroundColor_(col.CGColor())
+                    # Split the active/inactive ternary so each gets its own
+                    # dynamic color. Re-runs on step change; _paint re-registers
+                    # (idempotent, last-set wins). A pale lime dot is nearly
+                    # invisible on light glass, so active darkens to brand green.
+                    if active:
+                        _paint(lay, "setBackgroundColor_",
+                               _dyn((0.788, 0.925, 0.431, 1.0),
+                                    (0.34, 0.52, 0.10, 1.0)))
+                    else:
+                        _paint(lay, "setBackgroundColor_",
+                               _dyn((1, 1, 1, 0.22), (0, 0, 0, 0.20)))
             # re-center the dot row for the new widths.
             self._recenter_dots()
             # primary button label per step.
