@@ -1971,28 +1971,197 @@ _TRANSCRIBE_CTRL_CLASS = None
 
 
 def _transcribe_controller_class():
-    """Lazily build the controller that runs the 'Transcribe an audio file' window:
-    a titled, resizable window with a Choose-file button, a status line, an editable
-    transcript text view, and Copy / Save buttons. Deferred import so CLI paths never
-    load AppKit."""
+    """Lazily build the controller for the 'Transcribe an audio file' window.
+
+    A titled, resizable liquid-glass window with three swapped states that mirror
+    the mockup (lines 301-354):
+      • EMPTY   — a dashed drop zone (waveform SF Symbol in a circle, subtitle of
+                  supported formats) + a green-gradient 'Choose File…' button.
+                  The window's content view accepts drag-and-drop of an audio
+                  file and highlights on drag-over.
+      • LOADING — a centered indeterminate NSProgressIndicator (AppKit-managed;
+                  no hand animation) + 'Transcribing "<name>"…' + a subtitle.
+      • DONE    — a rounded file-info card (audio SF Symbol, filename, 'N words ·
+                  transcribed on-device') above the editable transcript, then a
+                  green-gradient Copy button + Save… + right-aligned
+                  'Transcribe another' (resets to EMPTY).
+
+    The transcribe/copy/save wiring and the FlowApp._transcribe_path contract
+    (bg thread, serialized by FlowApp._transcribe_lock) are preserved exactly.
+    Deferred AppKit import so CLI paths never load Cocoa."""
     global _TRANSCRIBE_CTRL_CLASS
     if _TRANSCRIBE_CTRL_CLASS is not None:
         return _TRANSCRIBE_CTRL_CLASS
     import objc
     from Cocoa import (
-        NSObject, NSWindow, NSScrollView, NSTextView, NSButton, NSTextField,
+        NSObject, NSView, NSWindow, NSScrollView, NSTextView, NSButton,
+        NSTextField, NSImageView, NSImage, NSProgressIndicator,
         NSOpenPanel, NSSavePanel, NSApplication, NSColor, NSFont,
         NSApplicationActivationPolicyRegular, NSApplicationActivationPolicyAccessory,
-        NSMakeRect, NSMakeSize, NSOperationQueue,
+        NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue,
         NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
         NSWindowStyleMaskResizable, NSWindowStyleMaskMiniaturizable,
         NSBackingStoreBuffered, NSViewWidthSizable, NSViewHeightSizable,
-        NSViewMinYMargin, NSViewMaxYMargin, NSVisualEffectView,
+        NSViewMinYMargin, NSViewMaxYMargin, NSViewMinXMargin, NSViewMaxXMargin,
+        NSVisualEffectView, NSTextAlignmentCenter, NSTextAlignmentLeft,
+        NSDragOperationCopy, NSDragOperationNone,
     )
     G = _glass()
     OK = 1               # NSModalResponseOK / NSFileHandlingPanelOKButton
     AUDIO_TYPES = ["wav", "aiff", "aif", "aifc", "caf", "m4a", "m4b", "mp3", "mp4",
                    "aac", "flac", "ogg", "opus", "mov", "wma", "amr", "3gp"]
+
+    def _rgb(r, g, b, a=1.0):
+        return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, a)
+
+    def _white(a):
+        return NSColor.whiteColor().colorWithAlphaComponent_(a)
+
+    GREEN = _rgb(0.788, 0.925, 0.431)          # #c9ec6e — the früt accent
+    GRAD_TOP = _rgb(0.831, 0.941, 0.475)       # #d4f079
+    GRAD_BOT = _rgb(0.753, 0.878, 0.361)       # #c0e05c
+    INK = _rgb(0.078, 0.090, 0.043)            # #14170b — near-black button text
+
+    def _symbol(name, point_size, weight_ok=True):
+        """An SF Symbol NSImage at a given point size, or None if unavailable."""
+        try:
+            img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+        except Exception:  # noqa: BLE001
+            return None
+        if img is None:
+            return None
+        try:
+            from Cocoa import NSImageSymbolConfiguration
+            cfg = NSImageSymbolConfiguration.configurationWithPointSize_weight_(
+                point_size, 5)   # NSFontWeightMedium ~= 5
+            r = img.imageWithSymbolConfiguration_(cfg)
+            if r is not None:
+                img = r
+        except Exception:  # noqa: BLE001
+            pass
+        return img
+
+    def _green_button(title, symbol_name, target, action):
+        """A green-gradient pill button (mockup's Choose File / Copy) with dark
+        ink text. Uses a CAGradientLayer behind the button — no per-frame work."""
+        btn = NSButton.buttonWithTitle_target_action_(title, target, action)
+        btn.setBordered_(False)
+        img = _symbol(symbol_name, 13.0) if symbol_name else None
+        if img is not None:
+            btn.setImage_(img)
+            try:
+                from Cocoa import NSImageLeft
+                btn.setImagePosition_(NSImageLeft)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            btn.setContentTintColor_(INK)
+        except Exception:  # noqa: BLE001
+            pass
+        # Dark-ink title via attributed string (contentTintColor tints the symbol;
+        # attributed title guarantees the text color too).
+        try:
+            from Cocoa import (NSAttributedString, NSForegroundColorAttributeName,
+                               NSFontAttributeName)
+            attrs = {NSForegroundColorAttributeName: INK,
+                     NSFontAttributeName: G.rounded_font(13, 0.4)}
+            btn.setAttributedTitle_(
+                NSAttributedString.alloc().initWithString_attributes_(title, attrs))
+        except Exception:  # noqa: BLE001
+            btn.setFont_(G.rounded_font(13, 0.4))
+        btn.setWantsLayer_(True)
+        host = btn.layer()
+        if host is not None:
+            try:
+                from Quartz import CAGradientLayer
+                grad = CAGradientLayer.layer()
+                grad.setColors_([GRAD_TOP.CGColor(), GRAD_BOT.CGColor()])
+                grad.setStartPoint_(NSMakePoint(0.5, 1.0))
+                grad.setEndPoint_(NSMakePoint(0.5, 0.0))
+                grad.setCornerRadius_(9.0)
+                try:
+                    from Quartz import kCACornerCurveContinuous
+                    grad.setCornerCurve_(kCACornerCurveContinuous)
+                except Exception:  # noqa: BLE001
+                    pass
+                grad.setFrame_(host.bounds())
+                host.insertSublayer_atIndex_(grad, 0)
+                # keep the gradient sized to the button as it lays out
+                host.setMasksToBounds_(True)
+                host.setCornerRadius_(9.0)
+                btn._grad_layer = grad     # retain ref; resized in layout
+            except Exception:  # noqa: BLE001
+                host.setBackgroundColor_(GREEN.CGColor())
+                host.setCornerRadius_(9.0)
+        return btn
+
+    def _plain_button(title, symbol_name, target, action):
+        """A subtle translucent secondary button (Save… / Transcribe another)."""
+        btn = NSButton.buttonWithTitle_target_action_(title, target, action)
+        btn.setBordered_(False)
+        img = _symbol(symbol_name, 13.0) if symbol_name else None
+        if img is not None:
+            btn.setImage_(img)
+            try:
+                from Cocoa import NSImageLeft
+                btn.setImagePosition_(NSImageLeft)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            btn.setContentTintColor_(_white(0.82))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from Cocoa import (NSAttributedString, NSForegroundColorAttributeName,
+                               NSFontAttributeName)
+            attrs = {NSForegroundColorAttributeName: _white(0.82),
+                     NSFontAttributeName: G.rounded_font(12.5, 0.0)}
+            btn.setAttributedTitle_(
+                NSAttributedString.alloc().initWithString_attributes_(title, attrs))
+        except Exception:  # noqa: BLE001
+            btn.setFont_(G.rounded_font(12.5))
+        btn.setWantsLayer_(True)
+        bl = btn.layer()
+        if bl is not None:
+            bl.setBackgroundColor_(_white(0.06).CGColor())
+            bl.setCornerRadius_(9.0)
+            bl.setBorderWidth_(1.0)
+            bl.setBorderColor_(_white(0.09).CGColor())
+        return btn
+
+    # ---- a content view that accepts audio-file drops --------------------------
+    class _DropContentView(NSVisualEffectView):
+        # NOT an Obj-C initializer; set after alloc by the controller.
+        def acceptsFirstResponder(self):
+            return True
+
+        def draggingEntered_(self, sender):
+            ctrl = getattr(self, "_ctrl", None)
+            if ctrl is None or not ctrl._can_accept_drop(sender):
+                return NSDragOperationNone
+            ctrl._set_drop_highlight(True)
+            return NSDragOperationCopy
+
+        def draggingExited_(self, sender):
+            ctrl = getattr(self, "_ctrl", None)
+            if ctrl is not None:
+                ctrl._set_drop_highlight(False)
+
+        def draggingEnded_(self, sender):
+            ctrl = getattr(self, "_ctrl", None)
+            if ctrl is not None:
+                ctrl._set_drop_highlight(False)
+
+        def prepareForDragOperation_(self, sender):
+            ctrl = getattr(self, "_ctrl", None)
+            return bool(ctrl is not None and ctrl._can_accept_drop(sender))
+
+        def performDragOperation_(self, sender):
+            ctrl = getattr(self, "_ctrl", None)
+            if ctrl is None:
+                return False
+            ctrl._set_drop_highlight(False)
+            return bool(ctrl._handle_drop(sender))
 
     class _TranscribeController(NSObject):
         def initWithApp_(self, app):
@@ -2005,88 +2174,426 @@ def _transcribe_controller_class():
             self._build()
             return self
 
+        # -- build ----------------------------------------------------------
         @objc.python_method
         def _build(self):
             style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
                      | NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable)
             win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(0, 0, 640, 520), style, NSBackingStoreBuffered, False)
+                NSMakeRect(0, 0, 560, 496), style, NSBackingStoreBuffered, False)
             win.setTitle_("Transcribe Audio File — früt Flow")
             win.setReleasedWhenClosed_(False)
             win.setDelegate_(self)
-            win.setMinSize_(NSMakeSize(440, 340))
-            # Liquid-glass chrome: edge-to-edge blur under the traffic lights.
+            win.setMinSize_(NSMakeSize(440, 360))
             G.dress_window(win)
-            content = G.backing(win.contentView().frame(), G.MAT_WINDOW)
-            win.setContentView_(content)
 
-            choose = NSButton.buttonWithTitle_target_action_(
-                "Choose Audio File…", self, "chooseFile:")
-            choose.setFrame_(NSMakeRect(16, 476, 190, 28))
-            choose.setAutoresizingMask_(NSViewMinYMargin)
-            choose.setFont_(G.rounded_font(13))
-            content.addSubview_(choose)
+            frame = win.contentView().frame()
+            # A behind-window blurred DROP content view (dark charcoal glass).
+            content = _DropContentView.alloc().initWithFrame_(frame)
+            content.setBlendingMode_(G.BLEND_BEHIND)
+            content.setState_(G.STATE_ACTIVE)
+            try:
+                content.setMaterial_(G.MAT_WINDOW)
+            except Exception:  # noqa: BLE001
+                pass
+            content.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            # Force the always-dark vibe (mockup is dark glass) so white text reads.
+            try:
+                from Cocoa import NSAppearance
+                ap = NSAppearance.appearanceNamed_("NSAppearanceNameVibrantDark")
+                if ap is not None:
+                    content.setAppearance_(ap)
+            except Exception:  # noqa: BLE001
+                pass
+            content._ctrl = self
+            content.registerForDraggedTypes_(self._drag_types())
+            win.setContentView_(content)
+            self._content = content
+            W = frame.size.width
+            H = frame.size.height
+
+            # A common inner padding rect that clears the transparent titlebar.
+            PAD = 16.0
+            TOP = 47.0                         # leave room under the traffic lights
+
+            # ---- EMPTY state --------------------------------------------------
+            empty = NSView.alloc().initWithFrame_(
+                NSMakeRect(PAD, PAD, W - PAD * 2, H - PAD - TOP))
+            empty.setAutoresizingMask_(
+                NSViewWidthSizable | NSViewHeightSizable)
+            empty.setWantsLayer_(True)
+            el = empty.layer()
+            if el is not None:
+                el.setCornerRadius_(16.0)
+                el.setBackgroundColor_(_white(0.02).CGColor())
+                el.setBorderWidth_(1.5)
+                el.setBorderColor_(_white(0.16).CGColor())
+                try:
+                    from Quartz import kCACornerCurveContinuous
+                    el.setCornerCurve_(kCACornerCurveContinuous)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._empty = empty
+            self._empty_layer = el
+            content.addSubview_(empty)
+
+            ew = empty.frame().size.width
+            eh = empty.frame().size.height
+            cx = ew / 2.0
+
+            # circular icon well with a waveform symbol
+            circle = NSView.alloc().initWithFrame_(
+                NSMakeRect(cx - 33, eh / 2.0 + 40, 66, 66))
+            circle.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin
+                                        | NSViewMinYMargin)
+            circle.setWantsLayer_(True)
+            cl = circle.layer()
+            if cl is not None:
+                cl.setCornerRadius_(33.0)
+                cl.setBackgroundColor_(_white(0.05).CGColor())
+                cl.setBorderWidth_(1.0)
+                cl.setBorderColor_(_white(0.08).CGColor())
+            empty.addSubview_(circle)
+            wf = _symbol("waveform", 30.0)
+            wiv = NSImageView.alloc().initWithFrame_(NSMakeRect(0, 0, 66, 66))
+            if wf is not None:
+                wiv.setImage_(wf)
+            try:
+                wiv.setContentTintColor_(GREEN)
+            except Exception:  # noqa: BLE001
+                pass
+            wiv.setImageScaling_(1)     # NSImageScaleProportionallyDown
+            circle.addSubview_(wiv)
+
+            title = NSTextField.labelWithString_("Drop an audio file to transcribe")
+            title.setFrame_(NSMakeRect(0, eh / 2.0 + 6, ew, 22))
+            title.setAlignment_(NSTextAlignmentCenter)
+            title.setFont_(G.rounded_font(15, 0.4))
+            title.setTextColor_(_white(0.82))
+            title.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin
+                                       | NSViewMaxYMargin)
+            empty.addSubview_(title)
+
+            sub = NSTextField.labelWithString_(
+                "Voice memos, m4a, mp3, wav, aiff, and more")
+            sub.setFrame_(NSMakeRect(0, eh / 2.0 - 16, ew, 18))
+            sub.setAlignment_(NSTextAlignmentCenter)
+            sub.setFont_(G.rounded_font(12.5))
+            sub.setTextColor_(_white(0.45))
+            sub.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin
+                                     | NSViewMaxYMargin)
+            empty.addSubview_(sub)
+
+            choose = _green_button("Choose File…", "folder", self, "chooseFile:")
+            choose.setFrame_(NSMakeRect(cx - 74, eh / 2.0 - 62, 148, 34))
+            choose.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin
+                                        | NSViewMinYMargin)
+            empty.addSubview_(choose)
             self._choose = choose
 
-            status = NSTextField.labelWithString_(
-                "Choose an audio file (voice memo, m4a, mp3, wav…) to transcribe it.")
-            status.setFrame_(NSMakeRect(216, 481, 408, 20))
-            status.setAutoresizingMask_(NSViewMinYMargin | NSViewWidthSizable)
-            status.setFont_(G.rounded_font(13))
-            status.setTextColor_(NSColor.secondaryLabelColor())
-            content.addSubview_(status)
-            self._status = status
+            # ---- LOADING state ------------------------------------------------
+            loading = NSView.alloc().initWithFrame_(
+                NSMakeRect(PAD, PAD, W - PAD * 2, H - PAD - TOP))
+            loading.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            loading.setHidden_(True)
+            self._loading = loading
+            content.addSubview_(loading)
 
-            scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(16, 52, 608, 412))
+            lw = loading.frame().size.width
+            lh = loading.frame().size.height
+            lcx = lw / 2.0
+
+            spinner = NSProgressIndicator.alloc().initWithFrame_(
+                NSMakeRect(lcx - 16, lh / 2.0 + 28, 32, 32))
+            spinner.setStyle_(1)          # NSProgressIndicatorStyleSpinning
+            spinner.setIndeterminate_(True)
+            spinner.setDisplayedWhenStopped_(False)
+            spinner.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxXMargin
+                                         | NSViewMinYMargin | NSViewMaxYMargin)
+            try:
+                # tint the spinner green where the appearance supports it
+                spinner.setControlTint_(0)     # NSDefaultControlTint
+            except Exception:  # noqa: BLE001
+                pass
+            loading.addSubview_(spinner)
+            self._spinner = spinner
+
+            ltitle = NSTextField.labelWithString_("Transcribing…")
+            ltitle.setFrame_(NSMakeRect(0, lh / 2.0 - 6, lw, 22))
+            ltitle.setAlignment_(NSTextAlignmentCenter)
+            ltitle.setFont_(G.rounded_font(14.5, 0.4))
+            ltitle.setTextColor_(_white(0.82))
+            ltitle.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin
+                                        | NSViewMaxYMargin)
+            loading.addSubview_(ltitle)
+            self._loading_title = ltitle
+
+            lsub = NSTextField.labelWithString_(
+                "Running on-device on the GPU — long files take a little longer.")
+            lsub.setFrame_(NSMakeRect(lcx - 150, lh / 2.0 - 34, 300, 20))
+            lsub.setAlignment_(NSTextAlignmentCenter)
+            lsub.setFont_(G.rounded_font(12.5))
+            lsub.setTextColor_(_white(0.45))
+            lsub.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxXMargin
+                                      | NSViewMinYMargin | NSViewMaxYMargin)
+            loading.addSubview_(lsub)
+
+            # ---- DONE state ---------------------------------------------------
+            done = NSView.alloc().initWithFrame_(
+                NSMakeRect(PAD, PAD, W - PAD * 2, H - PAD - TOP))
+            done.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+            done.setHidden_(True)
+            self._done = done
+            content.addSubview_(done)
+
+            dw = done.frame().size.width
+            dh = done.frame().size.height
+
+            # file-info card at the top
+            CARD_H = 60.0
+            card = NSView.alloc().initWithFrame_(
+                NSMakeRect(0, dh - CARD_H, dw, CARD_H))
+            card.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+            card.setWantsLayer_(True)
+            kl = card.layer()
+            if kl is not None:
+                kl.setCornerRadius_(12.0)
+                kl.setBackgroundColor_(_white(0.045).CGColor())
+                kl.setBorderWidth_(1.0)
+                kl.setBorderColor_(_white(0.07).CGColor())
+                try:
+                    from Quartz import kCACornerCurveContinuous
+                    kl.setCornerCurve_(kCACornerCurveContinuous)
+                except Exception:  # noqa: BLE001
+                    pass
+            done.addSubview_(card)
+            self._card = card
+
+            fwell = NSView.alloc().initWithFrame_(
+                NSMakeRect(13, (CARD_H - 38) / 2.0, 38, 38))
+            fwell.setWantsLayer_(True)
+            fl = fwell.layer()
+            if fl is not None:
+                fl.setCornerRadius_(9.0)
+                fl.setBackgroundColor_(GREEN.colorWithAlphaComponent_(0.12).CGColor())
+            card.addSubview_(fwell)
+            fimg = _symbol("waveform.circle.fill", 19.0)
+            if fimg is None:
+                fimg = _symbol("doc.fill", 19.0)
+            fiv = NSImageView.alloc().initWithFrame_(NSMakeRect(0, 0, 38, 38))
+            if fimg is not None:
+                fiv.setImage_(fimg)
+            try:
+                fiv.setContentTintColor_(GREEN)
+            except Exception:  # noqa: BLE001
+                pass
+            fiv.setImageScaling_(1)
+            fwell.addSubview_(fiv)
+
+            fname = NSTextField.labelWithString_("")
+            fname.setFrame_(NSMakeRect(61, CARD_H / 2.0 + 1, dw - 74, 18))
+            fname.setFont_(G.rounded_font(13.5, 0.4))
+            fname.setTextColor_(_white(0.9))
+            fname.setAutoresizingMask_(NSViewWidthSizable)
+            try:
+                fname.setLineBreakMode_(5)     # NSLineBreakByTruncatingTail
+            except Exception:  # noqa: BLE001
+                pass
+            card.addSubview_(fname)
+            self._fname = fname
+
+            fmeta = NSTextField.labelWithString_("")
+            fmeta.setFrame_(NSMakeRect(61, CARD_H / 2.0 - 17, dw - 74, 16))
+            fmeta.setFont_(G.rounded_font(11.5))
+            fmeta.setTextColor_(_white(0.45))
+            fmeta.setAutoresizingMask_(NSViewWidthSizable)
+            card.addSubview_(fmeta)
+            self._fmeta = fmeta
+
+            # editable transcript scroll under the card
+            BTN_ROW = 44.0
+            scroll = NSScrollView.alloc().initWithFrame_(
+                NSMakeRect(0, BTN_ROW, dw, dh - CARD_H - 11 - BTN_ROW))
             scroll.setHasVerticalScroller_(True)
-            scroll.setBorderType_(0)              # NSNoBorder (was NSBezelBorder)
-            scroll.setDrawsBackground_(False)     # let the window blur show through
+            scroll.setBorderType_(0)
+            scroll.setDrawsBackground_(True)
+            scroll.setBackgroundColor_(_rgb(0.0, 0.0, 0.0, 0.22))
             scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-            G.round_layer(scroll, 12.0)           # continuous-rounded transcript panel
-            tv = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 606, 410))
+            G.round_layer(scroll, 12.0)
+            tv = NSTextView.alloc().initWithFrame_(
+                NSMakeRect(0, 0, dw, dh - CARD_H - 11 - BTN_ROW))
             tv.setEditable_(True)
             tv.setRichText_(False)
-            tv.setFont_(G.rounded_font(14))
-            tv.setDrawsBackground_(False)         # transparent over the blur
-            tv.setTextColor_(NSColor.labelColor())
-            tv.setTextContainerInset_(NSMakeSize(10, 10))
+            tv.setFont_(G.rounded_font(13.5))
+            tv.setDrawsBackground_(False)
+            tv.setTextColor_(_white(0.86))
+            tv.setTextContainerInset_(NSMakeSize(12, 12))
             tv.setAutoresizingMask_(NSViewWidthSizable)
             scroll.setDocumentView_(tv)
-            content.addSubview_(scroll)
+            done.addSubview_(scroll)
+            self._scroll = scroll
             self._tv = tv
 
-            copy = NSButton.buttonWithTitle_target_action_("Copy", self, "copyText:")
-            copy.setFrame_(NSMakeRect(16, 12, 96, 30))
+            # button row: Copy (green) · Save… · [spacer] · Transcribe another
+            copy = _green_button("Copy", "doc.on.doc", self, "copyText:")
+            copy.setFrame_(NSMakeRect(0, 6, 90, 32))
             copy.setAutoresizingMask_(NSViewMaxYMargin)
-            copy.setFont_(G.rounded_font(13))
-            content.addSubview_(copy)
-            save = NSButton.buttonWithTitle_target_action_("Save…", self, "saveText:")
-            save.setFrame_(NSMakeRect(118, 12, 96, 30))
+            done.addSubview_(copy)
+
+            save = _plain_button("Save…", "tray.and.arrow.down", self, "saveText:")
+            save.setFrame_(NSMakeRect(96, 6, 86, 32))
             save.setAutoresizingMask_(NSViewMaxYMargin)
-            save.setFont_(G.rounded_font(13))
-            content.addSubview_(save)
+            done.addSubview_(save)
+
+            again = _plain_button("Transcribe another", None, self, "resetToEmpty:")
+            again.setFrame_(NSMakeRect(dw - 160, 6, 160, 32))
+            again.setAutoresizingMask_(NSViewMinXMargin | NSViewMaxYMargin)
+            done.addSubview_(again)
+            self._again = again
 
             win.center()
             self._win = win
+            self._state = "empty"
 
-        # -- helpers (pure-Python; hidden from the Obj-C runtime) -----------
+        # -- drag & drop plumbing -------------------------------------------
         @objc.python_method
-        def _set_status(self, s):
-            self._status.setStringValue_(s)
+        def _drag_types(self):
+            try:
+                from Cocoa import NSPasteboardTypeFileURL
+                return [NSPasteboardTypeFileURL]
+            except Exception:  # noqa: BLE001
+                try:
+                    from Cocoa import NSFilenamesPboardType
+                    return [NSFilenamesPboardType]
+                except Exception:  # noqa: BLE001
+                    return ["public.file-url"]
 
+        @objc.python_method
+        def _dropped_path(self, sender):
+            """Return a supported audio file path from a drag, or None."""
+            try:
+                pb = sender.draggingPasteboard()
+            except Exception:  # noqa: BLE001
+                return None
+            path = None
+            try:
+                from Cocoa import NSURL, NSPasteboardTypeFileURL
+                url = NSURL.URLFromPasteboard_(pb)
+                if url is not None and url.isFileURL():
+                    path = str(url.path())
+            except Exception:  # noqa: BLE001
+                path = None
+            if path is None:
+                try:
+                    from Cocoa import NSFilenamesPboardType
+                    items = pb.propertyListForType_(NSFilenamesPboardType)
+                    if items:
+                        path = str(items[0])
+                except Exception:  # noqa: BLE001
+                    path = None
+            if not path:
+                return None
+            ext = os.path.splitext(path)[1].lstrip(".").lower()
+            if ext not in AUDIO_TYPES:
+                return None
+            return path
+
+        @objc.python_method
+        def _can_accept_drop(self, sender):
+            if self._busy:
+                return False
+            return self._dropped_path(sender) is not None
+
+        @objc.python_method
+        def _set_drop_highlight(self, on):
+            el = getattr(self, "_empty_layer", None)
+            if el is None or self._state != "empty":
+                return
+            if on:
+                el.setBorderColor_(GREEN.colorWithAlphaComponent_(0.5).CGColor())
+                el.setBackgroundColor_(GREEN.colorWithAlphaComponent_(0.05).CGColor())
+            else:
+                el.setBorderColor_(_white(0.16).CGColor())
+                el.setBackgroundColor_(_white(0.02).CGColor())
+
+        @objc.python_method
+        def _handle_drop(self, sender):
+            path = self._dropped_path(sender)
+            if not path:
+                return False
+            self._begin(path)
+            return True
+
+        # -- state transitions ----------------------------------------------
+        @objc.python_method
+        def _show_state(self, state):
+            self._state = state
+            self._empty.setHidden_(state != "empty")
+            self._loading.setHidden_(state != "loading")
+            self._done.setHidden_(state != "done")
+            if state == "loading":
+                self._spinner.startAnimation_(None)
+            else:
+                self._spinner.stopAnimation_(None)
+
+        @objc.python_method
+        def _begin(self, path):
+            """Kick off a transcription of `path` (shared by Choose + drop)."""
+            if self._busy:
+                return
+            self._path = path
+            name = os.path.basename(path)
+            self._busy = True
+            self._loading_title.setStringValue_(f"Transcribing “{name}”…")
+            self._show_state("loading")
+            threading.Thread(target=self._run, args=(path, name),
+                             daemon=True).start()
+
+        @objc.python_method
+        def _run(self, path, name):
+            try:
+                text, err = self._app._transcribe_path(path)
+            except Exception as e:  # noqa: BLE001
+                text, err = None, f"Transcription failed: {e}"
+
+            def _done():
+                self._busy = False
+                if err:
+                    self._loading_title.setStringValue_(err)
+                    # stay in empty so the user can retry, but surface the error
+                    self._show_state("empty")
+                    self._flash_error(err)
+                elif not text:
+                    self._show_state("empty")
+                    self._flash_error("No speech detected in that file.")
+                else:
+                    words = len(text.split())
+                    self._fname.setStringValue_(name)
+                    self._fmeta.setStringValue_(
+                        f"{words} word{'s' if words != 1 else ''} · "
+                        "transcribed on-device")
+                    self._tv.setString_(text)
+                    self._show_state("done")
+            NSOperationQueue.mainQueue().addOperationWithBlock_(_done)
+
+        @objc.python_method
+        def _flash_error(self, msg):
+            # Reuse the empty-state title to surface an error briefly.
+            try:
+                self._empty  # noqa: B018
+            except Exception:  # noqa: BLE001
+                pass
+            print(f"[flow] transcribe: {msg}", flush=True)
+
+        # -- window lifecycle -----------------------------------------------
         @objc.python_method
         def show(self):
-            # Become a regular app while the window is open so it focuses and shows a
-            # Dock icon (the app logo); revert to menu-bar-only when it closes.
             app = NSApplication.sharedApplication()
             app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
             app.activateIgnoringOtherApps_(True)
             self._win.makeKeyAndOrderFront_(None)
 
         def windowWillClose_(self, note):
-            # Defer one runloop turn so the closing window is no longer "visible";
-            # revert to Accessory only if no other app window remains (don't yank
-            # the Dock icon while the History window is still open).
             NSOperationQueue.mainQueue().addOperationWithBlock_(
                 lambda: _sync_activation_policy())
 
@@ -2102,40 +2609,20 @@ def _transcribe_controller_class():
             panel.setMessage_("Choose an audio file to transcribe")
             if panel.runModal() != OK or not panel.URLs():
                 return
-            path = str(panel.URLs()[0].path())
-            self._path = path
-            name = os.path.basename(path)
-            self._busy = True
-            self._choose.setEnabled_(False)
-            self._set_status(f"Transcribing “{name}” — long files can take a bit…")
+            self._begin(str(panel.URLs()[0].path()))
+
+        def resetToEmpty_(self, sender):
+            if self._busy:
+                return
+            self._path = None
             self._tv.setString_("")
-            threading.Thread(target=self._run, args=(path, name), daemon=True).start()
-
-        @objc.python_method
-        def _run(self, path, name):
-            try:
-                text, err = self._app._transcribe_path(path)
-            except Exception as e:  # noqa: BLE001
-                text, err = None, f"Transcription failed: {e}"
-
-            def _done():
-                self._busy = False
-                self._choose.setEnabled_(True)
-                if err:
-                    self._set_status(err)
-                elif not text:
-                    self._set_status("No speech detected in that file.")
-                else:
-                    self._set_status(f"Done — {len(text.split())} words from “{name}”. "
-                                  "Edit, Copy, or Save below.")
-                    self._tv.setString_(text)
-            NSOperationQueue.mainQueue().addOperationWithBlock_(_done)
+            self._set_drop_highlight(False)
+            self._show_state("empty")
 
         def copyText_(self, sender):
             s = self._tv.string()
             if s and str(s).strip():
                 _clip_set(str(s))
-                self._set_status("Copied to the clipboard.")
 
         def saveText_(self, sender):
             s = self._tv.string()
@@ -2151,9 +2638,8 @@ def _transcribe_controller_class():
                 try:
                     with open(str(panel.URL().path()), "w", encoding="utf-8") as f:
                         f.write(str(s))
-                    self._set_status("Saved.")
                 except Exception as e:  # noqa: BLE001
-                    self._set_status(f"Couldn't save: {e}")
+                    print(f"[flow] transcribe: couldn't save: {e}", flush=True)
 
     _TRANSCRIBE_CTRL_CLASS = _TranscribeController
     return _TRANSCRIBE_CTRL_CLASS
