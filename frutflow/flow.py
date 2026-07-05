@@ -1021,6 +1021,41 @@ def add_correction(heard: str, correct: str, *, context: str = "",
         print("[flow] (takes effect on your next dictation — no restart needed)")
 
 
+def update_correction(old_heard: str, heard: str, correct: str, *,
+                      context: str = "", app: str = "") -> bool:
+    """Edit one saved correction and its optional local-repair metadata."""
+    old_heard = _clean_text_value(old_heard, max_chars=160)
+    heard = _clean_text_value(heard, max_chars=160)
+    correct = _clean_text_value(correct, max_chars=160)
+    context = _clean_text_value(context, max_chars=300)
+    app = _clean_text_value(app, max_chars=80)
+    if not old_heard or not heard or not correct or heard == correct:
+        return False
+
+    corr = load_corrections()
+    if old_heard in corr and old_heard != heard:
+        corr.pop(old_heard, None)
+    corr[heard] = correct
+    _write_private_json(CORRECTIONS_PATH, corr, indent=2)
+
+    examples = load_correction_examples()
+    prev = (examples.pop(old_heard, {}) if old_heard != heard
+            else examples.get(heard, {}))
+    try:
+        count = int(prev.get("count", 1))
+    except (TypeError, ValueError, OverflowError):
+        count = 1
+    examples[heard] = {
+        "correct": correct,
+        "context": context,
+        "app": app,
+        "count": max(1, min(count, 1_000_000)),
+        "updated": time.time(),
+    }
+    _write_private_json(CORRECTION_EXAMPLES_PATH, examples, indent=2)
+    return True
+
+
 def apply_corrections(text: str) -> str:
     if not text:
         return text
@@ -4889,7 +4924,7 @@ def _settings_controller_class():
     import objc
     from Cocoa import (
         NSObject, NSView, NSWindow, NSScrollView, NSTextField, NSButton,
-        NSSwitch, NSSlider, NSSegmentedControl, NSImageView, NSImage,
+        NSSwitch, NSSlider, NSSegmentedControl, NSImageView, NSImage, NSAlert,
         NSApplication, NSColor,
         NSApplicationActivationPolicyRegular,
         NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
@@ -4980,6 +5015,7 @@ def _settings_controller_class():
             self._seg_meta = {}         # tag -> (values, cfg_key_or_None, apply_name_or_None)
             self._perm_rows = {}        # key -> {"pill":btn, "url":str, "tag":int}
             self._perm_tag_to_key = {}  # button tag -> perm key
+            self._correction_edit_rows = {}
             self._maxrec_label = None
             self._maxrec_slider = None
             self._perm_timer = None
@@ -5442,7 +5478,7 @@ def _settings_controller_class():
                 inner.addSubview_(body)
                 return 116.0
 
-            row_h = 70.0
+            row_h = 78.0
             h = max(row_h, row_h * len(rows))
             inner = self._card_h(pane, y_top, h)
             for i, row in enumerate(rows):
@@ -5460,9 +5496,20 @@ def _settings_controller_class():
                 title.setFont_(G.rounded_font(13.3, 0.2))
                 title.setTextColor_(TITLE_COL)
                 title.setLineBreakMode_(4)  # NSLineBreakByTruncatingMiddle
-                title.setFrame_(NSMakeRect(14, top - 25, CONTENT_W - 28, 18))
+                title.setFrame_(NSMakeRect(14, top - 27, CONTENT_W - 96, 18))
                 title.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
                 inner.addSubview_(title)
+
+                tag = self._tag()
+                self._correction_edit_rows[tag] = row
+                edit = NSButton.buttonWithTitle_target_action_(
+                    "Edit", self, "editCorrection:")
+                edit.setTag_(tag)
+                edit.setBezelStyle_(1)
+                edit.setFont_(G.rounded_font(11.8, 0.2))
+                edit.setFrame_(NSMakeRect(CONTENT_W - 72, top - 35, 56, 24))
+                edit.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+                inner.addSubview_(edit)
 
                 meta = []
                 if row["context"]:
@@ -5477,13 +5524,14 @@ def _settings_controller_class():
                 sub.setFont_(G.rounded_font(11.4))
                 sub.setTextColor_(SUB_COL)
                 sub.setLineBreakMode_(4)  # NSLineBreakByTruncatingMiddle
-                sub.setFrame_(NSMakeRect(14, top - 48, CONTENT_W - 28, 16))
+                sub.setFrame_(NSMakeRect(14, top - 54, CONTENT_W - 28, 16))
                 sub.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
                 inner.addSubview_(sub)
             return h
 
         @objc.python_method
         def _pane_corrections(self):
+            self._correction_edit_rows = {}
             rows = self._correction_rows()
             pane = self._flipped(WIN_W, 360)
             y = PAD
@@ -5505,6 +5553,37 @@ def _settings_controller_class():
             y += self._correction_row_card(pane, y, rows) + PAD
             self._finish_pane(pane, y)
             return pane
+
+        @objc.python_method
+        def _prompt_correction_value(self, title, message, default="",
+                                     required=False, button_title=None):
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_(title)
+            alert.setInformativeText_(message)
+            alert.addButtonWithTitle_(
+                button_title or ("Save" if required else "Next"))
+            alert.addButtonWithTitle_("Cancel")
+            field = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 360, 24))
+            field.setStringValue_(str(default or ""))
+            alert.setAccessoryView_(field)
+            try:
+                alert.window().setInitialFirstResponder_(field)
+            except Exception:  # noqa: BLE001
+                pass
+            if alert.runModal() != 1000:
+                return None
+            value = str(field.stringValue() or "")
+            if required and not _clean_text_value(value, max_chars=160):
+                return None
+            return value
+
+        @objc.python_method
+        def _correction_edit_error(self, message):
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("Could not save correction")
+            alert.setInformativeText_(message)
+            alert.addButtonWithTitle_("OK")
+            alert.runModal()
 
         @objc.python_method
         def _pane_privacy(self):
@@ -6044,6 +6123,45 @@ def _settings_controller_class():
                 self._app._MAX_RECORD_SECONDS = float(v)
             except Exception:  # noqa: BLE001
                 pass
+
+        def editCorrection_(self, sender):
+            row = self._correction_edit_rows.get(int(sender.tag()))
+            if not row:
+                return
+            heard = self._prompt_correction_value(
+                "Edit heard text",
+                "What did früt Flow hear incorrectly?",
+                row.get("heard", ""),
+                required=True)
+            if heard is None:
+                return
+            correct = self._prompt_correction_value(
+                "Edit correction",
+                "What should früt Flow type instead?",
+                row.get("correct", ""),
+                required=True)
+            if correct is None:
+                return
+            context = self._prompt_correction_value(
+                "Edit context",
+                "Optional sentence or situation where this fix matters.",
+                row.get("context", ""))
+            if context is None:
+                return
+            app = self._prompt_correction_value(
+                "Edit app",
+                "Optional app where this fix matters most.",
+                row.get("app", ""),
+                button_title="Save")
+            if app is None:
+                return
+            if not update_correction(row.get("heard", ""), heard, correct,
+                                     context=context, app=app):
+                self._correction_edit_error(
+                    "Heard and correction must both be filled in, and they "
+                    "cannot be the same.")
+                return
+            self._show_pane("Corrections")
 
         def permClicked_(self, sender):
             key = self._perm_tag_to_key.get(int(sender.tag()))
