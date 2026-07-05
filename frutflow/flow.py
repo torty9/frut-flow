@@ -43,6 +43,15 @@ import numpy as np
 
 CONFIG_DIR = Path.home() / ".flowdictate"
 CONFIG_PATH = CONFIG_DIR / "config.json"
+CODE_DIR_PATH = CONFIG_DIR / "code_dir"
+
+PBCOPY = "/usr/bin/pbcopy"
+PBPASTE = "/usr/bin/pbpaste"
+AFPLAY = "/usr/bin/afplay"
+AFCONVERT = "/usr/bin/afconvert"
+OPEN = "/usr/bin/open"
+LAUNCHCTL = "/bin/launchctl"
+OSASCRIPT = "/usr/bin/osascript"
 
 
 def _secure_dir() -> None:
@@ -183,6 +192,8 @@ DEFAULT_CONFIG = {
                                  # the need to ever run `--correct` by hand.
     "learn_window_seconds": 20,  # how long after a paste to keep watching for your
                                  # edit before finalizing what was learned.
+    "history_enabled": True,     # persist the last HISTORY_CAP dictations locally
+                                 # for the History window. Set false for private mode.
 
     # --- text insertion ---
     "insert_method": "paste",    # "paste" (clipboard + Cmd-V), "type", or
@@ -235,12 +246,162 @@ def _coerce_like(default, value):
         return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else default
     if isinstance(default, str):
         return value if isinstance(value, str) else default
-    return value                        # lists/dicts/None: pass through untouched
+    if isinstance(default, list):
+        return value if isinstance(value, list) else list(default)
+    if isinstance(default, dict):
+        return value if isinstance(value, dict) else dict(default)
+    return value
+
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _clean_text_value(value, *, max_chars: int, collapse_ws: bool = True) -> str:
+    if not isinstance(value, str):
+        return ""
+    s = _CONTROL_CHARS_RE.sub(" ", value)
+    if collapse_ws:
+        s = re.sub(r"\s+", " ", s)
+    s = s.strip()
+    return s[:max_chars].strip()
+
+
+def _clamp_number(value, default, lo, hi, *, as_int: bool = False):
+    try:
+        n = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not np.isfinite(n):
+        return default
+    n = max(lo, min(hi, n))
+    return int(round(n)) if as_int else n
+
+
+_CONFIG_ENUMS = {
+    "mode": {"hold", "toggle"},
+    "appearance": {"system", "light", "dark"},
+    "transcribe_backend": {"parakeet", "local"},
+    "compute_type": {"int8", "float16", "int8_float16", "int16", "float32"},
+    "normalize_method": {"rms", "peak"},
+    "vocab_biasing": {"hotwords", "prompt", "off"},
+    "cleanup": {"none", "basic", "local"},
+    "insert_method": {"paste", "type", "clipboard"},
+}
+
+_ALLOWED_PARAKEET_MODELS = {
+    "mlx-community/parakeet-tdt-0.6b-v2",
+    "mlx-community/parakeet-tdt-0.6b-v3",
+}
+
+_ALLOWED_LOCAL_REPAIR_MODELS = {
+    "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
+    "mlx-community/Llama-3.2-1B-Instruct-4bit",
+    "mlx-community/Qwen2.5-3B-Instruct-4bit",
+}
+
+
+def _valid_hotkey(name: str) -> bool:
+    if name in {
+        "alt_l", "alt_r", "ctrl_l", "ctrl_r",
+        "cmd_l", "cmd_r", "shift_l", "shift_r",
+    }:
+        return True
+    return len(name) == 1 and not name.isspace()
+
+
+def _clean_undo_phrases(value) -> list[str]:
+    if not isinstance(value, list):
+        return list(DEFAULT_CONFIG["undo_phrases"])
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in value[:50]:
+        phrase = _clean_text_value(item, max_chars=80).lower()
+        if phrase and phrase not in seen:
+            seen.add(phrase)
+            out.append(phrase)
+    return out
+
+
+def _normalize_config(cfg: dict) -> dict:
+    """Defensively normalize config values after type coercion.
+
+    The settings file is user-editable. Keep invalid values from crashing the
+    hotkey loop, growing unbounded timers/regexes, or forcing extreme model work.
+    """
+    clean = dict(DEFAULT_CONFIG)
+    if isinstance(cfg, dict):
+        for k, v in cfg.items():
+            if k in DEFAULT_CONFIG:
+                clean[k] = _coerce_like(DEFAULT_CONFIG[k], v)
+
+    for key, allowed in _CONFIG_ENUMS.items():
+        val = str(clean.get(key, "")).strip().lower()
+        clean[key] = val if val in allowed else DEFAULT_CONFIG[key]
+
+    hotkey = str(clean.get("hotkey", "")).strip().lower()
+    clean["hotkey"] = hotkey if _valid_hotkey(hotkey) else DEFAULT_CONFIG["hotkey"]
+
+    for key, max_chars in (
+        ("parakeet_model", 200),
+        ("model", 200),
+        ("language", 24),
+        ("local_repair_model", 200),
+    ):
+        val = _clean_text_value(clean.get(key), max_chars=max_chars)
+        clean[key] = val or DEFAULT_CONFIG[key]
+    if clean["parakeet_model"] not in _ALLOWED_PARAKEET_MODELS:
+        clean["parakeet_model"] = DEFAULT_CONFIG["parakeet_model"]
+    if clean["local_repair_model"] not in _ALLOWED_LOCAL_REPAIR_MODELS:
+        clean["local_repair_model"] = DEFAULT_CONFIG["local_repair_model"]
+    clean["initial_prompt"] = _clean_text_value(
+        clean.get("initial_prompt"), max_chars=1000)
+
+    cpu_hi = max(1, (os.cpu_count() or 4) * 2)
+    clean["cpu_threads"] = _clamp_number(
+        clean.get("cpu_threads"), DEFAULT_CONFIG["cpu_threads"], 0, cpu_hi,
+        as_int=True)
+    clean["beam_size"] = _clamp_number(
+        clean.get("beam_size"), DEFAULT_CONFIG["beam_size"], 1, 10, as_int=True)
+    clean["normalize_rms_dbfs"] = _clamp_number(
+        clean.get("normalize_rms_dbfs"), DEFAULT_CONFIG["normalize_rms_dbfs"],
+        -60.0, -3.0)
+    clean["normalize_peak"] = _clamp_number(
+        clean.get("normalize_peak"), DEFAULT_CONFIG["normalize_peak"], 0.05, 1.0)
+    clean["local_repair_temperature"] = _clamp_number(
+        clean.get("local_repair_temperature"),
+        DEFAULT_CONFIG["local_repair_temperature"], 0.0, 1.0)
+    clean["local_repair_max_input_chars"] = _clamp_number(
+        clean.get("local_repair_max_input_chars"),
+        DEFAULT_CONFIG["local_repair_max_input_chars"], 200, 10_000, as_int=True)
+    clean["fuzzy_threshold"] = _clamp_number(
+        clean.get("fuzzy_threshold"), DEFAULT_CONFIG["fuzzy_threshold"], 0.4, 1.25)
+    clean["learn_window_seconds"] = _clamp_number(
+        clean.get("learn_window_seconds"), DEFAULT_CONFIG["learn_window_seconds"],
+        1, 300, as_int=True)
+    clean["ding_volume"] = _clamp_number(
+        clean.get("ding_volume"), DEFAULT_CONFIG["ding_volume"], 0.0, 1.0)
+    clean["min_seconds"] = _clamp_number(
+        clean.get("min_seconds"), DEFAULT_CONFIG["min_seconds"], 0.05, 5.0)
+    clean["max_record_seconds"] = _clamp_number(
+        clean.get("max_record_seconds"), DEFAULT_CONFIG["max_record_seconds"],
+        5, 3600, as_int=True)
+    clean["warn_before_max_seconds"] = _clamp_number(
+        clean.get("warn_before_max_seconds"),
+        DEFAULT_CONFIG["warn_before_max_seconds"], 0, 300, as_int=True)
+    clean["warn_before_max_seconds"] = min(
+        clean["warn_before_max_seconds"], max(0, clean["max_record_seconds"] - 1))
+    clean["max_processing_seconds"] = _clamp_number(
+        clean.get("max_processing_seconds"),
+        DEFAULT_CONFIG["max_processing_seconds"], 10, 3600, as_int=True)
+    clean["undo_phrases"] = _clean_undo_phrases(clean.get("undo_phrases"))
+    return clean
 
 
 def load_config() -> dict:
+    _secure_dir()
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
+        _chmod_private(CONFIG_PATH)
         try:
             user = json.loads(CONFIG_PATH.read_text())
             if isinstance(user, dict):
@@ -249,17 +410,19 @@ def load_config() -> dict:
                         cfg[k] = _coerce_like(DEFAULT_CONFIG[k], v)
         except (json.JSONDecodeError, OSError, ValueError) as e:
             print(f"[flow] WARNING: could not read {CONFIG_PATH}: {e}")
-    return cfg
+    return _normalize_config(cfg)
 
 
 def write_default_config() -> None:
     _secure_dir()
     if CONFIG_PATH.exists():
         print(f"[flow] config already exists at {CONFIG_PATH} (leaving it as-is)")
-        return
-    CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
-    _chmod_private(CONFIG_PATH)
-    print(f"[flow] wrote default config to {CONFIG_PATH}")
+    else:
+        _write_private_json(CONFIG_PATH, DEFAULT_CONFIG, indent=2)
+        print(f"[flow] wrote default config to {CONFIG_PATH}")
+    code_dir = str(Path(__file__).resolve().parent)
+    _write_private_text(CODE_DIR_PATH, code_dir + "\n")
+    print(f"[flow] wrote code directory pointer to {CODE_DIR_PATH}")
 
 
 # ---------------------------------------------------------------------------
@@ -276,11 +439,14 @@ class Recorder:
         self._frames: list[np.ndarray] = []
         self._stream = None
         self._lock = threading.Lock()
+        self._frames_lock = threading.Lock()
         self.recording = False
 
     def _callback(self, indata, frames, time_info, status):  # noqa: ARG002
         # status carries xrun warnings; we just keep grabbing audio.
-        self._frames.append(indata.copy())
+        with self._frames_lock:
+            if self.recording:
+                self._frames.append(indata.copy())
 
     def _open_stream(self):
         stream = self._sd.InputStream(
@@ -296,7 +462,8 @@ class Recorder:
         with self._lock:
             if self.recording:
                 return
-            self._frames = []
+            with self._frames_lock:
+                self._frames = []
             try:
                 self._stream = self._open_stream()
             except Exception:  # noqa: BLE001
@@ -315,15 +482,22 @@ class Recorder:
         with self._lock:
             if not self.recording:
                 return None
+            stream = self._stream
             try:
-                self._stream.stop()
-                self._stream.close()
+                if stream is not None:
+                    try:
+                        stream.stop()
+                    finally:
+                        stream.close()
             finally:
                 self._stream = None
                 self.recording = False
-            if not self._frames:
+            with self._frames_lock:
+                frames = list(self._frames)
+                self._frames = []
+            if not frames:
                 return None
-            return np.concatenate(self._frames, axis=0).flatten()
+            return np.concatenate(frames, axis=0).flatten()
 
 
 # ---------------------------------------------------------------------------
@@ -681,13 +855,77 @@ def _read_json(path: Path, default):
         return default
 
 
+def _write_private_text(path: Path, payload: str) -> None:
+    """Atomically write owner-only text under ~/.flowdictate."""
+    import tempfile
+    _secure_dir()
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent),
+                               prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        _chmod_private(Path(tmp))
+        os.replace(tmp, path)
+        _chmod_private(path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _write_private_json(path: Path, obj, *, indent: int | None = None) -> None:
+    """Atomically write owner-only JSON under ~/.flowdictate."""
+    payload = json.dumps(obj, ensure_ascii=False, indent=indent)
+    if indent is not None:
+        payload += "\n"
+    _write_private_text(path, payload)
+
+
+def _sanitize_vocab(data) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for entry in data.values():
+        if not isinstance(entry, dict):
+            continue
+        form = _clean_text_value(entry.get("form"), max_chars=80)
+        if not form:
+            continue
+        try:
+            count = int(entry.get("count", 0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if count <= 0:
+            continue
+        out[form.lower()] = {"count": min(count, 1_000_000), "form": form}
+        if len(out) >= 400:
+            break
+    return out
+
+
+def _sanitize_corrections(data) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    for heard, correct in data.items():
+        h = _clean_text_value(heard, max_chars=160)
+        c = _clean_text_value(correct, max_chars=160)
+        if h and c and h != c:
+            out[h] = c
+        if len(out) >= 500:
+            break
+    return out
+
+
 def learn_vocab(text: str) -> None:
     """Fold a finished dictation into the rolling word-frequency map."""
     if not text:
         return
-    vocab = _read_json(VOCAB_PATH, {})
-    if not isinstance(vocab, dict):
-        vocab = {}
+    vocab = _sanitize_vocab(_read_json(VOCAB_PATH, {}))
     for w in _WORD_RE.findall(text):
         lw = w.lower()
         if lw in _COMMON_WORDS:
@@ -704,27 +942,26 @@ def learn_vocab(text: str) -> None:
                             key=lambda kv: kv[1].get("count", 0),
                             reverse=True)[:400])
     try:
-        _secure_dir()
-        VOCAB_PATH.write_text(json.dumps(vocab))
-        _chmod_private(VOCAB_PATH)
+        _write_private_json(VOCAB_PATH, vocab)
     except OSError:
         pass
 
 
 def load_corrections() -> dict:
     """{'misheard': 'correct'} — whole-word, case-insensitive swaps."""
-    data = _read_json(CORRECTIONS_PATH, {})
-    return data if isinstance(data, dict) else {}
+    return _sanitize_corrections(_read_json(CORRECTIONS_PATH, {}))
 
 
 def add_correction(heard: str, correct: str, *, silent: bool = False) -> None:
     if not heard or not correct or heard == correct:
         return
+    heard = _clean_text_value(heard, max_chars=160)
+    correct = _clean_text_value(correct, max_chars=160)
+    if not heard or not correct or heard == correct:
+        return
     corr = load_corrections()
     corr[heard] = correct
-    _secure_dir()
-    CORRECTIONS_PATH.write_text(json.dumps(corr, indent=2) + "\n")
-    _chmod_private(CORRECTIONS_PATH)
+    _write_private_json(CORRECTIONS_PATH, corr, indent=2)
     if not silent:
         print(f"[flow] correction saved: '{heard}' -> '{correct}'  ({CORRECTIONS_PATH})")
         print("[flow] (takes effect on your next dictation — no restart needed)")
@@ -748,11 +985,14 @@ def apply_corrections(text: str) -> str:
 # Entry shape: {"text": str, "ts": float, "app": str|None, "words": int,
 #               "delivered": bool}. Stored OLDEST-first on disk (cheap append +
 # slice cap); load_history() returns NEWEST-first for the UI. Capped at the last
-# HISTORY_CAP entries — your last hundred dictations.
+# HISTORY_CAP entries — your last ten dictations.
 # ---------------------------------------------------------------------------
 HISTORY_PATH = CONFIG_DIR / "history.json"
-HISTORY_CAP = 100
+STATS_PATH = CONFIG_DIR / "stats.json"
+HISTORY_CAP = 10
 _HISTORY_LOCK = threading.Lock()   # serialize worker append vs. clear vs. itself
+_STATS_LOCK = threading.Lock()
+TYPING_WPM = 40.0
 
 
 def _atomic_write_json(path: Path, obj) -> None:
@@ -760,23 +1000,7 @@ def _atomic_write_json(path: Path, obj) -> None:
     temp file IN THE SAME DIRECTORY (so os.replace is a same-filesystem atomic
     rename — a cross-device replace would raise), flush+fsync, then replace.
     Caller holds _HISTORY_LOCK. Re-raises on failure (its only callers guard it)."""
-    import tempfile
-    _secure_dir()
-    payload = json.dumps(obj, ensure_ascii=False)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent),
-                               prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)          # atomic on the same filesystem; no torn reads
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    _write_private_json(path, obj)
 
 
 def load_history() -> list:
@@ -787,7 +1011,17 @@ def load_history() -> list:
     data = _read_json(HISTORY_PATH, [])
     if not isinstance(data, list):
         return []
-    good = [e for e in data if isinstance(e, dict) and isinstance(e.get("text"), str)]
+    good = []
+    for e in data[-HISTORY_CAP:]:
+        if not isinstance(e, dict) or not isinstance(e.get("text"), str):
+            continue
+        good.append({
+            "text": e.get("text", ""),
+            "ts": e.get("ts", 0),
+            "app": e.get("app") if isinstance(e.get("app"), str) else None,
+            "words": e.get("words", len(str(e.get("text", "")).split())),
+            "delivered": bool(e.get("delivered", True)),
+        })
     return list(reversed(good))        # disk oldest-first -> newest-first for UI
 
 
@@ -853,6 +1087,67 @@ def pop_history_matching(text: str) -> None:
         pass
 
 
+def _clean_usage_stats(data) -> dict:
+    if not isinstance(data, dict):
+        data = {}
+    out = {}
+    for key in ("dictations", "words"):
+        try:
+            out[key] = max(0, int(data.get(key, 0)))
+        except (TypeError, ValueError, OverflowError):
+            out[key] = 0
+    for key in ("spoken_seconds", "typed_seconds", "saved_seconds", "updated"):
+        try:
+            value = float(data.get(key, 0.0))
+        except (TypeError, ValueError, OverflowError):
+            value = 0.0
+        out[key] = value if np.isfinite(value) and value > 0 else 0.0
+    return out
+
+
+def load_usage_stats() -> dict:
+    """Aggregate usage stats used by the History home page. No transcript text."""
+    return _clean_usage_stats(_read_json(STATS_PATH, {}))
+
+
+def record_usage_stats(text: str, spoken_seconds: float) -> None:
+    """Record aggregate time saved by dictating this final text."""
+    try:
+        words = len((text or "").split())
+        if words <= 0:
+            return
+        spoken = _clamp_number(spoken_seconds, 0.0, 0.0, 3600.0)
+        typed = (words / TYPING_WPM) * 60.0
+        saved = max(0.0, typed - spoken)
+        with _STATS_LOCK:
+            stats = load_usage_stats()
+            stats["dictations"] += 1
+            stats["words"] += words
+            stats["spoken_seconds"] += spoken
+            stats["typed_seconds"] += typed
+            stats["saved_seconds"] += saved
+            stats["updated"] = time.time()
+            _write_private_json(STATS_PATH, stats, indent=2)
+    except Exception:  # noqa: BLE001  stats must never break dictation
+        pass
+
+
+def format_saved_hours(stats: dict | None = None) -> str:
+    stats = load_usage_stats() if stats is None else _clean_usage_stats(stats)
+    hours = stats.get("saved_seconds", 0.0) / 3600.0
+    unit = "hour" if 0.95 <= hours < 1.05 else "hours"
+    return f"{hours:.1f} {unit}"
+
+
+def _log_transcript_result(text: str, cfg: dict) -> None:
+    if cfg.get("debug", False):
+        print(f"[flow] → {text}")
+        return
+    words = len((text or "").split())
+    chars = len(text or "")
+    print(f"[flow] → dictation ready ({words} words, {chars} chars)")
+
+
 def relative_time(ts, now: "float | None" = None) -> str:
     """iOS-style relative label: 'just now' / '2m ago' / '3h ago' / 'yesterday'
     / '4d ago' / a short date. Pure; trivially unit-testable. Never raises."""
@@ -893,13 +1188,12 @@ def build_learned_prompt(cfg: dict) -> str:
     if base:
         parts.append(base)
     parts.extend(sorted({v for v in load_corrections().values() if v}))
-    vocab = _read_json(VOCAB_PATH, {})
-    if isinstance(vocab, dict):
-        ranked = sorted(vocab.values(),
-                        key=lambda e: e.get("count", 0), reverse=True)
-        learned = [e["form"] for e in ranked
-                   if e.get("form") and e.get("count", 0) >= 2][:40]
-        parts.extend(learned)
+    vocab = _sanitize_vocab(_read_json(VOCAB_PATH, {}))
+    ranked = sorted(vocab.values(),
+                    key=lambda e: e.get("count", 0), reverse=True)
+    learned = [e["form"] for e in ranked
+               if e.get("form") and e.get("count", 0) >= 2][:40]
+    parts.extend(learned)
     return " ".join(parts).strip()[:600]
 
 
@@ -965,21 +1259,20 @@ def distinctive_terms(max_terms: int = 60) -> list[str]:
         if v and v.lower() not in seen:
             seen.add(v.lower())
             terms.append(v)
-    vocab = _read_json(VOCAB_PATH, {})
-    if isinstance(vocab, dict):
-        ranked = sorted(vocab.values(),
-                        key=lambda e: e.get("count", 0), reverse=True)
-        for e in ranked:
-            form = e.get("form")
-            if not form or e.get("count", 0) < 2:
-                continue
-            low = form.lower()
-            if low in seen or low in _COMMON_WORDS or not _is_distinctive(form):
-                continue
-            seen.add(low)
-            terms.append(form)
-            if len(terms) >= max_terms:
-                break
+    vocab = _sanitize_vocab(_read_json(VOCAB_PATH, {}))
+    ranked = sorted(vocab.values(),
+                    key=lambda e: e.get("count", 0), reverse=True)
+    for e in ranked:
+        form = e.get("form")
+        if not form or e.get("count", 0) < 2:
+            continue
+        low = form.lower()
+        if low in seen or low in _COMMON_WORDS or not _is_distinctive(form):
+            continue
+        seen.add(low)
+        terms.append(form)
+        if len(terms) >= max_terms:
+            break
     return terms
 
 
@@ -1158,33 +1451,45 @@ def learn_from_edit(el, pasted: str, *, max_learn: int = 3) -> int:
     cur_words = _NAME_RE.findall(current)
     if not pasted_words or not cur_words:
         return 0
-    pasted_set = {w.lower() for w in pasted_words}
-    cur_set = {w.lower() for w in cur_words}
-    # Sanity gate: only learn if MOST of what we pasted is still in the field —
-    # otherwise the AX value is unrelated (user navigated away / different field)
-    # and any "diff" would be noise.
-    present = sum(1 for w in pasted_words if w.lower() in cur_set)
-    if present < max(1, len(pasted_words) * 0.5):
+    import difflib
+    pasted_l = [w.lower() for w in pasted_words]
+    cur_l = [w.lower() for w in cur_words]
+    matcher = difflib.SequenceMatcher(a=pasted_l, b=cur_l)
+    equal = sum(i2 - i1 for tag, i1, i2, _j1, _j2 in matcher.get_opcodes()
+                if tag == "equal")
+    candidates: list[tuple[str, str]] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "replace":
+            continue
+        heard_span = pasted_words[i1:i2]
+        fixed_span = cur_words[j1:j2]
+        if len(heard_span) == len(fixed_span):
+            candidates.extend(zip(heard_span, fixed_span))
+        elif len(heard_span) == 1 and len(fixed_span) == 1:
+            candidates.append((heard_span[0], fixed_span[0]))
+    # Sanity gate: only learn from the same field/document. Multi-word dictations
+    # need substantial overlap; one-word replacements are allowed only when the
+    # replacement itself passes the phonetic/distinctiveness gate below.
+    if equal < max(1, len(pasted_words) * 0.45) and not (
+        len(pasted_words) <= 2 and candidates
+    ):
         return 0
-    # New words the user introduced (candidates for the corrected spelling).
-    introduced = [w for w in cur_words if w.lower() not in pasted_set]
     learned = 0
-    for w in pasted_words:
+    for w, best in candidates:
         if learned >= max_learn:
             break
-        if len(w) < 3 or w.lower() in _COMMON_WORDS or w.lower() in cur_set:
+        wl = w.lower()
+        bl = best.lower()
+        if len(w) < 2 or len(best) < 2 or wl == bl:
             continue
-        # w was distinctive AND is now gone — find its phonetic replacement.
-        if not _is_distinctive(w):
+        if wl in _COMMON_WORDS and bl in _COMMON_WORDS:
             continue
-        best, best_sim = None, 0.0
-        for x in introduced:
-            if len(x) < 2 or x.lower() == w.lower() or x.lower() in _COMMON_WORDS:
-                continue
-            sim = _lev_sim(w.lower(), x.lower())
-            if (_phonetic_match(w, x) or sim >= 0.6) and sim > best_sim:
-                best_sim, best = sim, x
-        if best is not None:
+        # Learn proper-noun/jargon fixes when either side looks distinctive. This
+        # catches cases like "Versal" -> "Vercel" even if the heard token is a word.
+        if not (_is_distinctive(w) or _is_distinctive(best)):
+            continue
+        sim = _lev_sim(wl, bl)
+        if _phonetic_match(w, best) or sim >= 0.55:
             add_correction(w, best, silent=True)
             learned += 1
     if learned:
@@ -1215,6 +1520,14 @@ def basic_cleanup(text: str) -> str:
     return text
 
 
+def _prompt_block_text(value, *, max_chars: int = 120) -> str:
+    """Escape learned/context text before embedding it in repair-model tags."""
+    s = _clean_text_value(value, max_chars=max_chars)
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;"))
+
+
 def _context_blocks(context: dict | None) -> str:
     """The shared '<known_spellings>' / '<active_app>' suffix injected into the
     on-device local_repair prompt. Biasing the model toward your canonical spellings
@@ -1222,12 +1535,15 @@ def _context_blocks(context: dict | None) -> str:
     Returns '' when there's nothing to add."""
     context = context or {}
     blocks = []
-    glossary = distinctive_terms(max_terms=60)
+    glossary = [_prompt_block_text(t, max_chars=80)
+                for t in distinctive_terms(max_terms=60)]
+    glossary = [t for t in glossary if t]
     if glossary:
         blocks.append("<known_spellings>\n" + ", ".join(glossary)
                       + "\n</known_spellings>")
-    if context.get("app"):
-        blocks.append(f"<active_app>{context['app']}</active_app>")
+    app_name = _prompt_block_text(context.get("app"), max_chars=80)
+    if app_name:
+        blocks.append(f"<active_app>{app_name}</active_app>")
     return ("\n\n" + "\n".join(blocks)) if blocks else ""
 
 
@@ -1358,6 +1674,32 @@ def _repair_output_ok(src: str, out: str) -> bool:
     li, lo = len(src), len(out)
     if lo < 0.6 * li or lo > 1.5 * li + 40:
         return False
+    src_l = src.strip().lower()
+    out_l = out.strip().lower()
+    bad_prefixes = ("assistant:", "user:", "system:", "sure,", "sure.",
+                    "here is", "here's", "the answer", "as an ai")
+    if out_l.startswith(bad_prefixes) and not src_l.startswith(bad_prefixes):
+        return False
+    if out.count("\n") > src.count("\n") + 1:
+        return False
+    src_tokens = re.findall(r"\S+", src_l)
+    out_tokens = re.findall(r"\S+", out_l)
+    if src_tokens and (
+        len(out_tokens) < max(1, int(len(src_tokens) * 0.65))
+        or len(out_tokens) > len(src_tokens) * 1.35 + 3
+    ):
+        return False
+    if len(src_tokens) >= 4:
+        import difflib
+        matcher = difflib.SequenceMatcher(a=src_tokens, b=out_tokens)
+        changed = 0
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag != "equal":
+                changed += max(i2 - i1, j2 - j1)
+        if changed > max(3, int(len(src_tokens) * 0.35)):
+            return False
+        if matcher.ratio() < 0.58:
+            return False
     return True
 
 
@@ -1430,13 +1772,13 @@ def clean(text: str, cfg: dict, context: dict | None = None, gpu_lock=None) -> s
 
 def _pbpaste() -> str | None:
     try:
-        return subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
+        return subprocess.run([PBPASTE], capture_output=True, text=True).stdout
     except Exception:  # noqa: BLE001
         return None
 
 
 def _pbcopy(text: str) -> None:
-    subprocess.run(["pbcopy"], input=text, text=True)
+    subprocess.run([PBCOPY], input=text, text=True)
 
 
 # In-process pasteboard via AppKit (pyobjc-framework-Cocoa is already a dependency).
@@ -1474,6 +1816,58 @@ def _clip_set(text: str) -> int:
         return int(pb.changeCount())
     except Exception:  # noqa: BLE001
         _pbcopy(text)
+        return -1
+
+
+def _clip_snapshot():
+    """Best-effort full pasteboard snapshot for later restoration."""
+    try:
+        pb = _pasteboard()
+        items = pb.pasteboardItems() or []
+        snap = []
+        for item in items:
+            saved = []
+            for typ in item.types() or []:
+                typ_s = str(typ)
+                data = item.dataForType_(typ)
+                if data is not None:
+                    saved.append(("data", typ_s, data))
+                    continue
+                s = item.stringForType_(typ)
+                if s is not None:
+                    saved.append(("string", typ_s, str(s)))
+            if saved:
+                snap.append(saved)
+        return ("items", snap) if snap else None
+    except Exception:  # noqa: BLE001
+        text = _pbpaste()
+        return ("text", text) if text else None
+
+
+def _clip_restore(snapshot) -> int:
+    """Restore a snapshot captured by _clip_snapshot(). Returns changeCount."""
+    if not snapshot:
+        return -1
+    kind, payload = snapshot
+    if kind == "text":
+        return _clip_set(payload)
+    try:
+        from AppKit import NSPasteboardItem
+        pb = _pasteboard()
+        restored = []
+        for saved in payload:
+            item = NSPasteboardItem.alloc().init()
+            for data_kind, typ, value in saved:
+                if data_kind == "data":
+                    item.setData_forType_(value, typ)
+                else:
+                    item.setString_forType_(value, typ)
+            restored.append(item)
+        pb.clearContents()
+        if restored:
+            pb.writeObjects_(restored)
+        return int(pb.changeCount())
+    except Exception:  # noqa: BLE001
         return -1
 
 
@@ -1603,8 +1997,17 @@ def apply_undo(text: str, cfg: dict):
     if not text or not phrases:
         return text, 0
     pats = sorted({p.lower() for p in phrases}, key=len, reverse=True)  # longest first
-    rx = re.compile(r"(?<!\w)(?:" + "|".join(re.escape(p) for p in pats) + r")(?!\w)",
-                    re.IGNORECASE)
+    normalized = re.sub(r"[\s,.;:!?]+", " ", text.lower()).strip()
+    if normalized in pats:
+        return "", 1
+    # Treat undo phrases as commands only when they stand as their own clause.
+    # This avoids deleting ordinary dictated content like "do not delete that file"
+    # or "I never mind waiting".
+    rx = re.compile(
+        r"(?<!\w)(?:" + "|".join(re.escape(p) for p in pats)
+        + r")(?!\w)(?=\s*(?:$|[,.!?;:]))",
+        re.IGNORECASE,
+    )
     if not rx.search(text):
         return text, 0
     kept = ""
@@ -1646,10 +2049,11 @@ def insert_text(text: str, cfg: dict) -> bool:
     if cfg["insert_method"] == "type":
         # Typed insert never touches the clipboard. Layout caveat applies, and
         # any '\n' will submit forms; paste is the safer default.
-        if not _ax_trusted():
+        if not _ax_trusted() or _secure_input_active():
             _pbcopy(text)
-            print("[flow] Accessibility NOT granted — left text on clipboard. "
-                  "Grant Accessibility to Terminal, then Cmd-Q & relaunch.")
+            print("[flow] Accessibility is unavailable or Secure Keyboard Entry "
+                  "is ON — left text on clipboard. Grant Accessibility / disable "
+                  "Secure Keyboard Entry, then try again.")
             return False
         from pynput.keyboard import Controller
         Controller().type(text)
@@ -1674,10 +2078,9 @@ def insert_text(text: str, cfg: dict) -> bool:
               "Keyboard Entry, or click out of the password field.)")
         return False
 
-    # Stash the existing clipboard (only if it's text we'd want back). Use a
-    # truthy check, not `is not None`: _clip_get() returns None/"" for a non-text
-    # clipboard (e.g. an image), and copying that back would wipe it.
-    old = _clip_get() if cfg["restore_clipboard"] else None
+    # Stash the existing clipboard, including non-text items when AppKit exposes
+    # them, so dictation paste does not wipe images/files from the user's clipboard.
+    old = _clip_snapshot() if cfg["restore_clipboard"] else None
 
     # In-process write is synchronous and confirmed on return — no poll loop needed
     # (the old pbcopy subprocess needed one; NSPasteboard does not).
@@ -1687,12 +2090,12 @@ def insert_text(text: str, cfg: dict) -> bool:
     # Restore the old clipboard AFTER the target app has consumed the paste, on a
     # background timer so this call returns IMMEDIATELY (the success ding, the
     # auto-learn arming, and readiness for the next dictation no longer wait ~0.25s).
-    # Only restore if nothing else changed the pasteboard since our write, so a
-    # failed paste still leaves the dictated text recoverable on the clipboard.
-    if old and old != text:
+    # Only restore if nothing else changed the pasteboard since our write; if some
+    # other app/user copied meanwhile, their newer clipboard wins.
+    if old:
         def _restore(expected=our_count, prev=old):
             if expected < 0 or _clip_change_count() == expected:
-                _clip_set(prev)
+                _clip_restore(prev)
         t = threading.Timer(0.4, _restore)
         t.daemon = True
         t.start()
@@ -1709,7 +2112,7 @@ def play(sound: str, cfg: dict, volume: float = 1.0) -> None:
     path = f"/System/Library/Sounds/{sound}.aiff"
     try:
         subprocess.Popen(
-            ["afplay", "-v", str(volume), path],
+            [AFPLAY, "-v", str(volume), path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     except Exception:  # noqa: BLE001
@@ -1817,6 +2220,21 @@ APP_BUNDLE_ID = "com.frutflow.dictation"
 AGENT_LABEL = "com.frutflow.dictation"
 
 
+def _relaunch_app_detached(delay: float = 1.0) -> None:
+    """Launch frutflow.app after this process exits, without a shell."""
+    code = (
+        "import subprocess, sys, time\n"
+        "time.sleep(float(sys.argv[1]))\n"
+        "subprocess.Popen(['/usr/bin/open', '-g', sys.argv[2]])\n"
+    )
+    subprocess.Popen(
+        [sys.executable, "-c", code, str(delay), APP_BUNDLE_PATH],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 def _teach_word_interactive() -> None:
     """Menu 'Teach a Word…' — the same two-dialog flow as the .command file, but
     in-process. Run on a background thread so the menu click never blocks the run
@@ -1835,7 +2253,7 @@ def _teach_word_interactive() -> None:
             'on error\n  return ""\nend try'
         )
         try:
-            out = subprocess.run(["osascript", "-e", script],
+            out = subprocess.run([OSASCRIPT, "-e", script],
                                  capture_output=True, text=True, timeout=300)
             return out.stdout.strip()
         except Exception:  # noqa: BLE001
@@ -1856,7 +2274,7 @@ def _teach_word_interactive() -> None:
     msg = (f'Saved. früt Flow will now type "{correct}" instead of "{heard}" '
            'from your next dictation on.')
     try:
-        subprocess.run(["osascript", "-e",
+        subprocess.run([OSASCRIPT, "-e",
                         f'display dialog {json.dumps(msg, ensure_ascii=False)} '
                         'with title "früt Flow" '
                         'buttons {"Great"} default button "Great"'],
@@ -1950,7 +2368,7 @@ def _menu_actions_class():
 
         def openLog_(self, sender):
             try:
-                subprocess.Popen(["open",
+                subprocess.Popen([OPEN,
                                   str(Path.home() / ".flowdictate" / "flow.log")])
             except Exception:  # noqa: BLE001
                 pass
@@ -1960,7 +2378,7 @@ def _menu_actions_class():
             # hotkey tap). Accessibility + Microphone live one click away in the
             # same Privacy & Security list.
             try:
-                subprocess.Popen(["open",
+                subprocess.Popen([OPEN,
                     "x-apple.systempreferences:com.apple.preference.security"
                     "?Privacy_ListenEvent"])
             except Exception:  # noqa: BLE001
@@ -2006,9 +2424,7 @@ def _menu_actions_class():
             # survives our termination; LSMultipleInstancesProhibited + our exit
             # ensure exactly one instance ends up running.
             try:
-                subprocess.Popen(
-                    ["/bin/sh", "-c", f'sleep 1; open -g "{APP_BUNDLE_PATH}"'],
-                    start_new_session=True)
+                _relaunch_app_detached()
             except Exception:  # noqa: BLE001
                 pass
             NSApplication.sharedApplication().terminate_(None)
@@ -2019,7 +2435,7 @@ def _menu_actions_class():
             # (frutflow starts again at next login, or when you reopen the app.)
             try:
                 subprocess.run(
-                    ["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT_LABEL}"],
+                    [LAUNCHCTL, "bootout", f"gui/{os.getuid()}/{AGENT_LABEL}"],
                     capture_output=True)
             except Exception:  # noqa: BLE001
                 pass
@@ -3190,7 +3606,7 @@ _HISTORY_CTRL_CLASS = None
 
 def _history_controller_class():
     """Lazily build the History window controller: an iOS 'liquid glass' list of
-    the last 100 dictations (newest first) as translucent squircle cards in a
+    the last 10 dictations (newest first) as translucent squircle cards in a
     flipped NSStackView, grouped into Today / Earlier sections, with a rounded
     search field, a Transcribe button, a Clear control (with confirm), per-card
     icon Copy, a title-bar count pill (green sparkle), and empty / no-results
@@ -3231,6 +3647,7 @@ def _history_controller_class():
     PAD = 16.0          # window inner padding
     CARD_GAP = 10.0     # vertical gap between cards
     TOPBAR_H = 70.0     # search + buttons row (leaves the top strip for traffic lights)
+    STATS_H = 78.0      # saved-time summary below the search/action row
 
     def _rgb(r, g, b, a=1.0):
         return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, a)
@@ -3373,9 +3790,54 @@ def _history_controller_class():
             content.addSubview_(clear)
             self._clear = clear
 
+            # --- saved-time summary: the "home" page message -------------------
+            list_h = H - TOPBAR_H - STATS_H
+            stats_card, stats_inner = G.card(
+                NSMakeRect(PAD, list_h + 6, W - PAD * 2, STATS_H - 16),
+                radius=13.0)
+            stats_card.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+            stats_inner.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
+
+            sw = NSView.alloc().initWithFrame_(NSMakeRect(13, 12, 38, 38))
+            sw.setAutoresizingMask_(NSViewMaxXMargin)
+            sw.setWantsLayer_(True)
+            swl = sw.layer()
+            if swl is not None:
+                swl.setCornerRadius_(19.0)
+                swl.setBackgroundColor_(GREEN.colorWithAlphaComponent_(0.13).CGColor())
+            stats_inner.addSubview_(sw)
+            simg2 = _phosphor_sf("sparkle", "Time saved", point=19.0)
+            siv = NSImageView.alloc().initWithFrame_(NSMakeRect(0, 0, 38, 38))
+            if simg2 is not None:
+                siv.setImage_(simg2)
+                try:
+                    siv.setContentTintColor_(GREEN)
+                except Exception:  # noqa: BLE001
+                    pass
+            siv.setImageScaling_(_SCALE_FIT)
+            sw.addSubview_(siv)
+
+            stitle = NSTextField.labelWithString_("You've saved 0.0 hours using früt Flow")
+            stitle.setFrame_(NSMakeRect(62, 30, W - PAD * 2 - 78, 20))
+            stitle.setAutoresizingMask_(NSViewWidthSizable)
+            stitle.setFont_(G.rounded_font(15, 0.35))
+            stitle.setTextColor_(NSColor.labelColor())
+            stats_inner.addSubview_(stitle)
+            self._stats_title = stitle
+
+            ssub = NSTextField.labelWithString_(
+                "Estimated from voice typing versus 40 WPM manual typing.")
+            ssub.setFrame_(NSMakeRect(62, 12, W - PAD * 2 - 78, 18))
+            ssub.setAutoresizingMask_(NSViewWidthSizable)
+            ssub.setFont_(G.rounded_font(11.5))
+            ssub.setTextColor_(_dyn((1, 1, 1, 0.46), (0, 0, 0, 0.52)))
+            stats_inner.addSubview_(ssub)
+            self._stats_subtitle = ssub
+            content.addSubview_(stats_card)
+
             # --- scroll view + flipped stack of cards -------------------------
             scroll = NSScrollView.alloc().initWithFrame_(
-                NSMakeRect(0, 0, W, H - TOPBAR_H))
+                NSMakeRect(0, 0, W, list_h))
             scroll.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
             scroll.setHasVerticalScroller_(True)
             scroll.setDrawsBackground_(False)   # let the blur show through
@@ -3407,9 +3869,9 @@ def _history_controller_class():
             # Empty / no-results state: mic-in-circle icon + title + body,
             # centered in the list area; shown only when there are no cards.
             empty = NSView.alloc().initWithFrame_(
-                NSMakeRect(0, 0, W, H - TOPBAR_H))
+                NSMakeRect(0, 0, W, list_h))
             empty.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
-            cy = (H - TOPBAR_H) / 2
+            cy = list_h / 2
 
             ecircle = NSView.alloc().initWithFrame_(
                 NSMakeRect(W / 2 - 33, cy + 20, 66, 66))
@@ -3486,7 +3948,7 @@ def _history_controller_class():
                 lambda: _sync_activation_policy())
 
         def windowDidResize_(self, note):
-            # Coalesce live-drag resize ticks: re-wrapping ~100 blur cards on every
+            # Coalesce live-drag resize ticks: re-wrapping the blur cards on every
             # intermediate frame is janky, so run the re-fit once the drag settles.
             if self._resize_timer is not None:
                 self._resize_timer.invalidate()
@@ -3508,11 +3970,28 @@ def _history_controller_class():
         @objc.python_method
         def _reload(self):
             self._all = load_history()           # newest-first, best-effort
+            self._update_stats_summary()
             try:
                 self._count.setStringValue_(str(len(self._all)))
             except Exception:  # noqa: BLE001
                 pass
             self._rebuild(str(self._search.stringValue() or ""))
+
+        @objc.python_method
+        def _update_stats_summary(self):
+            try:
+                stats = load_usage_stats()
+                saved = format_saved_hours(stats)
+                d = int(stats.get("dictations", 0))
+                w = int(stats.get("words", 0))
+                self._stats_title.setStringValue_(
+                    f"You've saved {saved} using früt Flow")
+                d_label = "1 dictation" if d == 1 else f"{d} dictations"
+                w_label = "1 word" if w == 1 else f"{w} words"
+                self._stats_subtitle.setStringValue_(
+                    f"{d_label} · {w_label} · estimated against 40 WPM typing")
+            except Exception:  # noqa: BLE001
+                pass
 
         @objc.python_method
         def _is_today(self, ts):
@@ -3539,7 +4018,7 @@ def _history_controller_class():
             """Tear down and repopulate the stack from self._all, filtered by
             query and grouped Today / Earlier (newest-first within each group).
             Rebuilding the whole stack is the simplest correct filter; at the
-            100-cap it is imperceptible."""
+            10-cap it is imperceptible."""
             for v in list(self._stack.arrangedSubviews()):
                 self._stack.removeArrangedSubview_(v)
                 v.removeFromSuperview()
@@ -4250,35 +4729,19 @@ def _settings_config_save(key, value):
     """Read-modify-write a SINGLE key in ~/.flowdictate/config.json, preserving
     every other key. Atomic (same-dir temp file + os.replace) so a concurrent
     reader never sees a torn file. Pure-Python; never raises. Returns True on ok."""
-    import json
-    import os
-    import tempfile
-    from pathlib import Path
-    path = Path.home() / ".flowdictate" / "config.json"
     try:
+        if key not in DEFAULT_CONFIG:
+            return False
         try:
-            cur = json.loads(path.read_text())
+            cur = json.loads(CONFIG_PATH.read_text())
             if not isinstance(cur, dict):
                 cur = {}
         except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
             cur = {}
         cur[key] = value
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(cur, ensure_ascii=False, indent=2) + "\n"
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent),
-                                   prefix=path.name + ".", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)          # atomic on same filesystem
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        known = _normalize_config(cur)
+        unknown = {k: v for k, v in cur.items() if k not in DEFAULT_CONFIG}
+        _write_private_json(CONFIG_PATH, {**unknown, **known}, indent=2)
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -4807,7 +5270,7 @@ def _settings_controller_class():
 
         @objc.python_method
         def _pane_privacy(self):
-            pane = self._flipped(WIN_W, 420)
+            pane = self._flipped(WIN_W, 470)
             y = PAD
             y += self._privacy_banner(pane, y) + 12
             y += self._section_at(pane, "macOS permissions", y)
@@ -4821,11 +5284,16 @@ def _settings_controller_class():
             self._perm_row(inner, 2, "input", "Input Monitoring",
                            "Detect the global hotkey", URL_INPUT)
             y += h + PAD
-            inner2, h2 = self._card_at(pane, y, 1)
+            inner2, h2 = self._card_at(pane, y, 2)
             self._row_text(inner2, 0, "Learn from my edits",
                            "Auto-correct names you fix after pasting")
             self._add_switch(inner2, 0, "learn_from_edits",
                              bool(self._cfg("learn_from_edits", True)))
+            self._row_divider(inner2, 1)
+            self._row_text(inner2, 1, "Dictation history",
+                           "Keep the last 100 dictations on this Mac")
+            self._add_switch(inner2, 1, "history_enabled",
+                             bool(self._cfg("history_enabled", True)))
             y += h2 + PAD
             self._finish_pane(pane, y)
             self._refresh_permissions()
@@ -5147,7 +5615,7 @@ def _settings_controller_class():
             import os
             try:
                 r = subprocess.run(
-                    ["launchctl", "print",
+                    [LAUNCHCTL, "print",
                      f"gui/{os.getuid()}/{AGENT_LABEL}"],
                     capture_output=True, timeout=3)
                 return r.returncode == 0
@@ -5344,7 +5812,7 @@ def _settings_controller_class():
                 return
             import subprocess
             try:
-                subprocess.Popen(["open", row["url"]])
+                subprocess.Popen([OPEN, row["url"]])
             except Exception:  # noqa: BLE001
                 pass
 
@@ -6676,9 +7144,7 @@ def _popover_controller_class():
         @objc.python_method
         def _do_restart(self):
             try:
-                subprocess.Popen(
-                    ["/bin/sh", "-c", f'sleep 1; open -g "{APP_BUNDLE_PATH}"'],
-                    start_new_session=True)
+                _relaunch_app_detached()
             except Exception:  # noqa: BLE001
                 pass
             from Cocoa import NSApplication
@@ -6688,7 +7154,7 @@ def _popover_controller_class():
         def _do_quit(self):
             try:
                 subprocess.run(
-                    ["launchctl", "bootout", f"gui/{os.getuid()}/{AGENT_LABEL}"],
+                    [LAUNCHCTL, "bootout", f"gui/{os.getuid()}/{AGENT_LABEL}"],
                     capture_output=True)
             except Exception:  # noqa: BLE001
                 pass
@@ -6737,16 +7203,17 @@ class FlowApp:
         # queues it, instead of being silently dropped (the biggest way whole
         # dictations used to be lost). The worker serializes transcription + paste so
         # two clips never overlap.
-        self._work_q: queue.Queue = queue.Queue()
+        self._work_q: queue.Queue = queue.Queue(maxsize=5)
         self._processing_started: float | None = None  # set while the worker runs
         self._proc_warned = False
         # Auto-learn-from-edits: a handle on the field we last pasted into, so we
         # can diff your correction against it. None when nothing is pending.
         self._pending_learn: dict | None = None
-        # Voice-undo ("never mind"): a stack of (EXACT string we inserted, name of
-        # the app it was inserted into), most recent last. Saying an undo phrase pops
-        # the top and backspaces over it — but only if focus is still in that app.
-        self._undo_stack: list[tuple[str, str | None]] = []
+        self._learn_generation = 0
+        # Voice-undo ("never mind"): a stack of (EXACT string we inserted, app name,
+        # focused AX element), most recent last. Saying an undo phrase pops the top
+        # and backspaces over it only when focus still appears to be in that field.
+        self._undo_stack: list[tuple] = []
         # "Transcribe an audio file" window (built lazily on first open).
         self._transcribe_ctrl = None
         # "History" window — the app's home page (built lazily on first open).
@@ -6857,7 +7324,14 @@ class FlowApp:
             return
         # Hand the clip to the single transcription worker and return immediately —
         # capture is never blocked by a slow transcribe.
-        self._work_q.put(audio)
+        try:
+            self._work_q.put_nowait(audio)
+        except queue.Full:
+            print("[flow] transcription queue is full — dropping this clip so "
+                  "memory cannot grow without bound. Restart früt Flow if text "
+                  "has stopped appearing.", flush=True)
+            play("Basso", self.cfg)
+            return
         depth = self._work_q.qsize()
         if depth > 1:
             print(f"[flow] queued — {depth} clips waiting to transcribe.")
@@ -6893,6 +7367,7 @@ class FlowApp:
     def _process(self, audio: np.ndarray) -> None:
         text = ""
         recorded = False   # guard: record each dictation to history at most once
+        audio_duration = len(audio) / SAMPLE_RATE if audio is not None else 0.0
         try:
             print("[flow] transcribing...")
             self._set_status("⏳", "● Transcribing…")
@@ -6919,7 +7394,7 @@ class FlowApp:
             if not text:
                 print("[flow] (no speech detected)")
                 return
-            print(f"[flow] → {text}")
+            _log_transcript_result(text, self.cfg)
             # Voice undo. A "never mind" phrase retracts the sentence spoken right
             # before it — INLINE, so you can talk, say "actually never mind", and keep
             # going in one breath (only that sentence is dropped from what's typed). If
@@ -6928,7 +7403,7 @@ class FlowApp:
             if self.cfg.get("undo_enabled", True):
                 kept, prev_delete = apply_undo(text, self.cfg)
                 if prev_delete or kept != text:
-                    self._apply_undo_result(kept, prev_delete)
+                    self._apply_undo_result(kept, prev_delete, audio_duration)
                     return
             # Natural merge: lead with a space so the dictation doesn't glue
             # onto whatever word is already left of the cursor.
@@ -6938,7 +7413,8 @@ class FlowApp:
             # lands, a distinct, louder one when it only made it to the clipboard.
             if delivered:
                 self._remember_insertion(to_insert)   # so a later "never mind" can delete it
-                record_history(text, app=_focused_app_name(), delivered=True)
+                self._record_history(text, app=_focused_app_name(), delivered=True)
+                self._record_usage_stats(text, audio_duration)
                 recorded = True
                 play("Glass", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
                 if self.cfg.get("learn_from_edits", True):
@@ -6950,7 +7426,8 @@ class FlowApp:
                     self._arm_edit_learning(text)
             else:
                 # insert_text fell back to clipboard-only: still worth recording.
-                record_history(text, app=_focused_app_name(), delivered=False)
+                self._record_history(text, app=_focused_app_name(), delivered=False)
+                self._record_usage_stats(text, audio_duration)
                 recorded = True
                 play("Basso", self.cfg)
             # Learn your vocabulary from the FINAL text (after delivery, so it
@@ -6976,18 +7453,28 @@ class FlowApp:
                 # AFTER the record, e.g. in edit-learning, must not double-record).
                 # app=None: _focused_app_name may be unhappy here; record never raises.
                 if not recorded:
-                    record_history(text, app=None, delivered=False)
+                    self._record_history(text, app=None, delivered=False)
+
+    def _record_history(self, text: str, app: str | None = None,
+                        delivered: bool = True) -> None:
+        if self.cfg.get("history_enabled", True):
+            record_history(text, app=app, delivered=delivered)
+
+    def _record_usage_stats(self, text: str, spoken_seconds: float) -> None:
+        record_usage_stats(text, spoken_seconds)
 
     def _remember_insertion(self, inserted: str) -> None:
         """Push the EXACT string we just inserted, tagged with the app we inserted it
         into, onto the undo stack (bounded), so a later 'never mind' can backspace it
         away — and can refuse if focus has since moved to a different app."""
+        el = _ax_focused_element()
         with self._state_lock:
-            self._undo_stack.append((inserted, _focused_app_name()))
+            self._undo_stack.append((inserted, _focused_app_name(), el))
             if len(self._undo_stack) > 25:
                 self._undo_stack.pop(0)
 
-    def _apply_undo_result(self, kept: str, prev_delete: int) -> None:
+    def _apply_undo_result(self, kept: str, prev_delete: int,
+                           spoken_seconds: float = 0.0) -> None:
         """Carry out an utterance that contained a 'never mind': retract `prev_delete`
         previously-pasted dictations (backspace), then type the `kept` remainder (the
         continuation after an inline retraction), if any."""
@@ -7005,7 +7492,8 @@ class FlowApp:
         to_insert = (" " + kept) if self.cfg.get("auto_space", True) else kept
         if insert_text(to_insert, self.cfg):
             self._remember_insertion(to_insert)
-            record_history(kept, app=_focused_app_name(), delivered=True)
+            self._record_history(kept, app=_focused_app_name(), delivered=True)
+            self._record_usage_stats(kept, spoken_seconds)
             play("Glass", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
             if self.cfg.get("learn_from_edits", True):
                 self._reconcile_edit_learning()
@@ -7016,6 +7504,7 @@ class FlowApp:
                 except Exception:  # noqa: BLE001
                     pass
         else:
+            self._record_usage_stats(kept, spoken_seconds)
             play("Basso", self.cfg)
 
     def _undo_last_insertion(self) -> bool:
@@ -7040,7 +7529,11 @@ class FlowApp:
 
         if not last:
             return _refuse("(never mind — but nothing to undo)", put_back=False)
-        last_text, last_app = last
+        if len(last) == 3:
+            last_text, last_app, last_el = last
+        else:  # compatibility with any in-memory stack from an older code path
+            last_text, last_app = last
+            last_el = None
         # SAFETY (app identity): only backspace if focus is still in the SAME app we
         # dictated into. Otherwise 'never mind' — said to yourself after clicking into
         # a terminal/editor — would eat that app's text. Refuse on any app change.
@@ -7060,13 +7553,19 @@ class FlowApp:
         # than backspace into unrelated text. Delete exactly the MATCHED tail so the
         # count is right even when a boundary space was trimmed. When the app is
         # opaque to AX (val is None), delete best-effort.
+        cur_el = _ax_focused_element()
+        if last_el is not None and cur_el is not None and cur_el != last_el:
+            return _refuse("never mind — focus moved to another field; leaving the "
+                           "last dictation as is.")
         tail = last_text
-        val = _ax_read_value(_ax_focused_element())
-        if val is not None:
-            tail = next((c for c in (last_text, last_text.rstrip(), last_text.lstrip(), last_text.strip())
-                         if c and val.endswith(c)), None)
-            if tail is None:
-                return _refuse("never mind — the last dictation was changed; leaving it as is.")
+        val = _ax_read_value(cur_el)
+        if val is None:
+            return _refuse("never mind — this field cannot be verified safely; "
+                           "leaving the last dictation as is.")
+        tail = next((c for c in (last_text, last_text.rstrip(), last_text.lstrip(), last_text.strip())
+                     if c and val.endswith(c)), None)
+        if tail is None:
+            return _refuse("never mind — the last dictation was changed; leaving it as is.")
 
         n = _composed_len(tail)   # one Backspace per composed character (macOS rule)
         print(f"[flow] ↩︎ never mind — deleting last dictation ({n} chars).", flush=True)
@@ -7088,21 +7587,29 @@ class FlowApp:
         if el is None:
             return   # app doesn't expose its text field; nothing to learn from
         with self._state_lock:
-            self._pending_learn = {"el": el, "pasted": pasted, "done": False}
+            self._learn_generation += 1
+            generation = self._learn_generation
+            self._pending_learn = {
+                "el": el, "pasted": pasted, "done": False,
+                "generation": generation,
+            }
         try:
             win = float(self.cfg.get("learn_window_seconds", 20))
-            t = threading.Timer(win, self._reconcile_edit_learning)
+            t = threading.Timer(win, self._reconcile_edit_learning,
+                                kwargs={"generation": generation})
             t.daemon = True
             t.start()
         except Exception:  # noqa: BLE001
             pass
 
-    def _reconcile_edit_learning(self) -> None:
+    def _reconcile_edit_learning(self, generation: int | None = None) -> None:
         """Finalize learning for the last paste: diff your edits, learn the
         phonetic mis-hears. Runs at most once per paste (next-dictation OR timer)."""
         with self._state_lock:
             pend = self._pending_learn
             if not pend or pend.get("done"):
+                return
+            if generation is not None and pend.get("generation") != generation:
                 return
             pend["done"] = True
             self._pending_learn = None
@@ -7999,7 +8506,7 @@ def _load_audio_file(path: str) -> np.ndarray | None:
     tmp = Path(_tmp)
     try:
         subprocess.run(
-            ["afconvert", "-f", "WAVE", "-d", f"LEI16@{SAMPLE_RATE}", "-c", "1",
+            [AFCONVERT, "-f", "WAVE", "-d", f"LEI16@{SAMPLE_RATE}", "-c", "1",
              str(src), str(tmp)],
             check=True, capture_output=True)
         with wave.open(str(tmp), "rb") as w:

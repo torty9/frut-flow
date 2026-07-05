@@ -1,7 +1,8 @@
 {
   "hotkey": "alt_r",
   "mode": "hold",
-
+  "appearance": "dark",
+  "debug": false,
   "transcribe_backend": "parakeet",
   "parakeet_model": "mlx-community/parakeet-tdt-0.6b-v2",
   "warmup_on_start": true,
@@ -9,26 +10,45 @@
   "compute_type": "int8",
   "cpu_threads": 0,
   "language": "en",
-
   "normalize_audio": true,
   "normalize_method": "rms",
   "normalize_rms_dbfs": -20.0,
   "normalize_peak": 0.95,
-
+  "vad_filter": false,
+  "beam_size": 5,
+  "initial_prompt": "",
   "vocab_biasing": "hotwords",
+  "learn_vocab": true,
+  "cleanup": "basic",
+  "local_repair_model": "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
+  "local_repair_temperature": 0.0,
+  "local_repair_max_input_chars": 2000,
   "fuzzy_correct": true,
   "fuzzy_threshold": 0.74,
   "learn_from_edits": true,
   "learn_window_seconds": 20,
-
-  "cleanup": "basic",
-
+  "history_enabled": true,
   "insert_method": "paste",
   "restore_clipboard": true,
-
+  "auto_space": true,
+  "undo_enabled": true,
+  "undo_phrases": [
+    "never mind",
+    "nevermind",
+    "actually never mind",
+    "actually nevermind",
+    "scratch that",
+    "actually scratch that",
+    "delete that",
+    "actually delete that",
+    "cancel that",
+    "forget that",
+    "undo that"
+  ],
   "play_sounds": true,
   "show_hud": true,
-  "min_seconds": 0.3,
+  "ding_volume": 0.25,
+  "min_seconds": 0.2,
   "max_record_seconds": 120,
   "warn_before_max_seconds": 10,
   "max_processing_seconds": 120

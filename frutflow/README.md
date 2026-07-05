@@ -103,8 +103,9 @@ Edit `~/.flowdictate/config.json` (see `config.example.json`, or use the in-app
 | `restore_clipboard` | `true` | Put your previous clipboard back after pasting the dictation |
 | `auto_space` | `true` | Prepend a space so dictation merges naturally with existing text |
 | `undo_phrases` | `["never mind", …]` | Whole-utterance phrases that delete the previous dictation instead of typing |
+| `history_enabled` | `true` | Store the last 10 dictations locally for the History window. Set `false` for private mode. |
 | `show_hud` | `true` | Floating waveform pill near the bottom of the screen while recording |
-| `appearance` | `"dark"` | UI theme for the app's own windows (`"dark"`, `"light"`, `"auto"`) |
+| `appearance` | `"dark"` | UI theme for the app's own windows (`"dark"`, `"light"`, `"system"`) |
 | `max_record_seconds` | `120` | Safety cap that auto-stops a runaway capture (a warning sound plays ~10 s before) |
 
 ### Accuracy vs. speed
@@ -184,10 +185,11 @@ optional extra is a **fully on-device** cleanup step:
 
 **Nothing ever leaves your computer** — with any setting. There are no cloud
 back-ends and no API keys anywhere in this app; all transcription and cleanup
-runs on-device. After the one-time model download there are no network calls at
-all. Your learned vocabulary, corrections, history, and log live in
-`~/.flowdictate` and are written owner-only (`0600`). That's the main reason this
-exists.
+runs on-device. First setup can download Python packages and model weights; after
+the supported models are cached, dictation itself does not send audio or text to
+a server. Your learned vocabulary, corrections, optional history, and logs live
+in `~/.flowdictate` and are written owner-only. Live dictation logs redact the
+transcript unless `debug` is enabled.
 
 ## Credits & licenses
 
