@@ -6039,7 +6039,7 @@ def _onboarding_controller_class():
             icon = NSView.alloc().initWithFrame_(
                 NSMakeRect((W - ic) / 2.0, top - ic, ic, ic))
             G.round_layer(icon, 21.0, mask=True)
-            path = _Path(__file__).resolve().parent / "assets" / "frut-flow-icon.png"
+            path = _Path(__file__).resolve().parent / "assets" / "frut-flow.icns"
             img = NSImage.alloc().initWithContentsOfFile_(str(path))
             iv = NSImageView.alloc().initWithFrame_(NSMakeRect(0, 0, ic, ic))
             if img is not None:
@@ -6704,12 +6704,12 @@ def _popover_controller_class():
 
         @objc.python_method
         def _asset_icon(self):
-            """Load frut-flow-icon.png next to this module; None if missing."""
+            """Load frut-flow.icns next to this module; None if missing."""
             try:
                 base = Path(__file__).resolve().parent
             except Exception:  # noqa: BLE001
                 base = Path(os.getcwd())
-            p = base / "assets" / "frut-flow-icon.png"
+            p = base / "assets" / "frut-flow.icns"
             if not p.exists():
                 return None
             try:

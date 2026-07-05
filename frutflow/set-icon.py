@@ -6,8 +6,8 @@ Input Monitoring). So instead of baking the icon into Contents/Resources + Info.
 (which would change the code signature), this uses the Finder custom-icon mechanism
 (NSWorkspace.setIcon), which attaches the icon to the bundle without touching the seal.
 
-Usage:  ./.venv/bin/python3 set-icon.py [path/to/icon.png]
-        (defaults to assets/frut-flow-icon.png next to this script)
+Usage:  ./.venv/bin/python3 set-icon.py [path/to/icon.icns]
+        (defaults to assets/frut-flow.icns next to this script)
 """
 import sys
 from pathlib import Path
@@ -15,7 +15,7 @@ from pathlib import Path
 from AppKit import NSImage, NSWorkspace
 
 APP = str(Path.home() / "Applications" / "frutflow.app")
-DEFAULT_ICON = Path(__file__).resolve().parent / "assets" / "frut-flow-icon.png"
+DEFAULT_ICON = Path(__file__).resolve().parent / "assets" / "frut-flow.icns"
 
 
 def main() -> int:
