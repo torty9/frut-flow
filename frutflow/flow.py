@@ -833,6 +833,7 @@ def build_transcriber(cfg: dict):
 
 VOCAB_PATH = CONFIG_DIR / "vocab.json"
 CORRECTIONS_PATH = CONFIG_DIR / "corrections.json"
+CORRECTION_EXAMPLES_PATH = CONFIG_DIR / "correction_examples.json"
 
 # Ultra-common words add no value to the vocab prompt — skip them so only your
 # distinctive vocabulary is learned.
@@ -921,6 +922,39 @@ def _sanitize_corrections(data) -> dict:
     return out
 
 
+def _sanitize_correction_examples(data) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for heard, entry in data.items():
+        h = _clean_text_value(heard, max_chars=160)
+        if not h or not isinstance(entry, dict):
+            continue
+        correct = _clean_text_value(entry.get("correct"), max_chars=160)
+        if not correct or correct == h:
+            continue
+        context = _clean_text_value(entry.get("context"), max_chars=300)
+        app = _clean_text_value(entry.get("app"), max_chars=80)
+        try:
+            count = int(entry.get("count", 1))
+        except (TypeError, ValueError, OverflowError):
+            count = 1
+        try:
+            updated = float(entry.get("updated", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            updated = 0.0
+        out[h] = {
+            "correct": correct,
+            "context": context,
+            "app": app,
+            "count": max(1, min(count, 1_000_000)),
+            "updated": updated if np.isfinite(updated) and updated > 0 else 0.0,
+        }
+        if len(out) >= 500:
+            break
+    return out
+
+
 def learn_vocab(text: str) -> None:
     """Fold a finished dictation into the rolling word-frequency map."""
     if not text:
@@ -952,16 +986,36 @@ def load_corrections() -> dict:
     return _sanitize_corrections(_read_json(CORRECTIONS_PATH, {}))
 
 
-def add_correction(heard: str, correct: str, *, silent: bool = False) -> None:
+def load_correction_examples() -> dict:
+    """Optional correction metadata used as relevant local-repair examples."""
+    return _sanitize_correction_examples(_read_json(CORRECTION_EXAMPLES_PATH, {}))
+
+
+def add_correction(heard: str, correct: str, *, context: str = "",
+                   app: str = "", silent: bool = False) -> None:
     if not heard or not correct or heard == correct:
         return
     heard = _clean_text_value(heard, max_chars=160)
     correct = _clean_text_value(correct, max_chars=160)
+    context = _clean_text_value(context, max_chars=300)
+    app = _clean_text_value(app, max_chars=80)
     if not heard or not correct or heard == correct:
         return
     corr = load_corrections()
     corr[heard] = correct
     _write_private_json(CORRECTIONS_PATH, corr, indent=2)
+    examples = load_correction_examples()
+    prev = examples.get(heard, {})
+    if prev.get("correct") != correct:
+        prev = {}
+    examples[heard] = {
+        "correct": correct,
+        "context": context or prev.get("context", ""),
+        "app": app or prev.get("app", ""),
+        "count": int(prev.get("count", 0)) + 1,
+        "updated": time.time(),
+    }
+    _write_private_json(CORRECTION_EXAMPLES_PATH, examples, indent=2)
     if not silent:
         print(f"[flow] correction saved: '{heard}' -> '{correct}'  ({CORRECTIONS_PATH})")
         print("[flow] (takes effect on your next dictation — no restart needed)")
@@ -1528,6 +1582,34 @@ def _prompt_block_text(value, *, max_chars: int = 120) -> str:
              .replace(">", "&gt;"))
 
 
+def _relevant_correction_examples(context: dict | None, max_examples: int = 8) -> list[dict]:
+    """Pick correction examples worth showing the local repair model."""
+    examples = load_correction_examples()
+    if not examples:
+        return []
+    app = str((context or {}).get("app") or "").lower()
+    scored = []
+    for heard, entry in examples.items():
+        score = float(entry.get("count", 1))
+        eapp = str(entry.get("app") or "").lower()
+        if app and eapp and app == eapp:
+            score += 25.0
+        if entry.get("context"):
+            score += 5.0
+        score += min(float(entry.get("updated", 0.0)) / 1_000_000_000.0, 3.0)
+        scored.append((score, heard, entry))
+    scored.sort(reverse=True, key=lambda x: x[0])
+    out = []
+    for _score, heard, entry in scored[:max_examples]:
+        out.append({
+            "heard": heard,
+            "correct": entry.get("correct", ""),
+            "context": entry.get("context", ""),
+            "app": entry.get("app", ""),
+        })
+    return out
+
+
 def _context_blocks(context: dict | None) -> str:
     """The shared '<known_spellings>' / '<active_app>' suffix injected into the
     on-device local_repair prompt. Biasing the model toward your canonical spellings
@@ -1544,6 +1626,24 @@ def _context_blocks(context: dict | None) -> str:
     app_name = _prompt_block_text(context.get("app"), max_chars=80)
     if app_name:
         blocks.append(f"<active_app>{app_name}</active_app>")
+    examples = []
+    for ex in _relevant_correction_examples(context):
+        heard = _prompt_block_text(ex.get("heard"), max_chars=80)
+        correct = _prompt_block_text(ex.get("correct"), max_chars=80)
+        if not heard or not correct:
+            continue
+        bits = [f"{heard} -> {correct}"]
+        ex_context = _prompt_block_text(ex.get("context"), max_chars=220)
+        ex_app = _prompt_block_text(ex.get("app"), max_chars=80)
+        if ex_context:
+            bits.append(f"context: {ex_context}")
+        if ex_app:
+            bits.append(f"app: {ex_app}")
+        examples.append("; ".join(bits))
+    if examples:
+        blocks.append("<learned_corrections>\n"
+                      + "\n".join(f"- {e}" for e in examples)
+                      + "\n</learned_corrections>")
     return ("\n\n" + "\n".join(blocks)) if blocks else ""
 
 
@@ -2239,7 +2339,7 @@ def _teach_word_interactive() -> None:
     """Menu 'Teach a Word…' — the same two-dialog flow as the .command file, but
     in-process. Run on a background thread so the menu click never blocks the run
     loop while the dialogs are up."""
-    def _ask(prompt: str, save: bool = False) -> str:
+    def _ask(prompt: str, save: bool = False, default: str = "") -> str:
         btn = "Save" if save else "Next"
         # ensure_ascii=False is REQUIRED: AppleScript string literals accept
         # literal UTF-8 but reject json's \\uXXXX escapes, so accented words
@@ -2247,7 +2347,7 @@ def _teach_word_interactive() -> None:
         script = (
             'try\n'
             f'  set r to text returned of (display dialog {json.dumps(prompt, ensure_ascii=False)} '
-            f'default answer "" with title "Teach früt Flow" '
+            f'default answer {json.dumps(default, ensure_ascii=False)} with title "Teach früt Flow" '
             f'buttons {{"Cancel", "{btn}"}} default button "{btn}")\n'
             '  return r\n'
             'on error\n  return ""\nend try'
@@ -2263,11 +2363,20 @@ def _teach_word_interactive() -> None:
                  "(the word it got wrong)")
     if not heard:
         return
-    correct = _ask(f'What should it have typed instead of "{heard}"?', save=True)
+    correct = _ask(f'What should it have typed instead of "{heard}"?')
     if not correct:
         return
+    context_hint = _ask(
+        "Optional context.\n\nAdd the sentence or situation where this fix matters "
+        "(leave blank to skip).")
+    app_hint = _ask(
+        "Optional app.\n\nUse this fix especially in which app? "
+        "(leave blank to use it everywhere).",
+        save=True,
+        default=_focused_app_name() or "",
+    )
     try:
-        add_correction(heard, correct)
+        add_correction(heard, correct, context=context_hint, app=app_hint)
     except Exception as e:  # noqa: BLE001
         print(f"[flow] teach-a-word failed: {e}", flush=True)
         return
@@ -8667,6 +8776,10 @@ def main() -> int:
                         help="list audio input devices and exit")
     parser.add_argument("--correct", nargs=2, metavar=("HEARD", "CORRECT"),
                         help='teach a correction, e.g. --correct "fruit" "früt"')
+    parser.add_argument("--correct-context", default="",
+                        help="optional sentence/context for --correct")
+    parser.add_argument("--correct-app", default="",
+                        help="optional app name for --correct")
     parser.add_argument("--show-learning", action="store_true",
                         help="print your learned vocabulary + corrections and exit")
     parser.add_argument("--try", dest="try_text", metavar="TEXT",
@@ -8704,15 +8817,26 @@ def main() -> int:
         return transcribe_file(load_config(), args.transcribe, copy=args.copy)
 
     if args.correct:
-        add_correction(args.correct[0], args.correct[1])
+        add_correction(args.correct[0], args.correct[1],
+                       context=args.correct_context, app=args.correct_app)
         return 0
 
     if args.show_learning:
         corr = load_corrections()
+        examples = load_correction_examples()
         vocab = _read_json(VOCAB_PATH, {})
         print(f"[flow] corrections ({len(corr)}) — auto-learned + taught:")
         for h, c in corr.items():
-            print(f"    {h!r} -> {c!r}")
+            meta = examples.get(h) or {}
+            suffix = ""
+            if meta.get("context") or meta.get("app"):
+                parts = []
+                if meta.get("context"):
+                    parts.append(f"context={meta['context']!r}")
+                if meta.get("app"):
+                    parts.append(f"app={meta['app']!r}")
+                suffix = "  (" + ", ".join(parts) + ")"
+            print(f"    {h!r} -> {c!r}{suffix}")
         terms = distinctive_terms()
         print(f"[flow] distinctive vocab used for biasing + fuzzy-correct "
               f"({len(terms)}):")

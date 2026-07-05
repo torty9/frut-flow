@@ -29,7 +29,7 @@ correct=$(/usr/bin/osascript - "$heard" <<'OSA' 2>/dev/null
 on run argv
   set heardWord to item 1 of argv
   try
-    set r to text returned of (display dialog "What should it have typed instead of \"" & heardWord & "\"?" default answer "" with title "Teach früt Flow" buttons {"Cancel", "Save"} default button "Save")
+    set r to text returned of (display dialog "What should it have typed instead of \"" & heardWord & "\"?" default answer "" with title "Teach früt Flow" buttons {"Cancel", "Next"} default button "Next")
     return r
   on error
     return ""
@@ -39,11 +39,31 @@ OSA
 )
 [ -z "$correct" ] && exit 0
 
+context=$(/usr/bin/osascript <<'OSA' 2>/dev/null
+try
+  set r to text returned of (display dialog "Optional context." & return & return & "Add the sentence or situation where this fix matters. Leave blank to skip." default answer "" with title "Teach früt Flow" buttons {"Cancel", "Next"} default button "Next")
+  return r
+on error
+  return ""
+end try
+OSA
+)
+
+app_context=$(/usr/bin/osascript <<'OSA' 2>/dev/null
+try
+  set r to text returned of (display dialog "Optional app." & return & return & "Use this fix especially in which app? Leave blank to use it everywhere." default answer "" with title "Teach früt Flow" buttons {"Cancel", "Save"} default button "Save")
+  return r
+on error
+  return ""
+end try
+OSA
+)
+
 umask 077
 mkdir -p "$FLOWDICTATE_DIR"
 chmod 700 "$FLOWDICTATE_DIR"
 
-if [ ! -x "$VENV_PY" ] || ! "$VENV_PY" "$SCRIPT_DIR/flow.py" --correct "$heard" "$correct" >/dev/null 2>&1; then
+if [ ! -x "$VENV_PY" ] || ! "$VENV_PY" "$SCRIPT_DIR/flow.py" --correct "$heard" "$correct" --correct-context "$context" --correct-app "$app_context" >/dev/null 2>&1; then
   /usr/bin/osascript <<'OSA' >/dev/null 2>&1
 display dialog "Could not save the correction. Run ./run.sh once to set up früt Flow, then try again." with title "früt Flow" buttons {"OK"} default button "OK"
 OSA

@@ -148,7 +148,9 @@ stderr so stdout is just the text.
 
 You usually won't need to teach it anything — it learns from your edits. But you
 still can: `./run.sh --correct "heard" "correct"` (or double-click
-**Teach a Word.command**).
+**Teach a Word.command**). Teach a Word can also save optional context and app
+name, which the local repair model uses as relevant examples later. From the CLI:
+`./run.sh --correct "Versal" "Vercel" --correct-context "deploy to Vercel" --correct-app "Cursor"`.
 
 ### Optional on-device cleanup (still 100% local, still free)
 
