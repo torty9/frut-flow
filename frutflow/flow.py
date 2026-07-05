@@ -78,11 +78,10 @@ CHANNELS = 1
 
 DEFAULT_CONFIG = {
     # --- activation ---
-    "hotkey": "alt_r",           # push-to-talk key. Use a modifier key name
-                                 # ("alt", "cmd", "ctrl", "shift", or a
-                                 # left/right variant like "cmd_r"). Use a
-                                 # MODIFIER key so holding it doesn't type into
-                                 # your document.
+    "hotkey": "alt_r",           # push-to-talk key. Use Settings > Dictation
+                                 # > Change and press any single key, or edit
+                                 # JSON with a modifier name ("alt", "cmd",
+                                 # "ctrl", "shift", "cmd_r") or vk:N.
     "mode": "hold",              # "hold"  = push-to-talk (hold while speaking)
                                  # "toggle"= tap to start, tap again to stop
     "appearance": "dark",      # UI theme for the app's own windows:
@@ -300,13 +299,113 @@ _ALLOWED_LOCAL_REPAIR_MODELS = {
     "mlx-community/Qwen2.5-3B-Instruct-4bit",
 }
 
+_VK_BY_NAME = {
+    "alt_l": 58, "alt_r": 61,
+    "ctrl_l": 59, "ctrl_r": 62,
+    "cmd_l": 55, "cmd_r": 54,
+    "shift_l": 56, "shift_r": 60,
+}
+_MODIFIER_VKS_BY_NAME = {
+    "alt": {58, 61},
+    "ctrl": {59, 62},
+    "cmd": {55, 54},
+    "shift": {56, 60},
+}
+_MODIFIER_NAME_BY_VK = {vk: name for name, vk in _VK_BY_NAME.items()}
+_OPTION_VKS = {58, 61}
+
+_VK_LABELS = {
+    0: "A", 1: "S", 2: "D", 3: "F", 4: "H", 5: "G", 6: "Z", 7: "X",
+    8: "C", 9: "V", 11: "B", 12: "Q", 13: "W", 14: "E", 15: "R",
+    16: "Y", 17: "T", 18: "1", 19: "2", 20: "3", 21: "4", 22: "6",
+    23: "5", 24: "=", 25: "9", 26: "7", 27: "-", 28: "8", 29: "0",
+    30: "]", 31: "O", 32: "U", 33: "[", 34: "I", 35: "P", 36: "Return",
+    37: "L", 38: "J", 39: "'", 40: "K", 41: ";", 42: "\\", 43: ",",
+    44: "/", 45: "N", 46: "M", 47: ".", 48: "Tab", 49: "Space",
+    50: "`", 51: "Delete", 52: "Return", 53: "Escape", 65: ".",
+    67: "*", 69: "+", 71: "Clear", 75: "/", 76: "Enter", 78: "-",
+    81: "=", 82: "0", 83: "1", 84: "2", 85: "3", 86: "4", 87: "5",
+    88: "6", 89: "7", 91: "8", 92: "9", 96: "F5", 97: "F6",
+    98: "F7", 99: "F3", 100: "F8", 101: "F9", 103: "F11",
+    105: "F13", 106: "F16", 107: "F14", 109: "F10", 111: "F12",
+    113: "F15", 114: "Help", 115: "Home", 116: "Page Up",
+    117: "Forward Delete", 118: "F4", 119: "End", 120: "F2",
+    121: "Page Down", 122: "F1", 123: "Left Arrow", 124: "Right Arrow",
+    125: "Down Arrow", 126: "Up Arrow",
+}
+_VK_BY_LABEL = {}
+for _vk, _label in _VK_LABELS.items():
+    _VK_BY_LABEL.setdefault(_label.lower(), _vk)
+_VK_BY_LABEL.update({
+    "esc": 53,
+    "spacebar": 49,
+    "backspace": 51,
+    "del": 51,
+    "delete forward": 117,
+    "left": 123,
+    "right": 124,
+    "down": 125,
+    "up": 126,
+})
+
+
+def _parse_vk_binding(name: str) -> int | None:
+    name = str(name or "").strip().lower()
+    if not name:
+        return None
+    if name in _VK_BY_NAME:
+        return _VK_BY_NAME[name]
+    if name.startswith("vk:"):
+        try:
+            vk = int(name.split(":", 1)[1])
+        except ValueError:
+            return None
+        return vk if 0 <= vk <= 255 else None
+    if len(name) == 1:
+        return _VK_BY_LABEL.get(name)
+    return _VK_BY_LABEL.get(name)
+
+
+def _hotkey_name_for_vk(vk: int) -> str:
+    if vk in _MODIFIER_NAME_BY_VK:
+        return _MODIFIER_NAME_BY_VK[vk]
+    return f"vk:{int(vk)}"
+
+
+def _hotkey_display_name(name: str) -> str:
+    raw = str(name or "").strip().lower()
+    modifier_names = {
+        "alt": "Option", "cmd": "Command",
+        "ctrl": "Control", "shift": "Shift",
+        "alt_r": "Right Option", "alt_l": "Left Option",
+        "cmd_r": "Right Command", "cmd_l": "Left Command",
+        "ctrl_r": "Right Control", "ctrl_l": "Left Control",
+        "shift_r": "Right Shift", "shift_l": "Left Shift",
+    }
+    if raw in modifier_names:
+        return modifier_names[raw]
+    vk = _parse_vk_binding(raw)
+    if vk is not None:
+        return _VK_LABELS.get(vk, f"Key {vk}")
+    return str(name or "")
+
+
+def _hotkey_glyph(name: str) -> str:
+    raw = str(name or "").strip().lower()
+    modifier_glyphs = {
+        "alt": "⌥", "alt_l": "⌥", "alt_r": "⌥",
+        "cmd": "⌘", "cmd_l": "⌘", "cmd_r": "⌘",
+        "ctrl": "⌃", "ctrl_l": "⌃", "ctrl_r": "⌃",
+        "shift": "⇧", "shift_l": "⇧", "shift_r": "⇧",
+    }
+    if raw in modifier_glyphs:
+        return modifier_glyphs[raw]
+    return _hotkey_display_name(raw)
+
 
 def _valid_hotkey(name: str) -> bool:
-    return name in {
-        "alt", "cmd", "ctrl", "shift",
-        "alt_l", "alt_r", "ctrl_l", "ctrl_r",
-        "cmd_l", "cmd_r", "shift_l", "shift_r",
-    }
+    name = str(name or "").strip().lower()
+    return name in _MODIFIER_VKS_BY_NAME or _parse_vk_binding(name) is not None
 
 
 def _clean_undo_phrases(value) -> list[str]:
@@ -2291,30 +2390,11 @@ def play(sound: str, cfg: dict, volume: float = 1.0) -> None:
 # trust is NOT effective: the tap is created (banner prints, no "not trusted"
 # error) but never delivers a single event — exactly the silent dead-hotkey bug.
 #
-# A listen-only Quartz CGEventTap (kCGEventTapOptionListenOnly) needs only
-# Input Monitoring (CGPreflightListenEventAccess), which IS granted here. So we
-# build the tap directly via pyobjc/Quartz, match the configured hotkey by its
-# virtual keycode, and re-enable the tap if macOS ever disables it. Everything
-# downstream (record -> faster-whisper -> cleanup -> clipboard+Cmd-V paste) is
-# unchanged.
-
-# Virtual keycodes (kCGKeyCode) for the modifier keys we may use as a hotkey.
-# These are stable macOS HID keycodes, independent of keyboard layout.
-_VK_BY_NAME = {
-    "alt_l": 58, "alt_r": 61,          # left / right Option
-    "ctrl_l": 59, "ctrl_r": 62,        # left / right Control
-    "cmd_l": 55, "cmd_r": 54,          # left / right Command
-    "shift_l": 56, "shift_r": 60,      # left / right Shift
-}
-_MODIFIER_VKS_BY_NAME = {
-    "alt": {58, 61},
-    "ctrl": {59, 62},
-    "cmd": {55, 54},
-    "shift": {56, 60},
-}
-# Option keys are interchangeable for push-to-talk: if the configured hotkey is
-# either Option, accept BOTH so layout/canonicalization quirks can't break it.
-_OPTION_VKS = {58, 61}
+# A Quartz CGEventTap needs Input Monitoring (CGPreflightListenEventAccess),
+# which IS granted here. So we build the tap directly via pyobjc/Quartz, match
+# the configured hotkey by its virtual keycode, and re-enable the tap if macOS
+# ever disables it. Regular-key hotkeys are consumed so they do not type into the
+# target app; modifier hotkeys pass through so shortcuts keep working.
 
 # The hands-free "lock recording" key: press ` (backtick) WHILE holding the
 # configured hotkey to latch the capture, then press it again to stop. Consumed
@@ -2337,18 +2417,19 @@ def resolve_target_vks(name: str) -> set[int]:
     """Return the set of virtual keycodes that should trigger recording.
 
     Robust matching per the D1/D3/D4 diagnostics: never rely on a single key
-    identity for generic modifiers. Accept all vks in a selected modifier
-    family or a specific modifier's vk.
+    identity for generic modifiers. Captured single keys are stored as vk:N so
+    function keys, arrows, letters, punctuation, and keypad keys all work.
     """
+    name = str(name or "").strip().lower()
     if name in _MODIFIER_VKS_BY_NAME:
         return set(_MODIFIER_VKS_BY_NAME[name])
     if name in ("alt_l", "alt_r"):
         return set(_OPTION_VKS)
-    if name in _VK_BY_NAME:
-        return {_VK_BY_NAME[name]}
+    vk = _parse_vk_binding(name)
+    if vk is not None:
+        return {vk}
     raise ValueError(
-        f"Unknown hotkey '{name}'. Use a modifier name such as alt, cmd, "
-        f"ctrl, shift, alt_r, cmd_r, or ctrl_r."
+        f"Unknown hotkey '{name}'. Click Change in Settings and press a key."
     )
 
 
@@ -4736,12 +4817,7 @@ def _hud_controller_class():
             return btn
 
         def _hint_text(self):
-            sym = {
-                "alt_r": "⌥", "alt_l": "⌥", "alt": "⌥",
-                "ctrl_r": "⌃", "ctrl_l": "⌃", "ctrl": "⌃",
-                "cmd_r": "⌘", "cmd_l": "⌘", "cmd": "⌘",
-                "shift_r": "⇧", "shift_l": "⇧", "shift": "⇧", "fn": "fn",
-            }.get(str(self._app.hotkey_name).lower(), str(self._app.hotkey_name))
+            sym = _hotkey_glyph(str(self._app.hotkey_name))
             verb = ("Release %s to insert" if self._app.cfg.get("mode") == "hold"
                     else "Tap %s to stop") % sym
             return "%s · say “never mind” to undo" % verb
@@ -4952,7 +5028,7 @@ def _settings_controller_class():
     from Cocoa import (
         NSObject, NSView, NSWindow, NSScrollView, NSTextField, NSButton,
         NSSwitch, NSSlider, NSSegmentedControl, NSPopUpButton,
-        NSImageView, NSImage, NSAlert, NSApplication, NSColor,
+        NSImageView, NSImage, NSAlert, NSApplication, NSColor, NSEvent,
         NSApplicationActivationPolicyRegular,
         NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
         NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
@@ -5019,12 +5095,8 @@ def _settings_controller_class():
     CONTENT_W = WIN_W - PAD * 2
     ROW_H = 54.0
     TABS = ("General", "Dictation", "Model", "Corrections", "Privacy", "Help")
-    HOTKEY_CHOICES = (
-        ("Option", "alt"),
-        ("Command", "cmd"),
-        ("Control", "ctrl"),
-        ("Shift", "shift"),
-    )
+    EVENT_MASK_KEY_DOWN = 1 << 10
+    EVENT_MASK_FLAGS_CHANGED = 1 << 12
 
     PK_V2 = "mlx-community/parakeet-tdt-0.6b-v2"
     PK_V3 = "mlx-community/parakeet-tdt-0.6b-v3"
@@ -5054,6 +5126,9 @@ def _settings_controller_class():
             self._maxrec_slider = None
             self._perm_timer = None
             self._next_tag = 100
+            self._hotkey_value_label = None
+            self._hotkey_change_button = None
+            self._hotkey_capture_monitor = None
             self._build()
             return self
 
@@ -5308,6 +5383,38 @@ def _settings_controller_class():
             return pop
 
         @objc.python_method
+        def _add_hotkey_control(self, inner, row_idx):
+            top = self._row_top(inner, row_idx)
+            btn_w = 86.0
+            lbl_w = 122.0
+            gap = 8.0
+            btn_x = inner.frame().size.width - 14 - btn_w
+            lbl_x = btn_x - gap - lbl_w
+
+            lbl = NSTextField.labelWithString_(self._hotkey_display())
+            lbl.setFont_(G.rounded_font(12.5))
+            lbl.setTextColor_(TITLE_COL)
+            lbl.setAlignment_(NSTextAlignmentRight)
+            lbl.setLineBreakMode_(4)  # NSLineBreakByTruncatingMiddle
+            lbl.setFrame_(NSMakeRect(lbl_x, top - ROW_H / 2 - 8,
+                                     lbl_w, 16))
+            lbl.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            inner.addSubview_(lbl)
+            self._hotkey_value_label = lbl
+
+            btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(btn_x, top - ROW_H / 2 - 13, btn_w, 26))
+            btn.setBezelStyle_(1)
+            btn.setTitle_("Change")
+            btn.setFont_(G.rounded_font(12.0))
+            btn.setTarget_(self)
+            btn.setAction_("changeHotkey:")
+            btn.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            inner.addSubview_(btn)
+            self._hotkey_change_button = btn
+            return btn
+
+        @objc.python_method
         def _add_chip(self, inner, row_idx, glyph, text):
             top = self._row_top(inner, row_idx)
             lbl = NSTextField.labelWithString_(
@@ -5434,27 +5541,6 @@ def _settings_controller_class():
             return pane
 
         @objc.python_method
-        def _hotkey_choices(self):
-            choices = list(HOTKEY_CHOICES)
-            current = self._hotkey_popup_value()
-            values = {value for _label, value in choices}
-            if current and current not in values and _valid_hotkey(current):
-                choices.append((self._hotkey_display(), current))
-            return tuple(choices)
-
-        @objc.python_method
-        def _hotkey_popup_value(self):
-            current = str(self._cfg("hotkey", "alt_r") or "").strip().lower()
-            if current in ("alt_l", "alt_r"):
-                return "alt"
-            if current in ("cmd_l", "cmd_r"):
-                return "cmd"
-            if current in ("ctrl_l", "ctrl_r"):
-                return "ctrl"
-            if current in ("shift_l", "shift_r"):
-                return "shift"
-            return current
-
         @objc.python_method
         def _pane_dictation(self):
             pane = self._flipped(WIN_W, 340)
@@ -5462,14 +5548,7 @@ def _settings_controller_class():
             inner, h = self._card_at(pane, y, 4)
             self._row_text(inner, 0, "Push-to-talk key",
                            "Hold this to dictate anywhere", right_x=210.0)
-            choices = self._hotkey_choices()
-            self._add_popup(
-                inner, 0,
-                tuple(label for label, _value in choices),
-                tuple(value for _label, value in choices),
-                self._hotkey_popup_value(),
-                apply_name="apply_hotkey",
-                pop_w=172.0)
+            self._add_hotkey_control(inner, 0)
             self._row_divider(inner, 1)
             self._row_text(inner, 1, "Activation",
                            "Hold to talk, or tap to start and stop", right_x=180.0)
@@ -5999,24 +6078,13 @@ def _settings_controller_class():
         def _hotkey_display(self):
             name = str(getattr(self._app, "hotkey_name", "") or
                        self._cfg("hotkey", "alt_r"))
-            return {
-                "alt": "Option", "cmd": "Command",
-                "ctrl": "Control", "shift": "Shift",
-                "alt_r": "Right Option", "alt_l": "Left Option",
-                "cmd_r": "Right Command", "cmd_l": "Left Command",
-                "ctrl_r": "Right Control", "ctrl_l": "Left Control",
-                "shift_r": "Right Shift", "shift_l": "Left Shift",
-            }.get(name.lower(), name)
+            return _hotkey_display_name(name)
 
         @objc.python_method
         def _hotkey_glyph(self):
             name = str(getattr(self._app, "hotkey_name", "") or
-                       self._cfg("hotkey", "alt_r")).lower()
-            for pfx, gl in (("alt", "⌥"), ("cmd", "⌘"), ("ctrl", "⌃"),
-                            ("shift", "⇧")):
-                if name.startswith(pfx):
-                    return gl
-            return ""
+                       self._cfg("hotkey", "alt_r"))
+            return _hotkey_glyph(name)
 
         # ---- launchd agent reflection (read-only) ------------------------
         @objc.python_method
@@ -6150,15 +6218,70 @@ def _settings_controller_class():
                 self._perm_timer = None
 
         def windowWillClose_(self, note):
+            self._end_hotkey_capture()
             self._stop_perm_timer()
             NSOperationQueue.mainQueue().addOperationWithBlock_(
                 lambda: _sync_activation_policy())
+
+        @objc.python_method
+        def _update_hotkey_display(self):
+            if self._hotkey_value_label is not None:
+                self._hotkey_value_label.setStringValue_(self._hotkey_display())
+            if self._hotkey_change_button is not None:
+                self._hotkey_change_button.setTitle_("Change")
+                self._hotkey_change_button.setEnabled_(True)
+
+        @objc.python_method
+        def _start_hotkey_capture(self):
+            if self._hotkey_capture_monitor is not None:
+                return
+            if self._hotkey_change_button is not None:
+                self._hotkey_change_button.setTitle_("Press key")
+            if self._hotkey_value_label is not None:
+                self._hotkey_value_label.setStringValue_("Listening...")
+            try:
+                self._win.makeFirstResponder_(self._win.contentView())
+            except Exception:  # noqa: BLE001
+                pass
+            mask = EVENT_MASK_KEY_DOWN | EVENT_MASK_FLAGS_CHANGED
+            self._hotkey_capture_monitor = (
+                NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                    mask, lambda event: self._capture_hotkey_event(event)))
+
+        @objc.python_method
+        def _end_hotkey_capture(self):
+            mon = self._hotkey_capture_monitor
+            self._hotkey_capture_monitor = None
+            if mon is not None:
+                try:
+                    NSEvent.removeMonitor_(mon)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._update_hotkey_display()
+
+        @objc.python_method
+        def _capture_hotkey_event(self, event):
+            try:
+                keycode = int(event.keyCode())
+                value = _hotkey_name_for_vk(keycode)
+                self.apply_hotkey(value)
+            except Exception as e:  # noqa: BLE001
+                print(f"[flow] could not capture hotkey: {e}", flush=True)
+            finally:
+                self._end_hotkey_capture()
+            return None
 
         # ---- Obj-C action selectors --------------------------------------
         def tabChanged_(self, sender):
             i = int(sender.selectedSegment())
             if 0 <= i < len(TABS):
                 self._show_pane(TABS[i])
+
+        def changeHotkey_(self, _sender):
+            if self._hotkey_capture_monitor is None:
+                self._start_hotkey_capture()
+            else:
+                self._end_hotkey_capture()
 
         def switchToggled_(self, sender):
             meta = self._switch_meta.get(int(sender.tag()))
@@ -6306,6 +6429,7 @@ def _settings_controller_class():
                       flush=True)
             if ok:
                 self._save("hotkey", value)
+                self._update_hotkey_display()
 
         @objc.python_method
         def apply_pkmodel(self, value):
@@ -6747,16 +6871,10 @@ def _onboarding_controller_class():
 
         @objc.python_method
         def _hotkey_hint(self):
-            sym = {
-                "alt_r": "⌥ Right Option", "alt_l": "⌥ Left Option",
-                "alt": "⌥ Option", "ctrl_r": "⌃ Right Control",
-                "ctrl_l": "⌃ Left Control", "ctrl": "⌃ Control",
-                "cmd_r": "⌘ Right Command", "cmd_l": "⌘ Left Command",
-                "cmd": "⌘ Command", "shift_r": "⇧ Right Shift",
-                "shift_l": "⇧ Left Shift", "shift": "⇧ Shift", "fn": "fn",
-            }.get(str(self._app.hotkey_name).lower(),
-                  str(self._app.hotkey_name))
-            return sym
+            name = str(self._app.hotkey_name)
+            glyph = _hotkey_glyph(name)
+            label = _hotkey_display_name(name)
+            return label if glyph == label else f"{glyph} {label}"
 
         # ---- bottom bar ---------------------------------------------------
         @objc.python_method
@@ -7210,26 +7328,12 @@ def _popover_controller_class():
         @objc.python_method
         def _hotkey_glyph(self):
             app = self._ctl._app
-            return {
-                "alt_r": "⌥", "alt_l": "⌥", "alt": "⌥",
-                "ctrl_r": "⌃", "ctrl_l": "⌃", "ctrl": "⌃",
-                "cmd_r": "⌘", "cmd_l": "⌘", "cmd": "⌘",
-                "shift_r": "⇧", "shift_l": "⇧", "shift": "⇧", "fn": "fn",
-            }.get(str(getattr(app, "hotkey_name", "alt_r")).lower(),
-                  str(getattr(app, "hotkey_name", "alt_r")))
+            return _hotkey_glyph(str(getattr(app, "hotkey_name", "alt_r")))
 
         @objc.python_method
         def _hotkey_words(self):
             app = self._ctl._app
-            return {
-                "alt_r": "Right Option", "alt_l": "Left Option", "alt": "Option",
-                "ctrl_r": "Right Control", "ctrl_l": "Left Control",
-                "ctrl": "Control", "cmd_r": "Right Command",
-                "cmd_l": "Left Command", "cmd": "Command",
-                "shift_r": "Right Shift", "shift_l": "Left Shift",
-                "shift": "Shift", "fn": "Fn",
-            }.get(str(getattr(app, "hotkey_name", "alt_r")).lower(),
-                  str(getattr(app, "hotkey_name", "alt_r")))
+            return _hotkey_display_name(str(getattr(app, "hotkey_name", "alt_r")))
 
         @objc.python_method
         def _label(self, s, frame, size, weight, color, align=None):
@@ -7664,7 +7768,7 @@ class FlowApp:
         self._key_down = False
         self._tap = None          # CFMachPort for the Quartz tap
         self._tap_source = None   # its run-loop source (needed to detach on rebuild)
-        self._lock_tap = None          # CFMachPort for the ACTIVE backtick lock tap (separate from the listen-only main tap)
+        self._lock_tap = None          # CFMachPort for the ACTIVE backtick lock tap (separate from the main tap)
         self._lock_tap_source = None   # its run-loop source
         self._lock_tap_ok = False      # did the lock tap create+enable? (feature is unavailable if False)
         self._locked = False           # hold-mode hands-free latch (guarded by _state_lock); reset in _end()
@@ -8269,7 +8373,7 @@ class FlowApp:
 
     # -- low-level Quartz tap callback ---------------------------------------
 
-    def _handle_event(self, etype, keycode, is_down, flags=None) -> None:
+    def _handle_event(self, etype, keycode, is_down, flags=None) -> bool:
         """Dispatch a decoded keyboard event.
 
         is_down is True/False for real keyDown/keyUp events. For a bare modifier
@@ -8287,7 +8391,7 @@ class FlowApp:
                   f"flags={flags_repr} target_vks={sorted(self.target_vks)} "
                   f"match={match}", flush=True)
         if not match:
-            return
+            return False
 
         if is_down is None:
             # Bare modifier (flagsChanged): derive down/up from the flag bits.
@@ -8308,13 +8412,26 @@ class FlowApp:
             if (self.cfg["mode"] == "hold" and not is_down
                     and self.recorder.recording):
                 self._on_key_up()
-            return
+            return True
 
         self._key_down = is_down
         if is_down:
             self._on_key_down()
         else:
             self._on_key_up()
+        return True
+
+    def _should_consume_hotkey_event(self, etype, keycode) -> bool:
+        """Consume regular-key hotkeys so they don't type while activating.
+
+        Modifier-only hotkeys must pass through, otherwise Option/Command/etc.
+        stop working as normal modifiers in other apps while früt Flow is open.
+        """
+        if keycode not in self.target_vks:
+            return False
+        if keycode in _MODIFIER_NAME_BY_VK:
+            return False
+        return int(etype) in (10, 11)  # kCGEventKeyDown / kCGEventKeyUp
 
     # -- tap lifecycle (create / destroy / rebuild) ---------------------------
     #
@@ -8339,23 +8456,26 @@ class FlowApp:
 
             keycode = Quartz.CGEventGetIntegerValueField(
                 event, Quartz.kCGKeyboardEventKeycode)
+            handled = False
             if et == int(Quartz.kCGEventKeyDown):
-                self._handle_event(et, keycode, True)
+                handled = self._handle_event(et, keycode, True)
             elif et == int(Quartz.kCGEventKeyUp):
-                self._handle_event(et, keycode, False)
+                handled = self._handle_event(et, keycode, False)
             elif et == int(Quartz.kCGEventFlagsChanged):
                 # Bare modifier — no down/up. Read the event's flag bits so
                 # _handle_event can derive press/release DETERMINISTICALLY from
                 # the matching modifier's mask bit, instead of toggling a Python
                 # flag that gets stuck inverted if an event is ever missed.
                 flags = Quartz.CGEventGetFlags(event)
-                self._handle_event(et, keycode, None, flags)
+                handled = self._handle_event(et, keycode, None, flags)
+            if handled and self._should_consume_hotkey_event(et, keycode):
+                return None
         except Exception as e:  # noqa: BLE001  never let the tap die
             print(f"[flow] tap callback error: {e}", flush=True)
-        return event   # listen-only, but return the event unchanged
+        return event
 
     def _install_tap(self) -> bool:
-        """Create the listen-only Quartz tap and attach it to the stored run loop.
+        """Create the Quartz hotkey tap and attach it to the stored run loop.
         Returns False when creation fails (== Input Monitoring not granted)."""
         import Quartz
         # Event types we care about: real key down/up (character keys) AND
@@ -8367,8 +8487,8 @@ class FlowApp:
         tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,           # session-level tap
             Quartz.kCGHeadInsertEventTap,        # see events first
-            Quartz.kCGEventTapOptionListenOnly,  # observe only — needs only
-                                                 # Input Monitoring, not Accessibility
+            Quartz.kCGEventTapOptionDefault,     # observe and optionally consume
+                                                 # target regular-key events
             mask,
             self._tap_callback,
             None,
@@ -8411,11 +8531,9 @@ class FlowApp:
 
     # -- hands-free lock key (SEPARATE, ACTIVE tap on the backtick) -----------
     #
-    # The main tap is listen-only (deliberately — an active tap needs *effective*
-    # Accessibility, the historical dead-hotkey trap), so it CANNOT swallow a
-    # keystroke. To consume the backtick cleanly we add a SECOND, independent,
-    # ACTIVE tap dedicated to vk 50. If it fails to create the lock feature is
-    # simply unavailable and push-to-talk is 100% intact.
+    # Backtick remains a separate active tap because it is not the main hotkey;
+    # it is a chord layered on top of hold mode. If it fails to create, push-to-
+    # talk remains intact.
 
     def _on_lock_key(self, is_repeat: bool) -> bool:
         """Decide what a backtick keyDown means. Returns True to CONSUME it, False to
@@ -8436,6 +8554,8 @@ class FlowApp:
         latched = False
         stopping = False
         with self._state_lock:
+            if _VK_GRAVE in self.target_vks:
+                return False               # backtick is the main hotkey; disable the lock overlay
             if self.cfg["mode"] != "hold":
                 return False               # lock is a hold-mode-only feature — let the backtick type
             if self._locked:
@@ -8486,8 +8606,8 @@ class FlowApp:
 
     def _install_lock_tap(self) -> bool:
         """Create the SEPARATE, ACTIVE tap that consumes the backtick lock key.
-        Independent of the listen-only main tap: if this fails the lock feature is
-        simply unavailable and push-to-talk is 100% intact. Needs Input Monitoring
+        Independent of the main tap: if this fails the lock feature is simply
+        unavailable and push-to-talk is 100% intact. Needs Input Monitoring
         (same as the main tap); does NOT need Accessibility (it only observes+consumes,
         never synthesizes)."""
         import Quartz
@@ -8567,7 +8687,7 @@ class FlowApp:
             except Exception:  # noqa: BLE001  next InputStream open will retry anyway
                 pass
 
-    # -- run (direct Quartz CGEventTap, listen-only) -------------------------
+    # -- run (direct Quartz CGEventTap) --------------------------------------
 
     def run(self) -> None:
         import Quartz
@@ -8598,7 +8718,8 @@ class FlowApp:
                        else self.cfg["model"])
         print("=" * 60)
         print("  früt Flow is running.")
-        print(f"  {verb} [{self.hotkey_name}] to dictate. Ctrl-C to quit.")
+        print(f"  {verb} [{_hotkey_display_name(self.hotkey_name)}] "
+              "to dictate. Ctrl-C to quit.")
         print(f"  backend={backend} model={shown_model} "
               f"cleanup={self.cfg['cleanup']}")
         feats = []

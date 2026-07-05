@@ -124,7 +124,7 @@ Edit `~/.flowdictate/config.json` (see `config.example.json`, or use the in-app
 
 | Key | Default | Notes |
 |---|---|---|
-| `hotkey` | `"alt_r"` | Use Settings to choose `alt`, `cmd`, `ctrl`, or `shift`, or edit JSON with a left/right variant like `cmd_r`. Use a **modifier** so holding it doesn't type. |
+| `hotkey` | `"alt_r"` | Use Settings ▸ Dictation ▸ **Change**, then press the single key you want. Regular keys are stored as `vk:N`; modifier names like `alt`, `cmd`, `ctrl`, `shift`, or `cmd_r` also work in JSON. |
 | `mode` | `"hold"` | `"hold"` = push-to-talk · `"toggle"` = tap to start/stop |
 | `transcribe_backend` | `"parakeet"` | `"parakeet"` (NVIDIA Parakeet on the GPU — fastest, default) · `"local"` (faster-whisper on CPU). Both on-device. |
 | `parakeet_model` | `"mlx-community/parakeet-tdt-0.6b-v2"` | v2 = English (best English accuracy) · `...-v3` = 25 languages |
