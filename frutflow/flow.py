@@ -4878,8 +4878,8 @@ def _settings_config_save(key, value):
 
 def _settings_controller_class():
     """Lazily build the Settings window controller: a titled glass window with a
-    top segmented tab bar (General / Dictation / Model / Privacy) that swaps a
-    scrolling content pane. Native controls (NSSwitch / NSSegmentedControl /
+    top segmented tab bar (General / Dictation / Model / Corrections / Privacy)
+    that swaps a scrolling content pane. Native controls (NSSwitch / NSSegmentedControl /
     NSSlider) grouped into rounded glass cards, mirroring the redesign mockup.
     Deferred AppKit import so CLI paths never load Cocoa. Mirrors the History /
     Transcribe controller patterns."""
@@ -4956,7 +4956,7 @@ def _settings_controller_class():
     PAD = 18.0
     CONTENT_W = WIN_W - PAD * 2
     ROW_H = 54.0
-    TABS = ("General", "Dictation", "Model", "Privacy", "Help")
+    TABS = ("General", "Dictation", "Model", "Corrections", "Privacy", "Help")
 
     PK_V2 = "mlx-community/parakeet-tdt-0.6b-v2"
     PK_V3 = "mlx-community/parakeet-tdt-0.6b-v3"
@@ -5027,12 +5027,19 @@ def _settings_controller_class():
 
             # Tab switcher (segmented), centered under the traffic-light strip.
             seg = NSSegmentedControl.alloc().initWithFrame_(
-                NSMakeRect(0, H - 44, 360, 26))
+                NSMakeRect(0, H - 44, 450, 26))
             seg.setSegmentCount_(len(TABS))
             total = 0.0
             for i, t in enumerate(TABS):
                 seg.setLabel_forSegment_(t, i)
-                w = 92.0
+                w = {
+                    "General": 76.0,
+                    "Dictation": 82.0,
+                    "Model": 62.0,
+                    "Corrections": 98.0,
+                    "Privacy": 72.0,
+                    "Help": 56.0,
+                }.get(t, 76.0)
                 seg.setWidth_forSegment_(w, i)
                 total += w
             try:
@@ -5291,6 +5298,7 @@ def _settings_controller_class():
                 "General": self._pane_general,
                 "Dictation": self._pane_dictation,
                 "Model": self._pane_model,
+                "Corrections": self._pane_corrections,
                 "Privacy": self._pane_privacy,
                 "Help": self._pane_help,
             }[name]()
@@ -5394,6 +5402,107 @@ def _settings_controller_class():
             note.setFrame_(NSMakeRect(PAD + 2, 0, CONTENT_W - 4, 30))
             self._place_top(pane, note, y, 30)
             y += 30 + PAD
+            self._finish_pane(pane, y)
+            return pane
+
+        @objc.python_method
+        def _correction_rows(self):
+            corrections = load_corrections()
+            examples = load_correction_examples()
+            rows = []
+            for heard, correct in corrections.items():
+                meta = examples.get(heard) or {}
+                rows.append({
+                    "heard": str(heard),
+                    "correct": str(correct),
+                    "context": str(meta.get("context") or ""),
+                    "app": str(meta.get("app") or ""),
+                    "count": int(meta.get("count") or 0),
+                    "updated": float(meta.get("updated") or 0.0),
+                })
+            rows.sort(key=lambda r: (r["updated"], r["heard"].lower()),
+                      reverse=True)
+            return rows
+
+        @objc.python_method
+        def _correction_row_card(self, pane, y_top, rows):
+            if not rows:
+                inner = self._card_h(pane, y_top, 116.0)
+                title = NSTextField.labelWithString_("No saved corrections yet")
+                title.setFont_(G.rounded_font(14, 0.25))
+                title.setTextColor_(TITLE_COL)
+                title.setFrame_(NSMakeRect(14, 25, CONTENT_W - 28, 20))
+                inner.addSubview_(title)
+                body = NSTextField.wrappingLabelWithString_(
+                    "Use Teach a Word from the menu bar to save the words früt "
+                    "Flow should repair next time.")
+                body.setFont_(G.rounded_font(12.0))
+                body.setTextColor_(SUB_COL)
+                body.setFrame_(NSMakeRect(14, 52, CONTENT_W - 28, 42))
+                inner.addSubview_(body)
+                return 116.0
+
+            row_h = 70.0
+            h = max(row_h, row_h * len(rows))
+            inner = self._card_h(pane, y_top, h)
+            for i, row in enumerate(rows):
+                top = h - row_h * i
+                if i > 0:
+                    div = NSView.alloc().initWithFrame_(
+                        NSMakeRect(0, top, inner.frame().size.width, 1))
+                    div.setWantsLayer_(True)
+                    _paint(div.layer(), "setBackgroundColor_", ROW_DIV)
+                    div.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+                    inner.addSubview_(div)
+
+                title = NSTextField.labelWithString_(
+                    f"{row['heard']} -> {row['correct']}")
+                title.setFont_(G.rounded_font(13.3, 0.2))
+                title.setTextColor_(TITLE_COL)
+                title.setLineBreakMode_(4)  # NSLineBreakByTruncatingMiddle
+                title.setFrame_(NSMakeRect(14, top - 25, CONTENT_W - 28, 18))
+                title.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+                inner.addSubview_(title)
+
+                meta = []
+                if row["context"]:
+                    meta.append(f"context: {row['context']}")
+                if row["app"]:
+                    meta.append(f"app: {row['app']}")
+                if row["count"]:
+                    meta.append("used once" if row["count"] == 1
+                                else f"used {row['count']} times")
+                detail = " · ".join(meta) if meta else "Applies everywhere"
+                sub = NSTextField.labelWithString_(detail)
+                sub.setFont_(G.rounded_font(11.4))
+                sub.setTextColor_(SUB_COL)
+                sub.setLineBreakMode_(4)  # NSLineBreakByTruncatingMiddle
+                sub.setFrame_(NSMakeRect(14, top - 48, CONTENT_W - 28, 16))
+                sub.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
+                inner.addSubview_(sub)
+            return h
+
+        @objc.python_method
+        def _pane_corrections(self):
+            rows = self._correction_rows()
+            pane = self._flipped(WIN_W, 360)
+            y = PAD
+            intro = NSTextField.wrappingLabelWithString_(
+                "Saved corrections früt Flow applies before inserting text. "
+                "Context and app hints are used by on-device cleanup when they match.")
+            intro.setFont_(G.rounded_font(12.3))
+            intro.setTextColor_(SUB_COL)
+            intro.setPreferredMaxLayoutWidth_(CONTENT_W - 4)
+            ih = self._wrap_height(intro, CONTENT_W - 4)
+            intro.setFrame_(NSMakeRect(PAD + 2, 0, CONTENT_W - 4, ih))
+            self._place_top(pane, intro, y, ih)
+            y += ih + 14
+
+            y += self._section_at(
+                pane,
+                "saved corrections" if len(rows) != 1 else "saved correction",
+                y)
+            y += self._correction_row_card(pane, y, rows) + PAD
             self._finish_pane(pane, y)
             return pane
 
@@ -5827,6 +5936,8 @@ def _settings_controller_class():
         # ---- pane swap ----------------------------------------------------
         @objc.python_method
         def _show_pane(self, name):
+            if name == "Corrections":
+                self._panes[name] = self._pane_corrections()
             pane = self._panes.get(name)
             if pane is None:
                 return
