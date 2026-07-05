@@ -37,6 +37,21 @@ Three layers stack so you rarely have to fix anything — all **on-device, autom
 - [Homebrew](https://brew.sh) (used to install the PortAudio audio library)
 - Python 3.9+
 
+## Easiest install for friends
+
+Send them **`Install frut Flow from GitHub.command`**. They can double-click that
+one file; it downloads the latest app from GitHub, installs the local
+dependencies, creates `~/Applications/frutflow.app`, enables on-device repair
+cleanup, and downloads the local models once:
+
+- Parakeet for speech recognition
+- Qwen for on-device correction/cleanup
+
+No API key or cloud code is needed.
+
+Because this installer pulls from the GitHub `main` branch, commit and push the
+current repo before sending the file.
+
 ## Quick start
 
 ```bash
@@ -52,6 +67,25 @@ model); after that it works fully offline.
 
 You can also just double-click **`Start früt Flow.command`** in Finder to launch
 it in a Terminal window.
+
+## Make a shareable installer zip
+
+From this project folder:
+
+```bash
+./package-mac.sh
+```
+
+That creates a clean download at `dist/frut-flow-mac-share-YYYY-MM-DD.zip`.
+Send or upload that zip. The recipient unzips it, double-clicks
+**`Install frut Flow.command`**, and the installer copies the app files to
+`~/Applications/frut-flow`, creates `~/Applications/frutflow.app`, installs the
+Python dependencies, enables on-device repair cleanup, preloads Parakeet and
+Qwen, and shows the one-time macOS permission steps.
+
+Because this is not Developer ID signed/notarized, macOS may show an "Apple
+cannot verify" warning. For a no-warning public download, build a signed and
+notarized `.dmg` or `.pkg` with an Apple Developer account.
 
 ### Manual install (if you prefer)
 
@@ -90,7 +124,7 @@ Edit `~/.flowdictate/config.json` (see `config.example.json`, or use the in-app
 
 | Key | Default | Notes |
 |---|---|---|
-| `hotkey` | `"alt_r"` | Any pynput key name (`alt_r`, `cmd_r`, `ctrl_r`, `f6`) or single char. Use a **modifier** so holding it doesn't type. |
+| `hotkey` | `"alt_r"` | Use Settings to choose `alt`, `cmd`, `ctrl`, or `shift`, or edit JSON with a left/right variant like `cmd_r`. Use a **modifier** so holding it doesn't type. |
 | `mode` | `"hold"` | `"hold"` = push-to-talk · `"toggle"` = tap to start/stop |
 | `transcribe_backend` | `"parakeet"` | `"parakeet"` (NVIDIA Parakeet on the GPU — fastest, default) · `"local"` (faster-whisper on CPU). Both on-device. |
 | `parakeet_model` | `"mlx-community/parakeet-tdt-0.6b-v2"` | v2 = English (best English accuracy) · `...-v3` = 25 languages |

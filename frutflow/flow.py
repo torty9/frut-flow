@@ -78,10 +78,11 @@ CHANNELS = 1
 
 DEFAULT_CONFIG = {
     # --- activation ---
-    "hotkey": "alt_r",           # push-to-talk key. A pynput Key name (e.g.
-                                 # "alt_r", "alt_l", "cmd_r", "ctrl_r", "f6")
-                                 # or a single character. Use a MODIFIER key so
-                                 # holding it doesn't type into your document.
+    "hotkey": "alt_r",           # push-to-talk key. Use a modifier key name
+                                 # ("alt", "cmd", "ctrl", "shift", or a
+                                 # left/right variant like "cmd_r"). Use a
+                                 # MODIFIER key so holding it doesn't type into
+                                 # your document.
     "mode": "hold",              # "hold"  = push-to-talk (hold while speaking)
                                  # "toggle"= tap to start, tap again to stop
     "appearance": "dark",      # UI theme for the app's own windows:
@@ -301,12 +302,11 @@ _ALLOWED_LOCAL_REPAIR_MODELS = {
 
 
 def _valid_hotkey(name: str) -> bool:
-    if name in {
+    return name in {
+        "alt", "cmd", "ctrl", "shift",
         "alt_l", "alt_r", "ctrl_l", "ctrl_r",
         "cmd_l", "cmd_r", "shift_l", "shift_r",
-    }:
-        return True
-    return len(name) == 1 and not name.isspace()
+    }
 
 
 def _clean_undo_phrases(value) -> list[str]:
@@ -1449,7 +1449,9 @@ def fuzzy_correct_text(text: str, terms: list[str], threshold: float = 0.74) -> 
         return text
     parts = re.split(r"(\W+)", text)   # keeps the delimiters in place
     for i, tok in enumerate(parts):
-        if len(tok) < 3 or not tok.isalpha():
+        # Three-letter tokens are too collision-prone for fuzzy repair: API/App,
+        # EIN/Ian, LLC/lil, etc. Exact taught corrections still handle them.
+        if len(tok) < 4 or not tok.isalpha():
             continue
         low = tok.lower()
         best, best_score = None, 0.0
@@ -1728,10 +1730,16 @@ _LOCAL_REPAIR_SHOTS = [
     {"role": "assistant", "content": "The API call is asynchronous and returns a promise."},
     {"role": "user", "content": "Put the boxes over they're by the door and tell there team"},
     {"role": "assistant", "content": "Put the boxes over there by the door and tell their team"},
+    {"role": "user", "content": "Your going to love this feature"},
+    {"role": "assistant", "content": "You're going to love this feature"},
     {"role": "user", "content": "What time is the standup meeting tomorrow morning?"},
     {"role": "assistant", "content": "What time is the standup meeting tomorrow morning?"},
+    {"role": "user", "content": "Summarize this in one sentence"},
+    {"role": "assistant", "content": "Summarize this in one sentence"},
     {"role": "user", "content": "The server lost it's connection to the database"},
     {"role": "assistant", "content": "The server lost its connection to the database"},
+    {"role": "user", "content": "Its to cold to go outside"},
+    {"role": "assistant", "content": "It's too cold to go outside"},
     {"role": "user", "content": "I read that book last night and it was great"},
     {"role": "assistant", "content": "I read that book last night and it was great"},
 ]
@@ -1838,6 +1846,22 @@ def _repair_output_ok(src: str, out: str) -> bool:
     return True
 
 
+def _preserve_source_terminal_punctuation(src: str, out: str) -> str:
+    """Remove sentence-ending punctuation the repair model added on its own.
+
+    The model is allowed to fix words, not decide sentence style. Keeping this as
+    a narrow terminal-punctuation guard preserves useful word repairs while
+    preventing the common "helpful period/question mark" drift.
+    """
+    src_r = (src or "").rstrip()
+    out_r = (out or "").rstrip()
+    if not src_r or not out_r:
+        return out
+    if src_r[-1] not in ".?!" and out_r[-1] in ".?!":
+        return out_r[:-1].rstrip() + out[len(out_r):]
+    return out
+
+
 def local_repair(text: str, cfg: dict, context: dict | None = None,
                  gpu_lock=None) -> str:
     """Conservative, on-device, context-aware repair of misheard words. Returns the
@@ -1871,6 +1895,7 @@ def local_repair(text: str, cfg: dict, context: dict | None = None,
     # The model sometimes wraps its answer in quotes/backticks despite instructions.
     if len(out) >= 2 and out[0] in "\"'`" and out[-1] == out[0]:
         out = out[1:-1].strip()
+    out = _preserve_source_terminal_punctuation(text, out)
     return out if _repair_output_ok(text, out) else text
 
 
@@ -2268,10 +2293,10 @@ def play(sound: str, cfg: dict, volume: float = 1.0) -> None:
 #
 # A listen-only Quartz CGEventTap (kCGEventTapOptionListenOnly) needs only
 # Input Monitoring (CGPreflightListenEventAccess), which IS granted here. So we
-# build the tap directly via pyobjc/Quartz, match the Option keys by their
-# virtual keycode (vk 58 = left Option, vk 61 = right Option), and re-enable the
-# tap if macOS ever disables it. Everything downstream (record -> faster-whisper
-# -> cleanup -> clipboard+Cmd-V paste) is unchanged.
+# build the tap directly via pyobjc/Quartz, match the configured hotkey by its
+# virtual keycode, and re-enable the tap if macOS ever disables it. Everything
+# downstream (record -> faster-whisper -> cleanup -> clipboard+Cmd-V paste) is
+# unchanged.
 
 # Virtual keycodes (kCGKeyCode) for the modifier keys we may use as a hotkey.
 # These are stable macOS HID keycodes, independent of keyboard layout.
@@ -2281,14 +2306,20 @@ _VK_BY_NAME = {
     "cmd_l": 55, "cmd_r": 54,          # left / right Command
     "shift_l": 56, "shift_r": 60,      # left / right Shift
 }
+_MODIFIER_VKS_BY_NAME = {
+    "alt": {58, 61},
+    "ctrl": {59, 62},
+    "cmd": {55, 54},
+    "shift": {56, 60},
+}
 # Option keys are interchangeable for push-to-talk: if the configured hotkey is
 # either Option, accept BOTH so layout/canonicalization quirks can't break it.
 _OPTION_VKS = {58, 61}
 
-# The hands-free "lock recording" key: press ` (backtick) WHILE holding Option to
-# latch the capture, then press it again to stop. Consumed by a SEPARATE active
-# tap (see FlowApp._install_lock_tap) so a real backtick is never eaten unless it
-# actually toggles the lock.
+# The hands-free "lock recording" key: press ` (backtick) WHILE holding the
+# configured hotkey to latch the capture, then press it again to stop. Consumed
+# by a SEPARATE active tap (see FlowApp._install_lock_tap) so a real backtick is
+# never eaten unless it actually toggles the lock.
 _VK_GRAVE = 50   # kVK_ANSI_Grave (backtick / tilde key)
 
 # Modifier keys arrive as kCGEventFlagsChanged (a *bare* modifier produces NO
@@ -2306,22 +2337,18 @@ def resolve_target_vks(name: str) -> set[int]:
     """Return the set of virtual keycodes that should trigger recording.
 
     Robust matching per the D1/D3/D4 diagnostics: never rely on a single key
-    identity. If the user picked an Option key, accept either Option; otherwise
-    accept the specific modifier's vk, or a single character's vk.
+    identity for generic modifiers. Accept all vks in a selected modifier
+    family or a specific modifier's vk.
     """
+    if name in _MODIFIER_VKS_BY_NAME:
+        return set(_MODIFIER_VKS_BY_NAME[name])
     if name in ("alt_l", "alt_r"):
         return set(_OPTION_VKS)
     if name in _VK_BY_NAME:
         return {_VK_BY_NAME[name]}
-    if len(name) == 1:
-        # Resolve a single character to its vk via pynput's KeyCode table.
-        from pynput.keyboard import KeyCode
-        vk = getattr(KeyCode.from_char(name), "vk", None)
-        if vk is not None:
-            return {vk}
     raise ValueError(
-        f"Unknown hotkey '{name}'. Use a modifier name (e.g. alt_r, cmd_r, "
-        f"ctrl_r) or a single character."
+        f"Unknown hotkey '{name}'. Use a modifier name such as alt, cmd, "
+        f"ctrl, shift, alt_r, cmd_r, or ctrl_r."
     )
 
 
@@ -4713,7 +4740,7 @@ def _hud_controller_class():
                 "alt_r": "⌥", "alt_l": "⌥", "alt": "⌥",
                 "ctrl_r": "⌃", "ctrl_l": "⌃", "ctrl": "⌃",
                 "cmd_r": "⌘", "cmd_l": "⌘", "cmd": "⌘",
-                "shift": "⇧", "fn": "fn",
+                "shift_r": "⇧", "shift_l": "⇧", "shift": "⇧", "fn": "fn",
             }.get(str(self._app.hotkey_name).lower(), str(self._app.hotkey_name))
             verb = ("Release %s to insert" if self._app.cfg.get("mode") == "hold"
                     else "Tap %s to stop") % sym
@@ -4924,8 +4951,8 @@ def _settings_controller_class():
     import objc
     from Cocoa import (
         NSObject, NSView, NSWindow, NSScrollView, NSTextField, NSButton,
-        NSSwitch, NSSlider, NSSegmentedControl, NSImageView, NSImage, NSAlert,
-        NSApplication, NSColor,
+        NSSwitch, NSSlider, NSSegmentedControl, NSPopUpButton,
+        NSImageView, NSImage, NSAlert, NSApplication, NSColor,
         NSApplicationActivationPolicyRegular,
         NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
         NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
@@ -4992,6 +5019,12 @@ def _settings_controller_class():
     CONTENT_W = WIN_W - PAD * 2
     ROW_H = 54.0
     TABS = ("General", "Dictation", "Model", "Corrections", "Privacy", "Help")
+    HOTKEY_CHOICES = (
+        ("Option", "alt"),
+        ("Command", "cmd"),
+        ("Control", "ctrl"),
+        ("Shift", "shift"),
+    )
 
     PK_V2 = "mlx-community/parakeet-tdt-0.6b-v2"
     PK_V3 = "mlx-community/parakeet-tdt-0.6b-v3"
@@ -5013,6 +5046,7 @@ def _settings_controller_class():
             self._panes = {}            # name -> flipped pane view
             self._switch_meta = {}      # tag -> (cfg_key, apply_name_or_None)
             self._seg_meta = {}         # tag -> (values, cfg_key_or_None, apply_name_or_None)
+            self._popup_meta = {}       # tag -> (values, cfg_key_or_None, apply_name_or_None)
             self._perm_rows = {}        # key -> {"pill":btn, "url":str, "tag":int}
             self._perm_tag_to_key = {}  # button tag -> perm key
             self._correction_edit_rows = {}
@@ -5246,6 +5280,34 @@ def _settings_controller_class():
             return seg
 
         @objc.python_method
+        def _add_popup(self, inner, row_idx, labels, values, cur_value,
+                       cfg_key=None, apply_name=None, pop_w=172.0):
+            top = self._row_top(inner, row_idx)
+            pop = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+                NSMakeRect(0, 0, pop_w, 26), False)
+            for label in labels:
+                pop.addItemWithTitle_(label)
+            sel = 0
+            for i, v in enumerate(values):
+                if v == cur_value:
+                    sel = i
+                    break
+            try:
+                pop.selectItemAtIndex_(sel)
+            except Exception:  # noqa: BLE001
+                pass
+            tag = self._tag()
+            pop.setTag_(tag)
+            pop.setTarget_(self)
+            pop.setAction_("popupChanged:")
+            self._popup_meta[tag] = (tuple(values), cfg_key, apply_name)
+            x = inner.frame().size.width - 14 - pop_w
+            pop.setFrame_(NSMakeRect(x, top - ROW_H / 2 - 13, pop_w, 26))
+            pop.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            inner.addSubview_(pop)
+            return pop
+
+        @objc.python_method
         def _add_chip(self, inner, row_idx, glyph, text):
             top = self._row_top(inner, row_idx)
             lbl = NSTextField.labelWithString_(
@@ -5372,13 +5434,42 @@ def _settings_controller_class():
             return pane
 
         @objc.python_method
+        def _hotkey_choices(self):
+            choices = list(HOTKEY_CHOICES)
+            current = self._hotkey_popup_value()
+            values = {value for _label, value in choices}
+            if current and current not in values and _valid_hotkey(current):
+                choices.append((self._hotkey_display(), current))
+            return tuple(choices)
+
+        @objc.python_method
+        def _hotkey_popup_value(self):
+            current = str(self._cfg("hotkey", "alt_r") or "").strip().lower()
+            if current in ("alt_l", "alt_r"):
+                return "alt"
+            if current in ("cmd_l", "cmd_r"):
+                return "cmd"
+            if current in ("ctrl_l", "ctrl_r"):
+                return "ctrl"
+            if current in ("shift_l", "shift_r"):
+                return "shift"
+            return current
+
+        @objc.python_method
         def _pane_dictation(self):
             pane = self._flipped(WIN_W, 340)
             y = PAD
             inner, h = self._card_at(pane, y, 4)
             self._row_text(inner, 0, "Push-to-talk key",
                            "Hold this to dictate anywhere", right_x=210.0)
-            self._add_chip(inner, 0, self._hotkey_glyph(), self._hotkey_display())
+            choices = self._hotkey_choices()
+            self._add_popup(
+                inner, 0,
+                tuple(label for label, _value in choices),
+                tuple(value for _label, value in choices),
+                self._hotkey_popup_value(),
+                apply_name="apply_hotkey",
+                pop_w=172.0)
             self._row_divider(inner, 1)
             self._row_text(inner, 1, "Activation",
                            "Hold to talk, or tap to start and stop", right_x=180.0)
@@ -5909,6 +6000,8 @@ def _settings_controller_class():
             name = str(getattr(self._app, "hotkey_name", "") or
                        self._cfg("hotkey", "alt_r"))
             return {
+                "alt": "Option", "cmd": "Command",
+                "ctrl": "Control", "shift": "Shift",
                 "alt_r": "Right Option", "alt_l": "Left Option",
                 "cmd_r": "Right Command", "cmd_l": "Left Command",
                 "ctrl_r": "Right Control", "ctrl_l": "Left Control",
@@ -6095,6 +6188,25 @@ def _settings_controller_class():
             elif cfg_key:
                 self._save(cfg_key, val)
 
+        def popupChanged_(self, sender):
+            meta = self._popup_meta.get(int(sender.tag()))
+            if not meta:
+                return
+            values, cfg_key, apply_name = meta
+            try:
+                i = int(sender.indexOfSelectedItem())
+            except Exception:  # noqa: BLE001
+                return
+            if not (0 <= i < len(values)):
+                return
+            val = values[i]
+            if apply_name:
+                fn = getattr(self, apply_name, None)
+                if fn:
+                    fn(val)
+            elif cfg_key:
+                self._save(cfg_key, val)
+
         @objc.python_method
         def _is_live_drag(self):
             """True while the user is mid-drag on a control (the triggering event
@@ -6181,6 +6293,19 @@ def _settings_controller_class():
             # Drive the shared theme mechanism so every glass window (which carries
             # its own per-window appearance) re-themes live, not just NSApp.
             _set_appearance_pref(value)
+
+        @objc.python_method
+        def apply_hotkey(self, value):
+            value = str(value or "").strip().lower()
+            ok = False
+            try:
+                fn = getattr(self._app, "apply_hotkey", None)
+                ok = bool(fn(value)) if callable(fn) else _valid_hotkey(value)
+            except Exception as e:  # noqa: BLE001
+                print(f"[flow] could not apply hotkey '{value}': {e}",
+                      flush=True)
+            if ok:
+                self._save("hotkey", value)
 
         @objc.python_method
         def apply_pkmodel(self, value):
@@ -6627,7 +6752,8 @@ def _onboarding_controller_class():
                 "alt": "⌥ Option", "ctrl_r": "⌃ Right Control",
                 "ctrl_l": "⌃ Left Control", "ctrl": "⌃ Control",
                 "cmd_r": "⌘ Right Command", "cmd_l": "⌘ Left Command",
-                "cmd": "⌘ Command", "shift": "⇧ Shift", "fn": "fn",
+                "cmd": "⌘ Command", "shift_r": "⇧ Right Shift",
+                "shift_l": "⇧ Left Shift", "shift": "⇧ Shift", "fn": "fn",
             }.get(str(self._app.hotkey_name).lower(),
                   str(self._app.hotkey_name))
             return sym
@@ -7088,7 +7214,7 @@ def _popover_controller_class():
                 "alt_r": "⌥", "alt_l": "⌥", "alt": "⌥",
                 "ctrl_r": "⌃", "ctrl_l": "⌃", "ctrl": "⌃",
                 "cmd_r": "⌘", "cmd_l": "⌘", "cmd": "⌘",
-                "shift": "⇧", "fn": "fn",
+                "shift_r": "⇧", "shift_l": "⇧", "shift": "⇧", "fn": "fn",
             }.get(str(getattr(app, "hotkey_name", "alt_r")).lower(),
                   str(getattr(app, "hotkey_name", "alt_r")))
 
@@ -7100,6 +7226,7 @@ def _popover_controller_class():
                 "ctrl_r": "Right Control", "ctrl_l": "Left Control",
                 "ctrl": "Control", "cmd_r": "Right Command",
                 "cmd_l": "Left Command", "cmd": "Command",
+                "shift_r": "Right Shift", "shift_l": "Left Shift",
                 "shift": "Shift", "fn": "Fn",
             }.get(str(getattr(app, "hotkey_name", "alt_r")).lower(),
                   str(getattr(app, "hotkey_name", "alt_r")))
@@ -7603,6 +7730,42 @@ class FlowApp:
         self._last_glyph = None    # most recent state glyph, so the popover can
                                    # colour its status dot to match the menu bar
 
+    def apply_hotkey(self, name: str) -> bool:
+        """Switch the dictation trigger without restarting the app.
+
+        The Quartz tap already listens for all key up/down/flagsChanged events;
+        changing the binding only needs to replace the matched virtual keycodes.
+        Reset transient key state so a previously held old key can't leave hold
+        mode latched after the binding changes.
+        """
+        name = str(name or "").strip().lower()
+        if not _valid_hotkey(name):
+            print(f"[flow] ignored invalid hotkey '{name}'.", flush=True)
+            return False
+        try:
+            target_vks = resolve_target_vks(name)
+        except Exception as e:  # noqa: BLE001
+            print(f"[flow] ignored hotkey '{name}': {e}", flush=True)
+            return False
+
+        old = self.hotkey_name
+        stop_hold_recording = False
+        with self._state_lock:
+            self.cfg["hotkey"] = name
+            self.hotkey_name = name
+            self.target_vks = target_vks
+            self._key_down = False
+            self._locked = False
+            self._last_toggle = 0.0
+            stop_hold_recording = (
+                self.cfg.get("mode") == "hold" and self.recorder.recording)
+
+        if stop_hold_recording:
+            threading.Thread(target=self._end, daemon=True).start()
+        print(f"[flow] hotkey changed: {old} -> {name} "
+              f"(vks={sorted(target_vks)}).", flush=True)
+        return True
+
     def _set_status(self, glyph: str, label: str) -> None:
         """Reflect the dictation state in the menu bar. No-op unless in app mode.
         Marshals the UI update to the main thread (safe from the worker thread)
@@ -7995,10 +8158,10 @@ class FlowApp:
                 self._begin()
 
     def _on_key_up(self) -> None:
-        # When LOCKED, releasing Option must NOT stop the capture — that's the whole
-        # point of hands-free mode. This is the single choke point both the normal
-        # release and the drift-resync path in _handle_event funnel through, so the
-        # latch guard lives here (not at the call sites).
+        # When LOCKED, releasing the hotkey must NOT stop the capture — that's the
+        # whole point of hands-free mode. This is the single choke point both the
+        # normal release and the drift-resync path in _handle_event funnel through,
+        # so the latch guard lives here (not at the call sites).
         if self.cfg["mode"] == "hold" and not self._locked:
             self._end()
 
@@ -8284,7 +8447,7 @@ class FlowApp:
                 self._locked = False       # clear BEFORE the stop so the auto-cap path can't re-guard
                 stopping = True
             elif self.recorder.recording and self._key_down and not is_repeat:
-                self._locked = True        # Option genuinely held AND recording -> LATCH
+                self._locked = True        # hotkey genuinely held AND recording -> LATCH
                 latched = True
             else:
                 return False               # idle backtick (or its repeats) -> real character, pass through
@@ -8989,6 +9152,54 @@ def compare_engines(cfg: dict, seconds: float = 6.0) -> int:
     return 0
 
 
+def preload_models(cfg: dict) -> int:
+    """Download and warm the configured local models without starting the app."""
+    norm = dict(
+        normalize=cfg.get("normalize_audio", True),
+        normalize_peak=cfg.get("normalize_peak", 0.95),
+        normalize_method=cfg.get("normalize_method", "rms"),
+        normalize_rms_dbfs=cfg.get("normalize_rms_dbfs", -20.0),
+    )
+    backend = cfg.get("transcribe_backend", "parakeet")
+    try:
+        if backend == "parakeet":
+            model_name = cfg.get("parakeet_model",
+                                 DEFAULT_CONFIG["parakeet_model"])
+            print(f"[flow] preloading Parakeet speech model: {model_name}")
+            ParakeetTranscriber(model_name, cfg["language"], warmup=True, **norm)
+        else:
+            model_name = cfg.get("model", DEFAULT_CONFIG["model"])
+            print(f"[flow] preloading faster-whisper speech model: {model_name}")
+            LocalTranscriber(
+                model_name, cfg["compute_type"], cfg["language"],
+                vad_filter=cfg.get("vad_filter", False),
+                beam_size=cfg.get("beam_size", 5),
+                initial_prompt=cfg.get("initial_prompt", ""),
+                cpu_threads=cfg.get("cpu_threads", 0), **norm)
+    except Exception as e:  # noqa: BLE001
+        print(f"[flow] could not preload speech model: {e}")
+        return 1
+
+    if cfg.get("cleanup") == "local":
+        repo_id = cfg.get("local_repair_model",
+                          DEFAULT_CONFIG["local_repair_model"])
+        try:
+            print(f"[flow] preloading on-device repair model: {repo_id}")
+            _get_local_repairer(repo_id)
+        except ModuleNotFoundError as e:
+            print(f"[flow] missing local-repair dependency: {e.name}")
+            print("       install requirements first:  pip install -r requirements.txt")
+            return 1
+        except Exception as e:  # noqa: BLE001
+            print(f"[flow] could not preload repair model: {e}")
+            return 1
+    else:
+        print("[flow] local repair is not enabled; skipping repair model preload.")
+
+    print("[flow] model preload complete.")
+    return 0
+
+
 def main() -> int:
     # When launched as the app, stdout/stderr are redirected to flow.log, where
     # Python block-buffers them — so status lines only appear minutes later. Make
@@ -9001,6 +9212,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="früt Flow — local voice dictation")
     parser.add_argument("--setup", action="store_true",
                         help="write default config + print permission help")
+    parser.add_argument("--enable-local-repair", action="store_true",
+                        help="set cleanup to local on-device repair in the config")
+    parser.add_argument("--preload-models", action="store_true",
+                        help="download and warm configured local models, then exit")
     parser.add_argument("--list-devices", action="store_true",
                         help="list audio input devices and exit")
     parser.add_argument("--correct", nargs=2, metavar=("HEARD", "CORRECT"),
@@ -9036,8 +9251,29 @@ def main() -> int:
 
     if args.setup:
         write_default_config()
+        if args.enable_local_repair:
+            if not _settings_config_save("cleanup", "local"):
+                print("[flow] could not enable local repair in the config")
+                return 1
+            print("[flow] enabled on-device repair cleanup in the config")
+        if args.preload_models:
+            code = preload_models(load_config())
+            print(PERMISSIONS_HELP)
+            return code
         print(PERMISSIONS_HELP)
         return 0
+
+    if args.enable_local_repair:
+        write_default_config()
+        if not _settings_config_save("cleanup", "local"):
+            print("[flow] could not enable local repair in the config")
+            return 1
+        print("[flow] enabled on-device repair cleanup in the config")
+        if not args.preload_models:
+            return 0
+
+    if args.preload_models:
+        return preload_models(load_config())
 
     if args.compare is not None:
         return compare_engines(load_config(), float(args.compare))

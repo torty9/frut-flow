@@ -1,0 +1,262 @@
+#!/bin/bash
+# Double-click installer for people receiving frut Flow as a zip.
+set -euo pipefail
+
+SOURCE_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+INSTALL_DIR="$HOME/Applications/frut-flow"
+APP="$HOME/Applications/frutflow.app"
+FLOWDICTATE_DIR="$HOME/.flowdictate"
+CODE_PTR="$FLOWDICTATE_DIR/code_dir"
+AGENT="$HOME/Library/LaunchAgents/com.frutflow.dictation.plist"
+LABEL="com.frutflow.dictation"
+ENABLE_LOCAL_REPAIR="${FRUTFLOW_ENABLE_LOCAL_REPAIR:-1}"
+PRELOAD_MODELS="${FRUTFLOW_PRELOAD_MODELS:-1}"
+
+enabled() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+clear || true
+echo "frut Flow installer"
+echo
+
+if [ "$(uname -m)" != "arm64" ]; then
+  echo "This version is built for Apple Silicon Macs."
+  echo
+  read -r -p "Press Return to close this window."
+  exit 1
+fi
+
+if ! command -v brew >/dev/null 2>&1; then
+  echo "Homebrew is required before setup can continue."
+  echo "Install it from: https://brew.sh"
+  echo
+  read -r -p "Press Return to close this window."
+  exit 1
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Python 3 is required before setup can continue."
+  echo "Install Python 3, then run this file again."
+  echo
+  read -r -p "Press Return to close this window."
+  exit 1
+fi
+
+if ! python3 - <<'PY'
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 9) else 1)
+PY
+then
+  echo "Python 3.9 or newer is required before setup can continue."
+  echo "Install a newer Python 3, then run this file again."
+  echo
+  read -r -p "Press Return to close this window."
+  exit 1
+fi
+
+mkdir -p "$HOME/Applications"
+
+if [ "$SOURCE_DIR" != "$INSTALL_DIR" ]; then
+  echo "Installing app files to:"
+  echo "  $INSTALL_DIR"
+  echo
+  mkdir -p "$INSTALL_DIR"
+  rsync -a \
+    --exclude ".DS_Store" \
+    --exclude ".venv" \
+    --exclude "__pycache__" \
+    --exclude "dist" \
+    "$SOURCE_DIR"/ "$INSTALL_DIR"/
+else
+  echo "App files are already in $INSTALL_DIR"
+  echo
+fi
+
+cd "$INSTALL_DIR"
+chmod +x ./*.sh ./*.command 2>/dev/null || true
+
+umask 077
+mkdir -p "$FLOWDICTATE_DIR"
+chmod 700 "$FLOWDICTATE_DIR"
+printf "%s\n" "$INSTALL_DIR" > "$CODE_PTR"
+chmod 600 "$CODE_PTR"
+
+echo "Installing dependencies and writing the default config..."
+echo
+setup_args=(--setup)
+if enabled "$ENABLE_LOCAL_REPAIR"; then
+  setup_args+=(--enable-local-repair)
+fi
+"$INSTALL_DIR/run.sh" "${setup_args[@]}"
+
+if enabled "$PRELOAD_MODELS"; then
+  echo
+  echo "Downloading and warming local models..."
+  echo "This can take a while the first time. Future launches use the local cache."
+  echo
+  "$INSTALL_DIR/run.sh" --preload-models
+fi
+
+create_app_bundle() {
+  if [ -d "$APP" ]; then
+    echo "Using existing app bundle:"
+    echo "  $APP"
+    echo
+    return 0
+  fi
+
+  echo "Creating app bundle:"
+  echo "  $APP"
+  echo
+
+  mkdir -p "$APP/Contents/MacOS"
+
+  cat > "$APP/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>frutflow</string>
+  <key>CFBundleExecutable</key>
+  <string>frutflow</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.frutflow.dictation</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>frutflow</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+  <key>LSMultipleInstancesProhibited</key>
+  <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>frutflow records your voice to transcribe it into text on-device.</string>
+</dict>
+</plist>
+PLIST
+
+  cat > "$APP/Contents/MacOS/frutflow" <<'LAUNCHER'
+#!/bin/bash
+# frutflow.app launcher. The bundle is the macOS permission owner; flow.py and
+# the virtualenv live outside the bundle so updating the app code does not
+# require re-signing the permissioned bundle.
+set -u
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+BUNDLE_PY="$HERE/python3"
+FLOWDICTATE_DIR="$HOME/.flowdictate"
+LOG="$FLOWDICTATE_DIR/flow.log"
+PTR="$FLOWDICTATE_DIR/code_dir"
+
+umask 077
+mkdir -p "$FLOWDICTATE_DIR"
+chmod 700 "$FLOWDICTATE_DIR"
+: >> "$LOG"
+chmod 600 "$LOG"
+
+CODE_DIR=""
+if [ -f "$PTR" ]; then
+  d="$(cat "$PTR")"
+  [ -n "$d" ] && [ -f "$d/flow.py" ] && CODE_DIR="$d"
+fi
+
+if [ -z "$CODE_DIR" ]; then
+  echo "[frutflow] Cannot find flow.py. Re-run Install frut Flow.command." >> "$LOG"
+  exit 1
+fi
+
+SP=""
+for cand in "$CODE_DIR"/.venv/lib/python*/site-packages; do
+  [ -d "$cand" ] && SP="$cand" && break
+done
+
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
+export DYLD_FALLBACK_LIBRARY_PATH="/opt/homebrew/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
+export PYTHONPATH="${SP:+$SP:}${PYTHONPATH:-}"
+export PYTHONNOUSERSITE=1
+
+cd "$CODE_DIR" || exit 1
+exec /usr/bin/arch -arm64 "$BUNDLE_PY" "$CODE_DIR/flow.py" >> "$LOG" 2>&1
+LAUNCHER
+
+  chmod +x "$APP/Contents/MacOS/frutflow"
+  python_path="$(python3 -c 'import sys; print(sys.executable)')"
+  cp "$python_path" "$APP/Contents/MacOS/python3"
+  chmod +x "$APP/Contents/MacOS/python3"
+
+  if command -v codesign >/dev/null 2>&1; then
+    codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+  fi
+}
+
+create_launch_agent() {
+  mkdir -p "$HOME/Library/LaunchAgents"
+  python3 - "$AGENT" "$INSTALL_DIR/watchdog.sh" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+agent_path = Path(sys.argv[1])
+watchdog = sys.argv[2]
+plist = {
+    "Label": "com.frutflow.dictation",
+    "ProgramArguments": ["/bin/bash", watchdog],
+    "RunAtLoad": True,
+    "KeepAlive": True,
+}
+with agent_path.open("wb") as f:
+    plistlib.dump(plist, f)
+PY
+
+  chmod 644 "$AGENT"
+  /bin/launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+  /bin/launchctl bootstrap "gui/$(id -u)" "$AGENT" >/dev/null 2>&1 || true
+  /bin/launchctl enable "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+}
+
+create_app_bundle
+
+if [ -x "$INSTALL_DIR/.venv/bin/python" ] && [ -f "$INSTALL_DIR/assets/frut-flow.icns" ]; then
+  "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/set-icon.py" >/dev/null 2>&1 || true
+fi
+
+create_launch_agent
+
+echo
+echo "Setup finished."
+echo
+echo "One-time permission step:"
+echo "Open System Settings > Privacy & Security and allow frutflow for:"
+echo "- Microphone"
+echo "- Accessibility"
+echo "- Input Monitoring"
+echo
+echo "If frutflow is not listed yet, press Return below to launch it once,"
+echo "then open Privacy & Security again."
+echo
+read -r -p "Press Return to start frut Flow now."
+
+/usr/bin/open -g "$APP"
+
+echo
+echo "frut Flow is installed."
+echo "You can start it later from:"
+echo "  $APP"
+echo
+read -r -p "Press Return to close this window."

@@ -17,14 +17,8 @@ pyobjc-framework-Cocoa>=10.0          # NSWorkspace + AX reads + in-process NSPa
 rapidfuzz>=3.0
 jellyfish>=1.0
 
-# Optional on-device cleanup (fully local — no cloud, no API key):
-#   cleanup = "local"  ->  pip install "mlx-lm>=0.28" "transformers>=4.44,<5"
-# Conservative, context-aware repair of MISHEARD words (homophones etc.) using a small
-# MLX instruct model that reuses the already-installed mlx runtime + shared HF cache.
-# The ~0.9 GB repair model downloads automatically on first use.
-# IMPORTANT: mlx-lm's metadata asks for transformers>=5, but 5.x BREAKS `import mlx_lm`
-# (incompatible tokenizer registration). Pin transformers<5 — verified 4.57.6; Parakeet
-# works on 4.x too. That pin conflicts with mlx-lm's declared metadata, so install the
-# two together with the explicit command above rather than expecting the resolver to.
-# mlx-lm>=0.28
-# transformers>=4.44,<5
+# On-device cleanup (fully local — no cloud, no API key). The friend installer
+# enables this and preloads the model; manual installs can still leave cleanup
+# set to "basic" in ~/.flowdictate/config.json if they do not want the extra model.
+mlx-lm>=0.28
+transformers>=4.44,<5
