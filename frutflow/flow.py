@@ -3752,9 +3752,9 @@ def _history_controller_class():
 
             ctrl_y = H - 62      # control row sits just below the traffic-light strip
 
-            # --- top bar: search field + Transcribe + Clear -------------------
+            # --- top bar: search field + Transcribe + Settings + Clear ---------
             search = NSSearchField.alloc().initWithFrame_(
-                NSMakeRect(PAD, ctrl_y, W - PAD * 2 - 216, 30))
+                NSMakeRect(PAD, ctrl_y, W - PAD * 2 - 260, 30))
             search.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
             search.setFont_(G.rounded_font(13))
             search.setPlaceholderString_("Search dictations")
@@ -3770,7 +3770,7 @@ def _history_controller_class():
 
             trans = NSButton.buttonWithTitle_target_action_(
                 "Transcribe", self, "openTranscribe:")
-            trans.setFrame_(NSMakeRect(W - PAD - 208, ctrl_y, 122, 30))
+            trans.setFrame_(NSMakeRect(W - PAD - 252, ctrl_y, 122, 30))
             trans.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
             trans.setBezelStyle_(1)   # NSBezelStyleRounded
             trans.setFont_(G.rounded_font(13))
@@ -3780,6 +3780,20 @@ def _history_controller_class():
                 trans.setImage_(timg)
                 trans.setImagePosition_(NSImageLeft)
             content.addSubview_(trans)
+
+            settings = NSButton.buttonWithTitle_target_action_(
+                "", self, "openSettings:")
+            settings.setFrame_(NSMakeRect(W - PAD - 122, ctrl_y, 36, 30))
+            settings.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
+            settings.setBezelStyle_(1)
+            settings.setFont_(G.rounded_font(13))
+            settings.setToolTip_("Settings")
+            simg = _phosphor_sf(
+                "gearshape", "Settings", point=15.0)
+            if simg is not None:
+                settings.setImage_(simg)
+                settings.setImagePosition_(NSImageLeft)
+            content.addSubview_(settings)
 
             clear = NSButton.buttonWithTitle_target_action_(
                 "Clear", self, "clearHistory:")
@@ -4283,6 +4297,12 @@ def _history_controller_class():
         def openTranscribe_(self, sender):
             try:
                 self._app._show_transcribe_window()
+            except Exception:  # noqa: BLE001
+                pass
+
+        def openSettings_(self, sender):
+            try:
+                self._app._show_settings_window()
             except Exception:  # noqa: BLE001
                 pass
 
