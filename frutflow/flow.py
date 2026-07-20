@@ -557,6 +557,34 @@ class Recorder:
         stream.start()
         return stream
 
+    def _reinitialize_locked(self) -> None:
+        """Refresh PortAudio while ``self._lock`` is held.
+
+        PortAudio caches the default input device.  That cache can be stale after
+        sleep or after switching AirPods, but terminating the process-global audio
+        library while another thread is opening a stream corrupts the live capture.
+        Keeping the reset behind the recorder's own lock makes the idle check and
+        reset one atomic operation.
+        """
+        self._sd._terminate()
+        self._sd._initialize()
+
+    def refresh_after_wake(self) -> bool:
+        """Refresh idle audio state after a *visible* wake.
+
+        Returns ``True`` when PortAudio was refreshed and ``False`` when a capture
+        was already active (the next ``start`` still has its retry path).  Never
+        tears the global audio library down underneath a live stream.
+        """
+        with self._lock:
+            if self.recording or self._stream is not None:
+                return False
+            try:
+                self._reinitialize_locked()
+                return True
+            except Exception:  # noqa: BLE001  start() retries again if necessary
+                return False
+
     def start(self) -> None:
         with self._lock:
             if self.recording:
@@ -570,8 +598,7 @@ class Recorder:
                 # (or the default input changed while we slept — AirPods etc.).
                 # Reinitialize the library once and retry before giving up.
                 try:
-                    self._sd._terminate()
-                    self._sd._initialize()
+                    self._reinitialize_locked()
                 except Exception:  # noqa: BLE001
                     pass
                 self._stream = self._open_stream()   # raises to caller if still bad
@@ -712,20 +739,56 @@ class LocalTranscriber:
         return " ".join(seg.text.strip() for seg in segments).strip()
 
 
-def _hf_repo_cached(repo_id: str) -> bool:
-    """True if a Hugging Face repo already has a local snapshot, so we can load it
-    fully offline (no network round-trip / no hang when disconnected)."""
+def _hf_cached_snapshot(repo_id: str) -> Path | None:
+    """Return a complete local Hugging Face snapshot, if one is cached.
+
+    Passing the snapshot directory directly to model loaders is stronger than
+    toggling ``HF_HUB_OFFLINE`` after importing ``huggingface_hub``: that package
+    reads its offline flag at import time, so the old approach could still perform
+    a metadata request on every app restart despite the weights being local.
+    """
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
         base = Path(HF_HUB_CACHE)
     except Exception:  # noqa: BLE001
         base = Path.home() / ".cache" / "huggingface" / "hub"
     folder = "models--" + repo_id.replace("/", "--")
-    snap = base / folder / "snapshots"
+    repo = base / folder
+    snap = repo / "snapshots"
     try:
-        return snap.is_dir() and any(snap.iterdir())
+        if not snap.is_dir():
+            return None
+        ref = repo / "refs" / "main"
+        if ref.is_file():
+            commit = ref.read_text(encoding="utf-8").strip()
+            preferred = snap / commit
+            if commit and preferred.is_dir():
+                return preferred
+        candidates = [p for p in snap.iterdir() if p.is_dir()]
+        return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
     except OSError:
-        return False
+        return None
+
+
+def _clear_mlx_cache() -> int:
+    """Return unused MLX/Metal buffers to macOS; return released bytes.
+
+    Parakeet's weights remain resident.  Only the allocator's reusable scratch
+    buffers are released.  On the default model a one-second inference retained
+    roughly 600--700 MiB here, which made long-idle/sleep paging substantially
+    worse on a 16 GiB Mac.
+    """
+    try:
+        # CPU-only faster-whisper users should not load the Metal runtime merely
+        # to discover that there is no MLX cache to clear.
+        mx = sys.modules.get("mlx.core")
+        if mx is None:
+            return 0
+        before = int(mx.get_cache_memory())
+        mx.clear_cache()
+        return before
+    except Exception:  # noqa: BLE001  CPU backend / older MLX
+        return 0
 
 
 class ParakeetTranscriber:
@@ -780,21 +843,13 @@ class ParakeetTranscriber:
 
         # Load fully offline when the weights are already cached, so startup never
         # blocks on the network; otherwise allow the one-time download.
-        prev_offline = os.environ.get("HF_HUB_OFFLINE")
-        if _hf_repo_cached(model_name):
-            os.environ["HF_HUB_OFFLINE"] = "1"
-        else:
+        cached = _hf_cached_snapshot(model_name)
+        if cached is None:
             print("[flow] first run: downloading Parakeet weights "
                   "(~2.3 GB, one time)...", file=sys.stderr, flush=True)
         print(f"[flow] loading Parakeet model '{model_name}' (MLX/GPU) ...",
               file=sys.stderr, flush=True)
-        try:
-            self.model = from_pretrained(model_name)
-        finally:
-            if prev_offline is None:
-                os.environ.pop("HF_HUB_OFFLINE", None)
-            else:
-                os.environ["HF_HUB_OFFLINE"] = prev_offline
+        self.model = from_pretrained(str(cached) if cached is not None else model_name)
 
         # A real inference on the MAIN thread here is REQUIRED, not merely an
         # optimization. It does two things: (1) compiles the Metal kernels so the
@@ -805,17 +860,30 @@ class ParakeetTranscriber:
         # any GPU work and does NOT initialize the stream (verified), so we feed a
         # faint noise clip. This always runs; `warmup` only controls the log line.
         try:
-            t0 = time.monotonic()
-            rng = np.random.default_rng(0)
-            self.transcribe((rng.standard_normal(SAMPLE_RATE) * 0.01).astype(np.float32))
+            elapsed = self.warm_up()
             if warmup:
-                print(f"[flow] model ready. (warm-up {time.monotonic()-t0:.1f}s)",
+                print(f"[flow] model ready. (warm-up {elapsed:.1f}s)",
                       file=sys.stderr, flush=True)
             else:
                 print("[flow] model ready.", file=sys.stderr, flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[flow] model ready. (warm-up issue: {e})",
                   file=sys.stderr, flush=True)
+
+    def warm_up(self) -> float:
+        """Run and discard one real decode, touching weights and compiled kernels.
+
+        Used both at startup and once after a visible wake so the user's first
+        dictation does not pay Metal page-in/kernel costs.  The deterministic faint
+        noise is intentionally non-silent; Parakeet short-circuits true silence.
+        """
+        t0 = time.monotonic()
+        rng = np.random.default_rng(0)
+        self.transcribe(
+            (rng.standard_normal(SAMPLE_RATE) * 0.01).astype(np.float32))
+        self._mx.synchronize()
+        _clear_mlx_cache()
+        return time.monotonic() - t0
 
     def transcribe(self, audio: np.ndarray, prompt: str | None = None,
                    hotwords: str | None = None) -> str:
@@ -933,6 +1001,7 @@ def build_transcriber(cfg: dict):
 VOCAB_PATH = CONFIG_DIR / "vocab.json"
 CORRECTIONS_PATH = CONFIG_DIR / "corrections.json"
 CORRECTION_EXAMPLES_PATH = CONFIG_DIR / "correction_examples.json"
+_PERSONALIZATION_LOCK = threading.RLock()
 
 # Ultra-common words add no value to the vocab prompt — skip them so only your
 # distinctive vocabulary is learned.
@@ -1058,36 +1127,42 @@ def learn_vocab(text: str) -> None:
     """Fold a finished dictation into the rolling word-frequency map."""
     if not text:
         return
-    vocab = _sanitize_vocab(_read_json(VOCAB_PATH, {}))
-    for w in _WORD_RE.findall(text):
-        lw = w.lower()
-        if lw in _COMMON_WORDS:
-            continue
-        entry = vocab.get(lw) or {"count": 0, "form": w}
-        entry["count"] = int(entry.get("count", 0)) + 1
-        # Prefer a capitalized surface form (likely a proper-noun spelling).
-        if w[:1].isupper() and not str(entry.get("form", ""))[:1].isupper():
-            entry["form"] = w
-        vocab[lw] = entry
-    # Bound the file: keep the 400 most-used entries.
-    if len(vocab) > 400:
-        vocab = dict(sorted(vocab.items(),
-                            key=lambda kv: kv[1].get("count", 0),
-                            reverse=True)[:400])
-    try:
-        _write_private_json(VOCAB_PATH, vocab)
-    except OSError:
-        pass
+    # Reconcile timers and the transcription worker can both learn at once.
+    # Serialize the read-modify-write so one update cannot erase the other.
+    with _PERSONALIZATION_LOCK:
+        vocab = _sanitize_vocab(_read_json(VOCAB_PATH, {}))
+        for w in _WORD_RE.findall(text):
+            lw = w.lower()
+            if lw in _COMMON_WORDS:
+                continue
+            entry = vocab.get(lw) or {"count": 0, "form": w}
+            entry["count"] = int(entry.get("count", 0)) + 1
+            # Prefer a capitalized surface form (likely a proper-noun spelling).
+            if w[:1].isupper() and not str(entry.get("form", ""))[:1].isupper():
+                entry["form"] = w
+            vocab[lw] = entry
+        # Bound the file: keep the 400 most-used entries.
+        if len(vocab) > 400:
+            vocab = dict(sorted(vocab.items(),
+                                key=lambda kv: kv[1].get("count", 0),
+                                reverse=True)[:400])
+        try:
+            _write_private_json(VOCAB_PATH, vocab)
+        except OSError:
+            pass
 
 
 def load_corrections() -> dict:
     """{'misheard': 'correct'} — whole-word, case-insensitive swaps."""
-    return _sanitize_corrections(_read_json(CORRECTIONS_PATH, {}))
+    with _PERSONALIZATION_LOCK:
+        return _sanitize_corrections(_read_json(CORRECTIONS_PATH, {}))
 
 
 def load_correction_examples() -> dict:
     """Optional correction metadata used as relevant local-repair examples."""
-    return _sanitize_correction_examples(_read_json(CORRECTION_EXAMPLES_PATH, {}))
+    with _PERSONALIZATION_LOCK:
+        return _sanitize_correction_examples(
+            _read_json(CORRECTION_EXAMPLES_PATH, {}))
 
 
 def add_correction(heard: str, correct: str, *, context: str = "",
@@ -1100,21 +1175,22 @@ def add_correction(heard: str, correct: str, *, context: str = "",
     app = _clean_text_value(app, max_chars=80)
     if not heard or not correct or heard == correct:
         return
-    corr = load_corrections()
-    corr[heard] = correct
-    _write_private_json(CORRECTIONS_PATH, corr, indent=2)
-    examples = load_correction_examples()
-    prev = examples.get(heard, {})
-    if prev.get("correct") != correct:
-        prev = {}
-    examples[heard] = {
-        "correct": correct,
-        "context": context or prev.get("context", ""),
-        "app": app or prev.get("app", ""),
-        "count": int(prev.get("count", 0)) + 1,
-        "updated": time.time(),
-    }
-    _write_private_json(CORRECTION_EXAMPLES_PATH, examples, indent=2)
+    with _PERSONALIZATION_LOCK:
+        corr = load_corrections()
+        corr[heard] = correct
+        _write_private_json(CORRECTIONS_PATH, corr, indent=2)
+        examples = load_correction_examples()
+        prev = examples.get(heard, {})
+        if prev.get("correct") != correct:
+            prev = {}
+        examples[heard] = {
+            "correct": correct,
+            "context": context or prev.get("context", ""),
+            "app": app or prev.get("app", ""),
+            "count": int(prev.get("count", 0)) + 1,
+            "updated": time.time(),
+        }
+        _write_private_json(CORRECTION_EXAMPLES_PATH, examples, indent=2)
     if not silent:
         print(f"[flow] correction saved: '{heard}' -> '{correct}'  ({CORRECTIONS_PATH})")
         print("[flow] (takes effect on your next dictation — no restart needed)")
@@ -1131,27 +1207,28 @@ def update_correction(old_heard: str, heard: str, correct: str, *,
     if not old_heard or not heard or not correct or heard == correct:
         return False
 
-    corr = load_corrections()
-    if old_heard in corr and old_heard != heard:
-        corr.pop(old_heard, None)
-    corr[heard] = correct
-    _write_private_json(CORRECTIONS_PATH, corr, indent=2)
+    with _PERSONALIZATION_LOCK:
+        corr = load_corrections()
+        if old_heard in corr and old_heard != heard:
+            corr.pop(old_heard, None)
+        corr[heard] = correct
+        _write_private_json(CORRECTIONS_PATH, corr, indent=2)
 
-    examples = load_correction_examples()
-    prev = (examples.pop(old_heard, {}) if old_heard != heard
-            else examples.get(heard, {}))
-    try:
-        count = int(prev.get("count", 1))
-    except (TypeError, ValueError, OverflowError):
-        count = 1
-    examples[heard] = {
-        "correct": correct,
-        "context": context,
-        "app": app,
-        "count": max(1, min(count, 1_000_000)),
-        "updated": time.time(),
-    }
-    _write_private_json(CORRECTION_EXAMPLES_PATH, examples, indent=2)
+        examples = load_correction_examples()
+        prev = (examples.pop(old_heard, {}) if old_heard != heard
+                else examples.get(heard, {}))
+        try:
+            count = int(prev.get("count", 1))
+        except (TypeError, ValueError, OverflowError):
+            count = 1
+        examples[heard] = {
+            "correct": correct,
+            "context": context,
+            "app": app,
+            "count": max(1, min(count, 1_000_000)),
+            "updated": time.time(),
+        }
+        _write_private_json(CORRECTION_EXAMPLES_PATH, examples, indent=2)
     return True
 
 
@@ -1666,6 +1743,12 @@ def learn_from_edit(el, pasted: str, *, max_learn: int = 3) -> int:
     current = _ax_read_value(el)
     if not current or not pasted:
         return 0
+    # Some apps expose an entire multi-megabyte document as the focused field.
+    # Diffing all of it against one short dictation blocks a learning thread and
+    # produces meaningless matches.  Until an app exposes a usable text range, skip
+    # oversized fields; dictation itself is never delayed or affected.
+    if len(current) > 16_384:
+        return 0
     pasted_words = _NAME_RE.findall(pasted)
     cur_words = _NAME_RE.findall(current)
     if not pasted_words or not cur_words:
@@ -1888,26 +1971,19 @@ class _LocalRepairer:
         self.repo_id = repo_id
         self._generate = generate
         self._make_sampler = make_sampler
-        prev_offline = os.environ.get("HF_HUB_OFFLINE")
-        if _hf_repo_cached(repo_id):
-            os.environ["HF_HUB_OFFLINE"] = "1"
-        else:
+        cached = _hf_cached_snapshot(repo_id)
+        if cached is None:
             print(f"[flow] first run: downloading on-device repair model "
                   f"'{repo_id}' (~1 GB, one time)...", file=sys.stderr, flush=True)
         print(f"[flow] loading on-device repair model '{repo_id}' (MLX/GPU) ...",
               file=sys.stderr, flush=True)
-        try:
-            self.model, self.tokenizer = load(repo_id)
-        finally:
-            if prev_offline is None:
-                os.environ.pop("HF_HUB_OFFLINE", None)
-            else:
-                os.environ["HF_HUB_OFFLINE"] = prev_offline
+        self.model, self.tokenizer = load(
+            str(cached) if cached is not None else repo_id)
         # Bind MLX's default GPU stream + compile kernels on THIS thread, exactly like
         # the Parakeet warm-up — otherwise the first real generate on a worker thread
         # raises "no Stream(gpu, 0) in current thread".
         try:
-            self.generate("hi", max_tokens=1, temp=0.0)
+            self.warm_up()
             print("[flow] repair model ready.", file=sys.stderr, flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[flow] repair model ready. (warm-up issue: {e})",
@@ -1923,6 +1999,17 @@ class _LocalRepairer:
             # API-drift guard: an mlx-lm without make_sampler / the sampler= kwarg.
             return self._generate(self.model, self.tokenizer, prompt,
                                   max_tokens=max_tokens, verbose=False)
+
+    def warm_up(self) -> float:
+        t0 = time.monotonic()
+        self.generate("hi", max_tokens=1, temp=0.0)
+        try:
+            import mlx.core as mx
+            mx.synchronize()
+        except Exception:  # noqa: BLE001
+            pass
+        _clear_mlx_cache()
+        return time.monotonic() - t0
 
 
 def _get_local_repairer(repo_id: str) -> "_LocalRepairer":
@@ -2003,21 +2090,25 @@ def local_repair(text: str, cfg: dict, context: dict | None = None,
     repo_id = cfg.get("local_repair_model",
                       DEFAULT_CONFIG["local_repair_model"])
     temp = float(cfg.get("local_repair_temperature", 0.0))
-    rep = _get_local_repairer(repo_id)   # lazy build (may download on first use)
-
-    system = _LOCAL_REPAIR_SYSTEM + _context_blocks(context)
-    messages = ([{"role": "system", "content": system}]
-                + _LOCAL_REPAIR_SHOTS
-                + [{"role": "user", "content": text}])
-    prompt = rep.tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=False)
     max_tokens = min(1024, len(text) // 2 + 96)
+
+    def _run_repair() -> str:
+        # Construction can download/load and warm an MLX model, so it belongs
+        # under the same GPU lock as generation—not just the final generate call.
+        rep = _get_local_repairer(repo_id)
+        system = _LOCAL_REPAIR_SYSTEM + _context_blocks(context)
+        messages = ([{"role": "system", "content": system}]
+                    + _LOCAL_REPAIR_SHOTS
+                    + [{"role": "user", "content": text}])
+        prompt = rep.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False)
+        return rep.generate(prompt, max_tokens=max_tokens, temp=temp)
 
     if gpu_lock is not None:
         with gpu_lock:
-            out = rep.generate(prompt, max_tokens=max_tokens, temp=temp)
+            out = _run_repair()
     else:
-        out = rep.generate(prompt, max_tokens=max_tokens, temp=temp)
+        out = _run_repair()
 
     out = (out or "").strip()
     # The model sometimes wraps its answer in quotes/backticks despite instructions.
@@ -2082,15 +2173,6 @@ def _pasteboard():
         from AppKit import NSPasteboard
         _NSPB = NSPasteboard.generalPasteboard()
     return _NSPB
-
-
-def _clip_get() -> str | None:
-    """Current clipboard text in-process, or None if it isn't text (image, etc.)."""
-    try:
-        from AppKit import NSPasteboardTypeString
-        return _pasteboard().stringForType_(NSPasteboardTypeString)
-    except Exception:  # noqa: BLE001
-        return _pbpaste()
 
 
 def _clip_set(text: str) -> int:
@@ -2399,10 +2481,15 @@ def play(sound: str, cfg: dict, volume: float = 1.0) -> None:
         return
     path = f"/System/Library/Sounds/{sound}.aiff"
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [AFPLAY, "-v", str(volume), path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        # Popen objects are not reaped automatically.  Keeping one tiny waiter per
+        # short system sound prevents defunct afplay children accumulating for the
+        # lifetime of this menu-bar process.
+        threading.Thread(target=proc.wait, daemon=True,
+                         name="frutflow-sound-reaper").start()
     except Exception:  # noqa: BLE001
         pass
 
@@ -2495,12 +2582,19 @@ AGENT_LABEL = "com.frutflow.dictation"
 def _relaunch_app_detached(delay: float = 1.0) -> None:
     """Launch frutflow.app after this process exits, without a shell."""
     code = (
-        "import subprocess, sys, time\n"
+        "import os, subprocess, sys, time\n"
         "time.sleep(float(sys.argv[1]))\n"
+        "log = sys.argv[3]\n"
+        "try:\n"
+        "    if os.path.getsize(log) >= 5 * 1024 * 1024:\n"
+        "        os.replace(log, log + '.1')\n"
+        "except OSError:\n"
+        "    pass\n"
         "subprocess.Popen(['/usr/bin/open', '-g', sys.argv[2]])\n"
     )
     subprocess.Popen(
-        [sys.executable, "-c", code, str(delay), APP_BUNDLE_PATH],
+        [sys.executable, "-c", code, str(delay), APP_BUNDLE_PATH,
+         str(CONFIG_DIR / "flow.log")],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -2897,10 +2991,15 @@ def _paint(layer, which, dyn):
             # before re-registering. Keeps the registry bounded; behavior is
             # unchanged (last write already won). Identity via `is` on the
             # deref'd object avoids CALayer's own equality semantics.
-            _THEMED_LAYERS[:] = [
-                (r, w, d) for (r, w, d) in _THEMED_LAYERS
-                if not (w == which and r() is layer)
-            ]
+            live = []
+            for r, w, d in _THEMED_LAYERS:
+                existing = r()
+                if existing is None:          # prune dead rebuilt-card layers now
+                    continue
+                if w == which and existing is layer:
+                    continue                  # replace this exact registration
+                live.append((r, w, d))
+            _THEMED_LAYERS[:] = live
             _THEMED_LAYERS.append((objc.WeakRef(layer), which, dyn))
         except Exception:  # noqa: BLE001
             pass   # can't register -> build-time color still set, just no live re-theme
@@ -5037,7 +5136,7 @@ def _hud_controller_class():
         # -- actions ---------------------------------------------------------
         def stop_(self, _sender):
             try:
-                self._app._end()
+                self._app._request_capture(False)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -7781,10 +7880,10 @@ def _popover_controller_class():
         def toggleRecord_(self, _sender):
             try:
                 app = self._app
-                if getattr(app, "recorder", None) and app.recorder.recording:
-                    app._end()
-                else:
-                    app._begin()
+                active = bool(getattr(app, "_capture_requested", False)
+                              or (getattr(app, "recorder", None)
+                                  and app.recorder.recording))
+                app._request_capture(not active)
                 self._apply_status_to_vc()
             except Exception:  # noqa: BLE001
                 pass
@@ -7815,6 +7914,17 @@ def _popover_controller_class():
     return _POPOVER_CTRL_CLASS
 
 
+def _display_is_awake() -> bool:
+    """Whether the main display is visibly active (not a maintenance DarkWake)."""
+    try:
+        import Quartz
+        display = Quartz.CGMainDisplayID()
+        return (bool(Quartz.CGDisplayIsActive(display))
+                and not bool(Quartz.CGDisplayIsAsleep(display)))
+    except Exception:  # noqa: BLE001  recover rather than stay broken on old macOS
+        return True
+
+
 class FlowApp:
     def __init__(self, cfg: dict, transcriber):
         self.cfg = cfg
@@ -7834,16 +7944,33 @@ class FlowApp:
         self._lock_tap_ok = False      # did the lock tap create+enable? (feature is unavailable if False)
         self._locked = False           # hold-mode hands-free latch (guarded by _state_lock); reset in _end()
         self._loop = None         # the main CFRunLoop (set in run())
-        self._last_recover = 0.0  # debounce for _recover_after_wake
+        # Wake signals arrive in clusters (DidWake, ScreensDidWake, clock skew).
+        # Debounce on wall time because monotonic time pauses during macOS sleep.
+        self._last_recover_wall = 0.0
+        self._last_runtime_recover_wall = 0.0
+        self._wake_recovery_pending = False
+        self._wake_pending_reason = ""
+        self._tap_lifecycle_lock = threading.Lock()
         self._tap_disabled_streak = 0  # consecutive watchdog checks finding it dead
         self._activity_token = None    # NSActivity assertion (App Nap opt-out)
-        self._wake_observer = None     # NSWorkspace DidWake token
-        self._wake_observer2 = None    # NSWorkspace ScreensDidWake token
+        self._wake_observers = []      # retained NSWorkspace notification tokens
+        self._capture_thread = None
+        self._transcription_thread = None
+        self._watchdog_thread = None
         # One lock guards the recording/processing state transitions, which are
         # touched from both the Quartz callback thread and the worker thread.
         self._state_lock = threading.RLock()
         self._record_started = 0.0   # monotonic time the current capture began
         self._warned_capture = False  # played the pre-cap warning for this capture?
+        # Audio open/close can block while CoreAudio settles after wake.  A single
+        # serial control worker keeps that work completely out of the Quartz event
+        # tap while preserving begin/end ordering for very short key presses.
+        self._capture_q = queue.SimpleQueue()
+        self._capture_requested = False
+        self._capture_generation = 0
+        self._audio_refresh_pending = False
+        self._audio_refresh_generation = 0
+        self._audio_refresh_timer = None
         self._MAX_RECORD_SECONDS = float(cfg.get("max_record_seconds", 120))
         self._warn_before = float(cfg.get("warn_before_max_seconds", 10))
         self._max_processing = float(cfg.get("max_processing_seconds", 120))
@@ -7854,12 +7981,15 @@ class FlowApp:
         # dictations used to be lost). The worker serializes transcription + paste so
         # two clips never overlap.
         self._work_q: queue.Queue = queue.Queue(maxsize=5)
+        self._wake_warm_token = object()
+        self._wake_warm_event = threading.Event()
         self._processing_started: float | None = None  # set while the worker runs
         self._proc_warned = False
         # Auto-learn-from-edits: a handle on the field we last pasted into, so we
         # can diff your correction against it. None when nothing is pending.
         self._pending_learn: dict | None = None
         self._learn_generation = 0
+        self._learn_timer: threading.Timer | None = None
         # Voice-undo ("never mind"): a stack of (EXACT string we inserted, app name,
         # focused AX element), most recent last. Saying an undo phrase pops the top
         # and backspaces over it only when focus still appears to be in that field.
@@ -7923,10 +8053,11 @@ class FlowApp:
             self._locked = False
             self._last_toggle = 0.0
             stop_hold_recording = (
-                self.cfg.get("mode") == "hold" and self.recorder.recording)
+                self.cfg.get("mode") == "hold"
+                and (self.recorder.recording or self._capture_requested))
 
         if stop_hold_recording:
-            threading.Thread(target=self._end, daemon=True).start()
+            self._request_capture(False)
         print(f"[flow] hotkey changed: {old} -> {name} "
               f"(vks={sorted(target_vks)}).", flush=True)
         return True
@@ -7969,18 +8100,64 @@ class FlowApp:
 
     # -- recording lifecycle -------------------------------------------------
 
-    def _begin(self) -> None:
+    def _request_capture(self, begin: bool) -> None:
+        """Queue a capture transition without blocking the event-tap callback."""
+        begin = bool(begin)
+        with self._state_lock:
+            if begin == self._capture_requested:
+                return
+            self._capture_requested = begin
+            self._capture_generation += 1
+            generation = self._capture_generation
+            if not begin:
+                self._locked = False
+        self._capture_q.put((generation, begin))
+
+    def _capture_worker(self) -> None:
+        """Run microphone open/close transitions serially off the Quartz tap."""
+        while True:
+            transition = self._capture_q.get()
+            if transition is None:
+                return
+            if isinstance(transition, tuple):
+                generation, begin = transition
+            else:  # compatibility with older in-memory callers/tests
+                generation, begin = None, bool(transition)
+            try:
+                if begin:
+                    # Process every accepted transition in FIFO order. Re-reading
+                    # only the latest desired state here would collapse a very fast
+                    # press/release into no recording at all.
+                    self._begin(generation=generation)
+                else:
+                    self._end(generation=generation)
+            except Exception as e:  # noqa: BLE001  keep control worker alive
+                print(f"[flow] capture worker error: {e}", flush=True)
+
+    def _begin(self, *, generation: int | None = None) -> None:
         with self._state_lock:
             if self.recorder.recording:
                 return
-            try:
-                self.recorder.start()
-            except Exception as e:  # noqa: BLE001  mic failed even after reinit
-                print(f"[flow] could not open the microphone: {e} — try again "
-                      "in a moment (if it persists, check System Settings ▸ "
-                      "Privacy ▸ Microphone or restart früt Flow).", flush=True)
-                play("Basso", self.cfg)
-                return
+        # CoreAudio may block while devices settle after wake. The capture worker
+        # already serializes start/stop, so do not hold the app-state lock that the
+        # Quartz callback needs merely to enqueue the matching key-up.
+        try:
+            self.recorder.start()
+        except Exception as e:  # noqa: BLE001  mic failed even after reinit
+            with self._state_lock:
+                # Only roll back the desired state if this failed transition is
+                # still the newest one. A later release/re-press may already be
+                # queued while CoreAudio was blocking.
+                if (generation is None
+                        or generation == self._capture_generation):
+                    self._capture_requested = False
+            print(f"[flow] could not open the microphone: {e} — try again "
+                  "in a moment (if it persists, check System Settings ▸ "
+                  "Privacy ▸ Microphone or restart früt Flow).", flush=True)
+            play("Basso", self.cfg)
+            self._refresh_audio_if_pending()
+            return
+        with self._state_lock:
             self._record_started = time.monotonic()
             self._warned_capture = False
         play("Tink", self.cfg)
@@ -7995,15 +8172,28 @@ class FlowApp:
             threading.Thread(target=self._reconcile_edit_learning,
                              daemon=True).start()
 
-    def _end(self) -> None:
+    def _end(self, *, generation: int | None = None) -> None:
         with self._state_lock:
             # Authoritative single reset point for the hands-free latch: clear it
             # BEFORE the recording check so every _end() (even the no-op path) leaves
             # the lock off — a locked-but-not-recording state can never get stuck.
             self._locked = False
+            if (generation is None
+                    or generation == self._capture_generation):
+                self._capture_requested = False
             if not self.recorder.recording:
-                return
-            audio = self.recorder.stop()
+                idle = True
+            else:
+                idle = False
+        if idle:
+            self._refresh_audio_if_pending()
+            return
+        # stream.stop/close and the final NumPy concatenate can both be slow; keep
+        # them off the state lock for the same event-tap responsiveness reason.
+        audio = self.recorder.stop()
+        with self._state_lock:
+            self._record_started = 0.0
+        self._refresh_audio_if_pending()
         play("Pop", self.cfg)
         if audio is None or len(audio) / SAMPLE_RATE < self.cfg["min_seconds"]:
             print("[flow] (too short, ignored)")
@@ -8011,7 +8201,7 @@ class FlowApp:
         # Hand the clip to the single transcription worker and return immediately —
         # capture is never blocked by a slow transcribe.
         try:
-            self._work_q.put_nowait(audio)
+            self._work_q.put_nowait((audio, time.monotonic()))
         except queue.Full:
             print("[flow] transcription queue is full — dropping this clip so "
                   "memory cannot grow without bound. Restart früt Flow if text "
@@ -8028,14 +8218,30 @@ class FlowApp:
         """Single long-lived consumer of the capture queue. Serializes transcription
         and pasting so two clips never overlap, without ever blocking capture."""
         while True:
-            audio = self._work_q.get()
+            item = self._work_q.get()
+            if item is self._wake_warm_token:
+                try:
+                    if self._wake_warm_event.is_set():
+                        self._warm_models_after_wake()
+                finally:
+                    self._work_q.task_done()
+                continue
             try:
-                if audio is None:
-                    continue   # shutdown sentinel (unused today)
+                if item is None:
+                    return
+                # If a warm token could not be queued because captures filled the
+                # bounded queue, warm before the first post-wake clip anyway.
+                if self._wake_warm_event.is_set():
+                    self._warm_models_after_wake()
+                if isinstance(item, tuple):
+                    audio, enqueued_at = item
+                else:  # compatibility with any tests/older in-memory producer
+                    audio, enqueued_at = item, time.monotonic()
+                queue_wait = max(0.0, time.monotonic() - enqueued_at)
                 with self._state_lock:
                     self._processing_started = time.monotonic()
                     self._proc_warned = False
-                self._process(audio)
+                self._process(audio, queue_wait=queue_wait)
             except Exception as e:  # noqa: BLE001  never let the worker thread die
                 print(f"[flow] worker error: {e}", flush=True)
             finally:
@@ -8050,10 +8256,113 @@ class FlowApp:
                     self._set_status("🎙️", "● Idle")
                 self._work_q.task_done()
 
-    def _process(self, audio: np.ndarray) -> None:
+    def _schedule_audio_refresh(self) -> None:
+        """Refresh PortAudio after devices settle, or immediately after capture."""
+        with self._state_lock:
+            old_timer = self._audio_refresh_timer
+            self._audio_refresh_generation += 1
+            generation = self._audio_refresh_generation
+            self._audio_refresh_pending = True
+            timer = threading.Timer(
+                1.0, self._refresh_audio_if_pending,
+                kwargs={"generation": generation})
+            timer.daemon = True
+            self._audio_refresh_timer = timer
+        if old_timer is not None:
+            old_timer.cancel()
+        timer.start()
+
+    def _refresh_audio_if_pending(
+            self, generation: int | None = None) -> bool:
+        """Attempt one pending wake refresh without racing an active recording.
+
+        A timer that finds the mic busy leaves the request pending. The serial
+        capture worker calls this again immediately after stop, so a user who
+        dictates during the first post-wake second cannot lose the refresh.
+        """
+        with self._state_lock:
+            if (generation is not None
+                    and generation != self._audio_refresh_generation):
+                return False
+            if not self._audio_refresh_pending:
+                if self._audio_refresh_timer is threading.current_thread():
+                    self._audio_refresh_timer = None
+                return False
+            claimed_generation = self._audio_refresh_generation
+            # Claim this generation so a timer and capture stop cannot both reset
+            # the process-global PortAudio state.
+            self._audio_refresh_pending = False
+        refreshed = self.recorder.refresh_after_wake()
+        active = bool(self.recorder.recording or self.recorder._stream is not None)
+        timer_to_cancel = None
+        with self._state_lock:
+            if claimed_generation == self._audio_refresh_generation:
+                self._audio_refresh_pending = bool(not refreshed and active)
+                if refreshed or not active:
+                    timer_to_cancel = self._audio_refresh_timer
+                    self._audio_refresh_timer = None
+            if self._audio_refresh_timer is threading.current_thread():
+                self._audio_refresh_timer = None
+        if (timer_to_cancel is not None
+                and timer_to_cancel is not threading.current_thread()):
+            timer_to_cancel.cancel()
+        if not refreshed and not active:
+            print("[flow] post-wake audio refresh failed; microphone start will "
+                  "retry device initialization if needed.", flush=True)
+        return refreshed
+
+    def _request_model_warmup(self) -> None:
+        """Coalesce a post-wake warmup onto the long-lived model worker."""
+        if (not callable(getattr(self.transcriber, "warm_up", None))
+                and _LOCAL_REPAIRER is None):
+            return
+        if self._wake_warm_event.is_set():
+            return
+        self._wake_warm_event.set()
+        # A queued audio clip already wakes the worker and checks the event. Only
+        # spend one bounded-queue slot on a token when the worker would otherwise
+        # be asleep; never reduce the five-clip capture backlog capacity.
+        if not self._work_q.empty():
+            return
+        try:
+            self._work_q.put_nowait(self._wake_warm_token)
+        except queue.Full:
+            # The worker checks the event before every real clip, so no work is lost.
+            pass
+
+    def _warm_models_after_wake(self) -> None:
+        """Re-page/compile loaded MLX models after one visible wake."""
+        if not self._wake_warm_event.is_set():
+            return
+        self._wake_warm_event.clear()
+        t0 = time.monotonic()
+        try:
+            with self._transcribe_lock:
+                warm = getattr(self.transcriber, "warm_up", None)
+                if callable(warm):
+                    warm()
+                # Do not load the optional repair model just for a wake; if it is
+                # already resident, touch it under the same GPU lock.
+                rep = _LOCAL_REPAIRER
+                if rep is not None:
+                    rep.warm_up()
+                released = _clear_mlx_cache()
+            print("[flow] post-wake model ready "
+                  f"({time.monotonic() - t0:.2f}s; "
+                  f"released {released / (1024 * 1024):.0f} MiB cache).",
+                  flush=True)
+        except Exception as e:  # noqa: BLE001  real dictation can still retry
+            with self._transcribe_lock:
+                _clear_mlx_cache()
+            print(f"[flow] post-wake model warm-up failed ({e}); "
+                  "the next dictation will retry normally.", flush=True)
+
+    def _process(self, audio: np.ndarray, *, queue_wait: float = 0.0) -> None:
         text = ""
         recorded = False   # guard: record each dictation to history at most once
         audio_duration = len(audio) / SAMPLE_RATE if audio is not None else 0.0
+        total_started = time.monotonic()
+        model_seconds = cleanup_seconds = insert_seconds = 0.0
         try:
             print("[flow] transcribing...")
             self._set_status("⏳", "● Transcribing…")
@@ -8071,12 +8380,16 @@ class FlowApp:
             # Only pay for context capture when a cleanup model will use it (tone hint).
             context = ({"app": _focused_app_name()}
                        if self.cfg.get("cleanup") == "local" else None)
+            stage_started = time.monotonic()
             with self._transcribe_lock:   # never overlap with the file-transcribe window
                 raw = self.transcriber.transcribe(audio, prompt=prompt,
                                                   hotwords=hotwords)
+            model_seconds = time.monotonic() - stage_started
             # gpu_lock serializes any on-device repair (cleanup=="local") against a
             # concurrent file-transcribe on the shared GPU; ignored for other modes.
+            stage_started = time.monotonic()
             text = clean(raw, self.cfg, context, gpu_lock=self._transcribe_lock)
+            cleanup_seconds = time.monotonic() - stage_started
             if not text:
                 print("[flow] (no speech detected)")
                 return
@@ -8094,7 +8407,9 @@ class FlowApp:
             # Natural merge: lead with a space so the dictation doesn't glue
             # onto whatever word is already left of the cursor.
             to_insert = (" " + text) if self.cfg.get("auto_space", True) else text
+            stage_started = time.monotonic()
             delivered = insert_text(to_insert, self.cfg)
+            insert_seconds = time.monotonic() - stage_started
             # Close the perception loop: a subtle (quiet) cue when text actually
             # lands, a distinct, louder one when it only made it to the clipboard.
             if delivered:
@@ -8140,6 +8455,18 @@ class FlowApp:
                 # app=None: _focused_app_name may be unhappy here; record never raises.
                 if not recorded:
                     self._record_history(text, app=None, delivered=False)
+        finally:
+            # MLX's allocator is process-global. Serialize cache maintenance with
+            # file transcription and optional repair-model inference too.
+            with self._transcribe_lock:
+                released = _clear_mlx_cache()
+            print("[flow] timing "
+                  f"total={time.monotonic() - total_started:.2f}s "
+                  f"queue={queue_wait:.2f}s model={model_seconds:.2f}s "
+                  f"cleanup={cleanup_seconds:.2f}s insert={insert_seconds:.2f}s "
+                  f"audio={audio_duration:.2f}s "
+                  f"cache={released / (1024 * 1024):.0f}MiB",
+                  flush=True)
 
     def _record_history(self, text: str, app: str | None = None,
                         delivered: bool = True) -> None:
@@ -8154,8 +8481,9 @@ class FlowApp:
         into, onto the undo stack (bounded), so a later 'never mind' can backspace it
         away — and can refuse if focus has since moved to a different app."""
         el = _ax_focused_element()
+        app_name = _focused_app_name()
         with self._state_lock:
-            self._undo_stack.append((inserted, _focused_app_name(), el))
+            self._undo_stack.append((inserted, app_name, el))
             if len(self._undo_stack) > 25:
                 self._undo_stack.pop(0)
 
@@ -8259,6 +8587,10 @@ class FlowApp:
         # We just removed it, so don't let the auto-learner mine the deleted text.
         with self._state_lock:
             self._pending_learn = None
+            learn_timer = self._learn_timer
+            self._learn_timer = None
+        if learn_timer is not None:
+            learn_timer.cancel()
         # It's gone from the target app, so drop it from History too (best-effort).
         pop_history_matching(tail)
         play("Bottle", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
@@ -8272,21 +8604,27 @@ class FlowApp:
         el = _ax_focused_element()
         if el is None:
             return   # app doesn't expose its text field; nothing to learn from
+        try:
+            win = float(self.cfg.get("learn_window_seconds", 20))
+        except Exception:  # noqa: BLE001
+            win = 20.0
         with self._state_lock:
+            old_timer = self._learn_timer
             self._learn_generation += 1
             generation = self._learn_generation
             self._pending_learn = {
                 "el": el, "pasted": pasted, "done": False,
                 "generation": generation,
             }
-        try:
-            win = float(self.cfg.get("learn_window_seconds", 20))
-            t = threading.Timer(win, self._reconcile_edit_learning,
-                                kwargs={"generation": generation})
-            t.daemon = True
-            t.start()
-        except Exception:  # noqa: BLE001
-            pass
+            timer = threading.Timer(
+                max(0.0, win), self._reconcile_edit_learning,
+                kwargs={"generation": generation})
+            timer.daemon = True
+            self._learn_timer = timer
+        if old_timer is not None:
+            old_timer.cancel()
+        if timer is not None:
+            timer.start()
 
     def _reconcile_edit_learning(self, generation: int | None = None) -> None:
         """Finalize learning for the last paste: diff your edits, learn the
@@ -8299,6 +8637,10 @@ class FlowApp:
                 return
             pend["done"] = True
             self._pending_learn = None
+            timer = self._learn_timer
+            self._learn_timer = None
+        if timer is not None and timer is not threading.current_thread():
+            timer.cancel()
         try:
             learn_from_edit(pend["el"], pend["pasted"])
         except Exception:  # noqa: BLE001  learning must never break dictation
@@ -8311,16 +8653,13 @@ class FlowApp:
 
     def _on_key_down(self) -> None:
         if self.cfg["mode"] == "hold":
-            self._begin()
+            self._request_capture(True)
         else:  # toggle
             now = time.monotonic()
             if now - self._last_toggle < 0.3:   # debounce key auto-repeat
                 return
             self._last_toggle = now
-            if self.recorder.recording:
-                self._end()
-            else:
-                self._begin()
+            self._request_capture(not self._capture_requested)
 
     def _on_key_up(self) -> None:
         # When LOCKED, releasing the hotkey must NOT stop the capture — that's the
@@ -8328,7 +8667,7 @@ class FlowApp:
         # normal release and the drift-resync path in _handle_event funnel through,
         # so the latch guard lives here (not at the call sites).
         if self.cfg["mode"] == "hold" and not self._locked:
-            self._end()
+            self._request_capture(False)
 
     def _watchdog_loop(self) -> None:
         """Background guardian on its own daemon thread. Jobs:
@@ -8341,12 +8680,10 @@ class FlowApp:
             so the hotkey goes dead with no sound and no text until restart. We
             poll CGEventTapIsEnabled and re-enable it; if the re-enable doesn't
             STICK (still dead next check), we escalate to a full tap rebuild.
-        (3) DETECT SLEEP/WAKE by clock skew: time.monotonic() (mach_absolute_time)
-            pauses while the Mac sleeps but time.time() doesn't, so after a
-            lid-close/open the wall clock jumps far ahead of the monotonic clock
-            between two loop iterations. On detection we rebuild the tap and
-            refresh the audio stack — the belt to the wake-notification's braces,
-            for the case where the notification never arrives.
+        (3) DETECT SLEEP/WAKE by clock skew, but defer all native work while the
+            display is asleep. macOS performs frequent maintenance DarkWakes with
+            the lid closed; treating all of them as a user wake previously caused
+            hundreds of tap/PortAudio rebuilds in one process lifetime.
         (4) Surface a STUCK transcription: if the worker has been on one clip too
             long it used to fail silently (a "dead hotkey" with a healthy tap). We
             can't force-kill a thread, but we log loudly so it's diagnosable — and
@@ -8362,9 +8699,21 @@ class FlowApp:
             wall = time.time()
             skew = (wall - prev_wall) - (now - prev_mono)
             prev_wall, prev_mono = wall, now
+            display_awake = _display_is_awake()
             if skew > 15.0:
-                self._recover_after_wake(
-                    f"system slept ~{skew:.0f}s (lid closed?)")
+                reason = f"system slept ~{skew:.0f}s"
+                if display_awake:
+                    self._recover_after_wake(reason, visible=True)
+                else:
+                    self._defer_wake_recovery(reason)
+            elif display_awake:
+                with self._state_lock:
+                    pending = self._wake_recovery_pending
+                    pending_reason = self._wake_pending_reason
+                if pending:
+                    self._recover_after_wake(
+                        f"display active after {pending_reason or 'sleep'}",
+                        visible=True)
             # (1) pre-cap warning + runaway recording guard
             with self._state_lock:
                 held = (self.recorder.recording and self._record_started) or None
@@ -8384,19 +8733,25 @@ class FlowApp:
                       flush=True)
                 self._key_down = False
                 self._locked = False   # a runaway LOCKED capture is still capped (belt-and-suspenders; _end clears it too)
-                self._end()
+                self._request_capture(False)
+            # Event taps are expected to be disabled during lid-closed DarkWakes.
+            # Do not re-enable/rebuild them until a visible wake is coalesced above.
+            if not display_awake:
+                continue
             # (2) tap-health self-heal, escalating to a rebuild if it won't stick
             try:
                 if self._tap is None:
                     # A previous rebuild failed and left us with no tap at all —
                     # keep retrying (debounced to every ~5s inside recover).
-                    self._recover_after_wake("hotkey tap missing — reinstalling")
+                    self._recover_after_wake(
+                        "hotkey tap missing — reinstalling", runtime=False)
                 elif not Quartz.CGEventTapIsEnabled(self._tap):
                     self._tap_disabled_streak += 1
                     if self._tap_disabled_streak >= 2:
                         # Re-enabling didn't stick — the tap is a zombie.
                         self._recover_after_wake(
-                            "hotkey tap stayed disabled after re-enabling")
+                            "hotkey tap stayed disabled after re-enabling",
+                            runtime=False)
                         self._tap_disabled_streak = 0
                     else:
                         Quartz.CGEventTapEnable(self._tap, True)
@@ -8510,8 +8865,11 @@ class FlowApp:
             # escalates to a full rebuild.
             if et in (int(Quartz.kCGEventTapDisabledByTimeout),
                       int(Quartz.kCGEventTapDisabledByUserInput)):
-                print("[flow] tap disabled by macOS — re-enabling.", flush=True)
+                # Deliberate teardown clears self._tap before disabling the old
+                # port. Suppress that expected callback instead of misreporting it
+                # as a macOS failure on every legitimate wake rebuild.
                 if self._tap is not None:
+                    print("[flow] tap disabled by macOS — re-enabling.", flush=True)
                     Quartz.CGEventTapEnable(self._tap, True)
                 return event
 
@@ -8637,7 +8995,7 @@ class FlowApp:
             play("Tink", self.cfg)
             return True
         if stopping:
-            threading.Thread(target=self._end, daemon=True).start()  # _end off the tap thread; it's idempotent
+            self._request_capture(False)
             return True
         return False
 
@@ -8709,19 +9067,87 @@ class FlowApp:
         except Exception:  # noqa: BLE001
             pass
 
-    def _recover_after_wake(self, reason: str) -> None:
-        """Post-sleep recovery: rebuild the hotkey tap and refresh the audio stack.
-        Idempotent and debounced — the wake notification, the watchdog's clock-skew
-        detector, and the disabled-streak escalation may all fire for one wake."""
-        now = time.monotonic()
+    def _defer_wake_recovery(self, reason: str) -> None:
+        """Remember a lid-closed/DarkWake signal without touching native state."""
         with self._state_lock:
-            if now - self._last_recover < 5.0:
-                return
-            self._last_recover = now
+            first = not self._wake_recovery_pending
+            self._wake_recovery_pending = True
+            self._wake_pending_reason = reason
+        if first:
+            print(f"[flow] {reason}; display asleep — recovery deferred.", flush=True)
+
+    def _recover_after_wake(self, reason: str, *, visible: bool = False,
+                            runtime: bool = True) -> bool:
+        """Coalesce recovery and marshal tap lifecycle work to the main thread.
+
+        ``runtime`` adds the delayed PortAudio refresh and MLX warm-up. Tap-health
+        retries set it false; actual visible wakes set it true.
+        """
+        if not visible and not _display_is_awake():
+            self._defer_wake_recovery(reason)
+            return False
+        now_wall = time.time()
+        with self._state_lock:
+            was_pending = self._wake_recovery_pending
+            recent_tap = now_wall - self._last_recover_wall < 5.0
+            recent_runtime = (
+                now_wall - self._last_runtime_recover_wall < 5.0)
+            if not was_pending:
+                if runtime and recent_runtime:
+                    return False
+                if not runtime and recent_tap:
+                    return False
+            # A tap-health repair just before the real display-wake signal must
+            # not suppress model/audio recovery. Upgrade the cluster without
+            # pointlessly rebuilding the taps a second time.
+            runtime_only = bool(runtime and recent_tap and not was_pending)
+            if not runtime_only:
+                self._last_recover_wall = now_wall
+            if runtime:
+                self._last_runtime_recover_wall = now_wall
+            self._wake_recovery_pending = False
+            self._wake_pending_reason = ""
+
+        def _perform():
+            if runtime_only:
+                self._perform_runtime_recovery(reason)
+            else:
+                self._perform_wake_recovery(reason, runtime=runtime)
+
+        if threading.current_thread() is threading.main_thread():
+            _perform()
+        else:
+            try:
+                from Foundation import NSOperationQueue
+                NSOperationQueue.mainQueue().addOperationWithBlock_(_perform)
+            except Exception:  # noqa: BLE001  terminal/old-AppKit fallback
+                _perform()
+        return True
+
+    def _perform_runtime_recovery(self, reason: str) -> None:
+        """Re-page MLX and refresh idle CoreAudio without rebuilding healthy taps."""
+        print(f"[flow] {reason} — refreshing post-wake audio/model state.",
+              flush=True)
+        self._request_model_warmup()
+        self._schedule_audio_refresh()
+
+    def _perform_wake_recovery(self, reason: str, *, runtime: bool) -> None:
+        """Main-thread half of visible-wake recovery."""
+        if not self._tap_lifecycle_lock.acquire(blocking=False):
+            if runtime:
+                self._perform_runtime_recovery(reason)
+            return
         print(f"[flow] {reason} — rebuilding the hotkey tap.", flush=True)
         try:
+            with self._state_lock:
+                self._key_down = False
+                self._locked = False
+                self._tap_disabled_streak = 0
+            if self.recorder.recording or self._capture_requested:
+                self._request_capture(False)
             self._teardown_tap()
             ok = self._install_tap() and self._tap_enabled()
+            self._tap_ok = bool(ok)
             print(f"[flow] hotkey tap rebuilt (enabled={ok}).", flush=True)
             # Rebuild the lock tap in its OWN inner try so a lock-tap failure NEVER
             # affects main-tap state or triggers the main tap's escalation.
@@ -8735,20 +9161,56 @@ class FlowApp:
         except Exception as e:  # noqa: BLE001
             print(f"[flow] tap rebuild failed: {e} — the watchdog will retry.",
                   flush=True)
-        # Refresh PortAudio so the next recording doesn't open a stale post-sleep
-        # audio device (also picks up default-input changes, e.g. AirPods).
-        # Only when idle — never yank the stream out from under a live capture.
-        with self._state_lock:
-            recording = self.recorder.recording
-        if not recording:
-            try:
-                import sounddevice as sd
-                sd._terminate()
-                sd._initialize()
-            except Exception:  # noqa: BLE001  next InputStream open will retry anyway
-                pass
+        finally:
+            self._tap_lifecycle_lock.release()
+        if runtime:
+            self._perform_runtime_recovery(reason)
 
     # -- run (direct Quartz CGEventTap) --------------------------------------
+
+    def _shutdown_runtime(self) -> None:
+        """Release lifecycle resources that otherwise survive until hard exit."""
+        timer = self._learn_timer
+        self._learn_timer = None
+        if timer is not None:
+            timer.cancel()
+
+        with self._state_lock:
+            audio_timer = self._audio_refresh_timer
+            self._audio_refresh_timer = None
+            self._audio_refresh_pending = False
+            self._audio_refresh_generation += 1
+        if audio_timer is not None:
+            audio_timer.cancel()
+
+        if self.recorder.recording or self._capture_requested:
+            self._request_capture(False)
+        self._capture_q.put(None)
+        try:
+            self._work_q.put_nowait(None)
+        except queue.Full:
+            pass
+
+        if self._wake_observers:
+            try:
+                from AppKit import NSWorkspace
+                nc = NSWorkspace.sharedWorkspace().notificationCenter()
+                for observer in self._wake_observers:
+                    nc.removeObserver_(observer)
+            except Exception:  # noqa: BLE001  process is already shutting down
+                pass
+            self._wake_observers.clear()
+
+        if self._activity_token is not None:
+            try:
+                from Foundation import NSProcessInfo
+                NSProcessInfo.processInfo().endActivity_(self._activity_token)
+            except Exception:  # noqa: BLE001
+                pass
+            self._activity_token = None
+
+        self._teardown_tap()
+        self._teardown_lock_tap()
 
     def run(self) -> None:
         import Quartz
@@ -8851,6 +9313,17 @@ class FlowApp:
         except Exception:  # noqa: BLE001  cosmetic-level optimization only
             self._activity_token = None
 
+        # Start the serial workers before registering wake callbacks. A wake can
+        # arrive immediately after launch, and its model warm-up must have a live
+        # consumer. Naming the threads also makes Activity Monitor samples useful.
+        self._capture_thread = threading.Thread(
+            target=self._capture_worker, name="frutflow-capture", daemon=True)
+        self._capture_thread.start()
+        self._transcription_thread = threading.Thread(
+            target=self._transcription_worker,
+            name="frutflow-transcription", daemon=True)
+        self._transcription_thread.start()
+
         # SLEEP/WAKE FIX: after lid-close/open, a CGEventTap can come back as a
         # "zombie" — CGEventTapIsEnabled() says True but it never delivers another
         # event, so re-enabling (the watchdog's old trick) can't heal it and the
@@ -8860,34 +9333,37 @@ class FlowApp:
         # notification doesn't arrive.
         try:
             from AppKit import NSWorkspace
+            from Foundation import NSOperationQueue
             nc = NSWorkspace.sharedWorkspace().notificationCenter()
 
             def _on_wake(_note):
+                # DidWake also fires for closed-lid maintenance DarkWakes. Check
+                # actual display state and defer all native teardown while hidden.
                 self._recover_after_wake("mac woke from sleep")
 
             def _on_screens_wake(_note):
-                self._recover_after_wake("displays woke (lid open?)")
+                self._recover_after_wake("displays woke (lid open?)", visible=True)
 
-            # queue=None => delivered on the posting thread's run loop; CFRunLoop
-            # surgery is safe from any thread (verified) and _recover_after_wake is
-            # debounced, so both notifications firing for one wake = ONE rebuild.
-            # DidWake covers full system wake; ScreensDidWake covers lid-open /
-            # display-only wake, which some wake paths post INSTEAD of DidWake — the
-            # gap that leaves the tap a zombie "sometimes" after closing the lid.
-            self._wake_observer = nc.addObserverForName_object_queue_usingBlock_(
-                "NSWorkspaceDidWakeNotification", None, None, _on_wake)
-            self._wake_observer2 = nc.addObserverForName_object_queue_usingBlock_(
-                "NSWorkspaceScreensDidWakeNotification", None, None, _on_screens_wake)
+            # Deliver on the main queue because Quartz run-loop source changes are
+            # main-thread lifecycle work. Both wake signals are coalesced into one
+            # visible recovery. Do not observe the pre-sleep notifications: they
+            # can arrive while the display still reports active, which would let
+            # the watchdog mistake sleep entry for a completed wake.
+            main_q = NSOperationQueue.mainQueue()
+            for name, callback in (
+                    ("NSWorkspaceDidWakeNotification", _on_wake),
+                    ("NSWorkspaceScreensDidWakeNotification", _on_screens_wake)):
+                self._wake_observers.append(
+                    nc.addObserverForName_object_queue_usingBlock_(
+                        name, None, main_q, callback))
         except Exception as e:  # noqa: BLE001  watchdog skew-detector still covers us
             print(f"[flow] (wake-notification hook unavailable: {e})", flush=True)
 
-        # Single transcription worker: drains the capture queue so recording is
-        # never blocked while a clip transcribes (no more dropped bursty dictation).
-        threading.Thread(target=self._transcription_worker, daemon=True).start()
-
         # Watchdog: pre-cap warning + auto-stop long captures, tap self-heal,
         # stuck-transcription guard, sleep/wake recovery.
-        threading.Thread(target=self._watchdog_loop, daemon=True).start()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, name="frutflow-watchdog", daemon=True)
+        self._watchdog_thread.start()
 
         # Second, independent app-mode signal: is the running bundle frutflow.app?
         # (Covers the case where __CFBundleIdentifier isn't in the environment.)
@@ -8908,8 +9384,7 @@ class FlowApp:
             try:
                 self._run_menubar()
             finally:
-                self._teardown_tap()
-                self._teardown_lock_tap()
+                self._shutdown_runtime()
         else:
             # Classic/terminal mode (e.g. `python flow.py` for debugging): plain
             # CFRunLoop so Ctrl-C still quits and stdout logs stay visible.
@@ -8918,8 +9393,7 @@ class FlowApp:
             except KeyboardInterrupt:
                 raise
             finally:
-                self._teardown_tap()
-                self._teardown_lock_tap()
+                self._shutdown_runtime()
 
     def _transcribe_path(self, path: str):
         """Transcribe an audio FILE with the app's already-loaded engine + the full
@@ -8936,9 +9410,17 @@ class FlowApp:
                 prompt = build_learned_prompt(self.cfg)
             elif self.cfg.get("vocab_biasing", "hotwords") == "hotwords":
                 hotwords = build_hotwords(self.cfg)
-        with self._transcribe_lock:
-            raw = self.transcriber.transcribe(audio, prompt=prompt, hotwords=hotwords)
-        return (clean(raw, self.cfg, gpu_lock=self._transcribe_lock) or ""), None
+        try:
+            with self._transcribe_lock:
+                raw = self.transcriber.transcribe(
+                    audio, prompt=prompt, hotwords=hotwords)
+            return (clean(raw, self.cfg,
+                          gpu_lock=self._transcribe_lock) or ""), None
+        finally:
+            # File transcription uses the same MLX allocator as live dictation.
+            # Do not leave its transient command/cache buffers resident forever.
+            with self._transcribe_lock:
+                _clear_mlx_cache()
 
     def _show_settings_window(self) -> None:
         """Open (or re-focus) the Settings window. Built lazily."""
