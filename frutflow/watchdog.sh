@@ -68,6 +68,10 @@ flow_process_matches() {
   if [[ "$args" == *python*"/flow.py"* ||
         "$args" == *python*" flow.py"* ||
         "$args" == *python*" ./flow.py"* ]]; then
+    # An instance launched through the bundle is ours regardless of its cwd.
+    if [[ "$args" == *"frutflow.app/Contents/MacOS/"* ]]; then
+      return 0
+    fi
     process_cwd_matches_repo "$pid"
     return
   fi
@@ -97,16 +101,30 @@ flow_is_running() {
 }
 
 prepare_flowdictate_dir
+# Backoff guard: a deterministically-crashing flow.py (corrupt venv, bad
+# upgrade) would otherwise be relaunched every ~20s forever — menu-bar
+# flicker, battery drain, log churn. After 5 consecutive relaunches with no
+# healthy run in between, retry only every 5 minutes (self-heal never fully
+# stops; a successful run resets the counter).
+consecutive_relaunches=0
 while true; do
   if ! flow_is_running; then
+    consecutive_relaunches=$((consecutive_relaunches + 1))
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
     rotate_log_if_needed
     rotate_flow_log_if_needed
     : >> "$LOG"
     chmod 600 "$LOG"
-    echo "[$ts] flow.py not running — relaunching frutflow.app" >> "$LOG"
+    echo "[$ts] flow.py not running — relaunching frutflow.app (attempt $consecutive_relaunches)" >> "$LOG"
     /usr/bin/open -g "$APP"
     sleep 8
+    if [ "$consecutive_relaunches" -ge 5 ]; then
+      ts="$(date '+%Y-%m-%d %H:%M:%S')"
+      echo "[$ts] $consecutive_relaunches relaunches without a healthy run — backing off to 5-minute retries. See $FLOW_LOG for the crash." >> "$LOG"
+      sleep 300
+    fi
+  else
+    consecutive_relaunches=0
   fi
   sleep 12
 done

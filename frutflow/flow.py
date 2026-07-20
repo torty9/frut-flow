@@ -44,6 +44,10 @@ import numpy as np
 CONFIG_DIR = Path.home() / ".flowdictate"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 CODE_DIR_PATH = CONFIG_DIR / "code_dir"
+INSTANCE_LOCK_PATH = CONFIG_DIR / "flow.lock"
+
+# Held open for the whole process lifetime by main()'s single-instance guard.
+_INSTANCE_LOCK_FD = None
 
 PBCOPY = "/usr/bin/pbcopy"
 PBPASTE = "/usr/bin/pbpaste"
@@ -194,6 +198,8 @@ DEFAULT_CONFIG = {
                                  # edit before finalizing what was learned.
     "history_enabled": True,     # persist the last HISTORY_CAP dictations locally
                                  # for the History window. Set false for private mode.
+    "onboarding_done": False,    # set true after the Welcome window auto-shows once
+                                 # (or is skipped because permissions were granted)
 
     # --- text insertion ---
     "insert_method": "paste",    # "paste" (clipboard + Cmd-V), "type", or
@@ -241,7 +247,14 @@ def _coerce_like(default, value):
     if isinstance(default, bool):
         return value if isinstance(value, bool) else default
     if isinstance(default, int):        # (bool already handled above)
-        return value if isinstance(value, int) and not isinstance(value, bool) else default
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        # Hand-edits and external tools often write 60.0 for 60; rejecting the
+        # float would silently revert the setting to its default. Round it —
+        # the downstream _clamp_number(as_int=True) was built for exactly that.
+        if isinstance(value, float) and np.isfinite(value):
+            return int(round(value))
+        return default
     if isinstance(default, float):
         return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else default
     if isinstance(default, str):
@@ -312,7 +325,6 @@ _MODIFIER_VKS_BY_NAME = {
     "shift": {56, 60},
 }
 _MODIFIER_NAME_BY_VK = {vk: name for name, vk in _VK_BY_NAME.items()}
-_OPTION_VKS = {58, 61}
 
 _VK_LABELS = {
     0: "A", 1: "S", 2: "D", 3: "F", 4: "H", 5: "G", 6: "Z", 7: "X",
@@ -361,8 +373,6 @@ def _parse_vk_binding(name: str) -> int | None:
         except ValueError:
             return None
         return vk if 0 <= vk <= 255 else None
-    if len(name) == 1:
-        return _VK_BY_LABEL.get(name)
     return _VK_BY_LABEL.get(name)
 
 
@@ -739,6 +749,32 @@ class LocalTranscriber:
         return " ".join(seg.text.strip() for seg in segments).strip()
 
 
+def _snapshot_has_weights(snap_dir: Path) -> bool:
+    """True when a HF snapshot dir holds at least one fully-downloaded weight file.
+
+    An interrupted first-run download leaves a snapshot with config/tokenizer
+    files but no (or dangling-symlink) weights; treating that as "cached" would
+    hand loaders a directory they can never load, permanently suppressing the
+    resumable download. Sharded models are checked against their index so a
+    partial shard set is not reported complete.
+    """
+    weight_names = ("*.safetensors", "model.bin", "*.npz", "*.gguf")
+    try:
+        index = snap_dir / "model.safetensors.index.json"
+        if index.is_file():
+            shards = set(json.loads(index.read_text()).get("weight_map", {}).values())
+            return bool(shards) and all(
+                (snap_dir / s).is_file() and (snap_dir / s).resolve().stat().st_size > 0
+                for s in shards)
+        for pattern in weight_names:
+            for f in snap_dir.rglob(pattern):
+                if f.is_file() and f.resolve().stat().st_size > 0:
+                    return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
 def _hf_cached_snapshot(repo_id: str) -> Path | None:
     """Return a complete local Hugging Face snapshot, if one is cached.
 
@@ -746,6 +782,8 @@ def _hf_cached_snapshot(repo_id: str) -> Path | None:
     toggling ``HF_HUB_OFFLINE`` after importing ``huggingface_hub``: that package
     reads its offline flag at import time, so the old approach could still perform
     a metadata request on every app restart despite the weights being local.
+    Incomplete snapshots (interrupted download) return None so callers fall back
+    to the hub path, which resumes the download instead of failing forever.
     """
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
@@ -758,14 +796,19 @@ def _hf_cached_snapshot(repo_id: str) -> Path | None:
     try:
         if not snap.is_dir():
             return None
+        ordered: list[Path] = []
         ref = repo / "refs" / "main"
         if ref.is_file():
             commit = ref.read_text(encoding="utf-8").strip()
             preferred = snap / commit
             if commit and preferred.is_dir():
-                return preferred
-        candidates = [p for p in snap.iterdir() if p.is_dir()]
-        return max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
+                ordered.append(preferred)
+        others = [p for p in snap.iterdir() if p.is_dir() and p not in ordered]
+        ordered.extend(sorted(others, key=lambda p: p.stat().st_mtime, reverse=True))
+        for candidate in ordered:
+            if _snapshot_has_weights(candidate):
+                return candidate
+        return None
     except OSError:
         return None
 
@@ -1014,7 +1057,10 @@ who whom not no yes so as than too very just only also more most much many few
 some any about after again all because before how out up down off once each
 """.split())
 
-_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'\-]{2,}")
+# Any-language word: a letter followed by 2+ letters/apostrophes/hyphens.
+# ASCII-only classes here would mangle non-ASCII words into learned fragments
+# ("café" → "caf", "Zürich" → "rich") — including this app's own name.
+_WORD_RE = re.compile(r"[^\W\d_](?:[^\W\d_]|['\-]){2,}")
 
 
 def _read_json(path: Path, default):
@@ -1071,8 +1117,12 @@ def _sanitize_vocab(data) -> dict:
         if count <= 0:
             continue
         out[form.lower()] = {"count": min(count, 1_000_000), "form": form}
-        if len(out) >= 400:
-            break
+    if len(out) > 400:
+        # Cap by keeping the MOST-USED words. Breaking out of the loop at the
+        # 400th file-order entry would permanently evict whatever the user
+        # learned most recently instead of their rarest words.
+        kept = sorted(out.items(), key=lambda kv: kv[1]["count"], reverse=True)
+        out = dict(kept[:400])
     return out
 
 
@@ -1085,8 +1135,11 @@ def _sanitize_corrections(data) -> dict:
         c = _clean_text_value(correct, max_chars=160)
         if h and c and h != c:
             out[h] = c
-        if len(out) >= 500:
-            break
+    if len(out) > 500:
+        # Keep the NEWEST 500: add_correction appends fresh teachings at the
+        # end, so cutting at the 500th entry would make every teaching past
+        # the cap silently vanish on the next save.
+        out = dict(list(out.items())[-500:])
     return out
 
 
@@ -1118,8 +1171,9 @@ def _sanitize_correction_examples(data) -> dict:
             "count": max(1, min(count, 1_000_000)),
             "updated": updated if np.isfinite(updated) and updated > 0 else 0.0,
         }
-        if len(out) >= 500:
-            break
+    if len(out) > 500:
+        # Same newest-wins policy as _sanitize_corrections.
+        out = dict(list(out.items())[-500:])
     return out
 
 
@@ -1237,8 +1291,11 @@ def apply_corrections(text: str) -> str:
         return text
     for heard, correct in load_corrections().items():
         if heard:
-            text = re.sub(rf"\b{re.escape(heard)}\b", correct, text,
-                          flags=re.IGNORECASE)
+            # The replacement goes through a lambda so backslashes in a taught
+            # correction (paths, LaTeX) are inserted literally — as a template
+            # string, re.sub would reject "\U" or corrupt "\n" into a newline.
+            text = re.sub(rf"\b{re.escape(heard)}\b", lambda _m, c=correct: c,
+                          text, flags=re.IGNORECASE)
     return text
 
 
@@ -1453,7 +1510,9 @@ def relative_time(ts, now: "float | None" = None) -> str:
         if d < 45:
             return "just now"
         if d < 3600:
-            return f"{int(round(d / 60)) or 1}m ago"
+            m = int(round(d / 60)) or 1
+            # 59.5–60 min rounds to 60 — that's "1h ago", never "60m ago".
+            return f"{m}m ago" if m < 60 else "1h ago"
         if d < 86400:
             return f"{int(d // 3600)}h ago"
         # Calendar-aware day bucketing so "yesterday" means the prior calendar day.
@@ -1652,6 +1711,12 @@ def fuzzy_correct_text(text: str, terms: list[str], threshold: float = 0.74) -> 
     case preserved. Surrounding spacing/punctuation is untouched."""
     if not text or not terms or not FUZZY_AVAILABLE:
         return text
+    # Single-token candidates only: correction TARGETS can be multi-word
+    # phrases ("New York"), and snapping one dictated token onto a phrase
+    # rewrites words the user never said ("Newark" → "New York").
+    terms = [t for t in terms if " " not in t]
+    if not terms:
+        return text
     parts = re.split(r"(\W+)", text)   # keeps the delimiters in place
     for i, tok in enumerate(parts):
         # Three-letter tokens are too collision-prone for fuzzy repair: API/App,
@@ -1807,14 +1872,18 @@ def learn_from_edit(el, pasted: str, *, max_learn: int = 3) -> int:
 # Conservative: only strip true vocal fillers. Whisper already punctuates and
 # capitalizes, so we don't try to rewrite meaning (the on-device "local" repair
 # mode handles misheard words; basic cleanup never touches word identity).
+# Deliberately absent: bare "er"/"err" — "To err is human" is real English, and
+# the whole set is English-only, so non-English dictation is never touched
+# ("um" is a top-frequency German preposition, "er" the pronoun "he").
 _FILLER_RE = re.compile(
-    r"\b(?:u+h+|u+m+|a+h+|e+h+|e+r+m*|hm+|mm+-?hmm+|uh-huh)\b[,.]?",
+    r"\b(?:u+h+|u+m+|a+h+|e+h+|e+rm+|hm+|mm+-?hmm+|uh-huh)\b[,.]?",
     re.IGNORECASE,
 )
 
 
-def basic_cleanup(text: str) -> str:
-    text = _FILLER_RE.sub("", text)
+def basic_cleanup(text: str, language: str = "en") -> str:
+    if str(language or "en").lower().startswith("en"):
+        text = _FILLER_RE.sub("", text)
     text = re.sub(r"\s+([,.;:!?])", r"\1", text)   # no space before punctuation
     text = re.sub(r"\s{2,}", " ", text).strip()
     if text:
@@ -2122,19 +2191,20 @@ def clean(text: str, cfg: dict, context: dict | None = None, gpu_lock=None) -> s
     if not text:
         return text
     mode = cfg["cleanup"]
+    lang = str(cfg.get("language", "en") or "en")
     if mode == "none":
         out = text
     elif mode == "local":
         # On-device context repair. basic_cleanup FIRST (deterministic fillers/punct/
         # casing) so the model sees clean prose and does exactly ONE job: word repair.
         try:
-            out = basic_cleanup(text)
+            out = basic_cleanup(text, language=lang)
             out = local_repair(out, cfg, context, gpu_lock=gpu_lock)
         except Exception as e:  # noqa: BLE001  fall back, never lose the words
             print(f"[flow] local repair failed ({e}); using basic cleanup.")
-            out = basic_cleanup(text)
+            out = basic_cleanup(text, language=lang)
     else:
-        out = basic_cleanup(text)
+        out = basic_cleanup(text, language=lang)
     # Exact taught corrections first (precise), then phonetic fuzzy repair of any
     # remaining near-miss proper nouns against your learned vocabulary. These run
     # AFTER local_repair, so a taught spelling still wins over the model.
@@ -2462,11 +2532,17 @@ def insert_text(text: str, cfg: dict) -> bool:
     # auto-learn arming, and readiness for the next dictation no longer wait ~0.25s).
     # Only restore if nothing else changed the pasteboard since our write; if some
     # other app/user copied meanwhile, their newer clipboard wins.
+    # The delay must comfortably outlast the target app's event processing: the
+    # pasteboard is read when the app HANDLES Cmd-V, not when we post it, and a
+    # busy Electron app or an IDE mid-GC can sit on the event for well over a
+    # second. Restoring too early pastes the user's OLD clipboard instead of the
+    # dictation — silently, with a success ding. 2s is imperceptible (the user's
+    # clipboard comes back before they can use it) and loses the race far less.
     if old:
         def _restore(expected=our_count, prev=old):
             if expected < 0 or _clip_change_count() == expected:
                 _clip_restore(prev)
-        t = threading.Timer(0.4, _restore)
+        t = threading.Timer(2.0, _restore)
         t.daemon = True
         t.start()
     return True
@@ -2524,9 +2600,20 @@ _VK_GRAVE = 50   # kVK_ANSI_Grave (backtick / tilde key)
 # matching modifier's mask bit is set, the key is now down; if cleared, it's up.
 # This is far more robust than toggling a Python-side flag, which gets stuck
 # inverted forever if a single flagsChanged event is ever missed or doubled.
-# (Mask values are filled in lazily from Quartz at run() time, since the
-# constants live in the Quartz module.)
+# (Mask values are filled in lazily at run() time, since the generic constants
+# live in the Quartz module.)
+#
+# Three tables, all keyed by virtual keycode:
+#   _MODIFIER_MASK_BY_VK        — the key's DEVICE-side bit (NX_DEVICE*KEYMASK),
+#                                 so "Right Option" matches ONLY the right key.
+#   _MODIFIER_CLASS_MASK_BY_VK  — the generic class bit (kCGEventFlagMask*),
+#                                 the fallback when a keyboard driver reports
+#                                 no device-side bits at all.
+#   _MODIFIER_DEVICE_BITS_BY_VK — union of both sides' device bits, used to
+#                                 probe whether this event carries side info.
 _MODIFIER_MASK_BY_VK: dict[int, int] = {}
+_MODIFIER_CLASS_MASK_BY_VK: dict[int, int] = {}
+_MODIFIER_DEVICE_BITS_BY_VK: dict[int, int] = {}
 
 
 def resolve_target_vks(name: str) -> set[int]:
@@ -2539,8 +2626,6 @@ def resolve_target_vks(name: str) -> set[int]:
     name = str(name or "").strip().lower()
     if name in _MODIFIER_VKS_BY_NAME:
         return set(_MODIFIER_VKS_BY_NAME[name])
-    if name in ("alt_l", "alt_r"):
-        return set(_OPTION_VKS)
     vk = _parse_vk_binding(name)
     if vk is not None:
         return {vk}
@@ -2847,6 +2932,16 @@ def _menu_actions_class():
             except Exception:  # noqa: BLE001
                 pass
             NSApplication.sharedApplication().terminate_(None)
+
+        def applicationWillTerminate_(self, note):
+            # Quit/Restart exit through NSApplication.terminate_, so app.run()
+            # never returns and the terminal-mode `finally` can't fire — this
+            # delegate hook is the ONLY orderly-shutdown path in app mode
+            # (stop capture, release the mic stream, cancel timers).
+            try:
+                self._app._shutdown_runtime()
+            except Exception:  # noqa: BLE001
+                pass
 
     _MENU_ACTIONS_CLASS = _MenuActions
     return _MENU_ACTIONS_CLASS
@@ -3378,21 +3473,24 @@ def _transcribe_controller_class():
     import objc
     from Cocoa import (
         NSObject, NSView, NSWindow, NSScrollView, NSTextView, NSButton,
-        NSTextField, NSImageView, NSImage, NSProgressIndicator,
-        NSOpenPanel, NSSavePanel, NSApplication, NSColor, NSFont,
-        NSApplicationActivationPolicyRegular, NSApplicationActivationPolicyAccessory,
+        NSTextField, NSImageView, NSProgressIndicator,
+        NSOpenPanel, NSSavePanel, NSApplication, NSColor,
+        NSApplicationActivationPolicyRegular,
         NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue,
         NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
         NSWindowStyleMaskResizable, NSWindowStyleMaskMiniaturizable,
         NSBackingStoreBuffered, NSViewWidthSizable, NSViewHeightSizable,
         NSViewMinYMargin, NSViewMaxYMargin, NSViewMinXMargin, NSViewMaxXMargin,
-        NSVisualEffectView, NSTextAlignmentCenter, NSTextAlignmentLeft,
+        NSVisualEffectView, NSTextAlignmentCenter,
         NSDragOperationCopy, NSDragOperationNone,
     )
     G = _glass()
     OK = 1               # NSModalResponseOK / NSFileHandlingPanelOKButton
+    # Only formats CoreAudio's afconvert can actually decode. Ogg/Vorbis, raw
+    # .opus, and WMA are NOT readable by AudioFile — advertising them turns the
+    # drop zone into a guaranteed decode failure.
     AUDIO_TYPES = ["wav", "aiff", "aif", "aifc", "caf", "m4a", "m4b", "mp3", "mp4",
-                   "aac", "flac", "ogg", "opus", "mov", "wma", "amr", "3gp"]
+                   "aac", "flac", "mov", "amr", "3gp"]
 
     def _rgb(r, g, b, a=1.0):
         return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, a)
@@ -3405,7 +3503,7 @@ def _transcribe_controller_class():
     GRAD_BOT = _rgb(0.753, 0.878, 0.361)       # #c0e05c
     INK = _rgb(0.078, 0.090, 0.043)            # #14170b — near-black button text
 
-    def _symbol(name, point_size, weight_ok=True):
+    def _symbol(name, point_size):
         """An SF Symbol NSImage at a given point size, or None if unavailable."""
         return _phosphor_sf(name, point=point_size)
 
@@ -3453,11 +3551,19 @@ def _transcribe_controller_class():
                 except Exception:  # noqa: BLE001
                     pass
                 grad.setFrame_(host.bounds())
+                # Sublayers do NOT track their superlayer on their own: when a
+                # caller later setFrame_s the button (Choose File 148×34, Copy
+                # 90×32), an unsized gradient leaves part of the pill unfilled.
+                try:
+                    from Quartz import kCALayerWidthSizable, kCALayerHeightSizable
+                    grad.setAutoresizingMask_(
+                        kCALayerWidthSizable | kCALayerHeightSizable)
+                except Exception:  # noqa: BLE001
+                    grad.setAutoresizingMask_(2 | 16)   # width | height sizable
                 host.insertSublayer_atIndex_(grad, 0)
-                # keep the gradient sized to the button as it lays out
                 host.setMasksToBounds_(True)
                 host.setCornerRadius_(9.0)
-                btn._grad_layer = grad     # retain ref; resized in layout
+                btn._grad_layer = grad     # retain ref so the layer outlives us
             except Exception:  # noqa: BLE001
                 host.setBackgroundColor_(GREEN.CGColor())
                 host.setCornerRadius_(9.0)
@@ -3651,6 +3757,10 @@ def _transcribe_controller_class():
             sub.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin
                                      | NSViewMaxYMargin)
             empty.addSubview_(sub)
+            # Kept so a failed transcription can surface its error RIGHT HERE —
+            # the drop zone is the only view left on screen after a failure.
+            self._empty_title = title
+            self._empty_sub = sub
 
             choose = _green_button("Choose File…", "folder", self, "chooseFile:")
             choose.setFrame_(NSMakeRect(cx - 74, eh / 2.0 - 62, 148, 34))
@@ -3838,14 +3948,24 @@ def _transcribe_controller_class():
 
         @objc.python_method
         def _dropped_path(self, sender):
-            """Return a supported audio file path from a drag, or None."""
+            """Return a supported audio file path from a SINGLE-file drag, or None."""
             try:
                 pb = sender.draggingPasteboard()
             except Exception:  # noqa: BLE001
                 return None
+            # Refuse multi-file drags at draggingEntered_ (the cursor shows
+            # "not accepted"): silently transcribing only the first of three
+            # dropped voice memos reads as data loss.
+            try:
+                from Cocoa import NSFilenamesPboardType
+                items = pb.propertyListForType_(NSFilenamesPboardType)
+                if items is not None and len(items) > 1:
+                    return None
+            except Exception:  # noqa: BLE001
+                pass
             path = None
             try:
-                from Cocoa import NSURL, NSPasteboardTypeFileURL
+                from Cocoa import NSURL
                 url = NSURL.URLFromPasteboard_(pb)
                 if url is not None and url.isFileURL():
                     path = str(url.path())
@@ -3912,6 +4032,7 @@ def _transcribe_controller_class():
             self._path = path
             name = os.path.basename(path)
             self._busy = True
+            self._reset_empty_copy()      # clear any prior error before retrying
             self._loading_title.setStringValue_(f"Transcribing “{name}”…")
             self._show_state("loading")
             threading.Thread(target=self._run, args=(path, name),
@@ -3927,7 +4048,6 @@ def _transcribe_controller_class():
             def _done():
                 self._busy = False
                 if err:
-                    self._loading_title.setStringValue_(err)
                     # stay in empty so the user can retry, but surface the error
                     self._show_state("empty")
                     self._flash_error(err)
@@ -3944,14 +4064,34 @@ def _transcribe_controller_class():
                     self._show_state("done")
             NSOperationQueue.mainQueue().addOperationWithBlock_(_done)
 
+        _EMPTY_TITLE_DEFAULT = "Drop an audio file to transcribe"
+        _EMPTY_SUB_DEFAULT = "Voice memos, m4a, mp3, wav, aiff, and more"
+
         @objc.python_method
         def _flash_error(self, msg):
-            # Reuse the empty-state title to surface an error briefly.
+            """Surface a failure in the empty state's title/subtitle.
+
+            After a failed transcription the drop zone is the only thing on
+            screen, so the error must live there — a log line alone reads as
+            "the app silently reset" to the user."""
             try:
-                self._empty  # noqa: B018
+                self._empty_title.setStringValue_("Couldn’t transcribe that file")
+                self._empty_title.setTextColor_(_rgb(1.0, 0.62, 0.5))
+                self._empty_sub.setStringValue_(str(msg))
+                self._empty_sub.setTextColor_(_white(0.62))
             except Exception:  # noqa: BLE001
                 pass
             print(f"[flow] transcribe: {msg}", flush=True)
+
+        @objc.python_method
+        def _reset_empty_copy(self):
+            try:
+                self._empty_title.setStringValue_(self._EMPTY_TITLE_DEFAULT)
+                self._empty_title.setTextColor_(_white(0.82))
+                self._empty_sub.setStringValue_(self._EMPTY_SUB_DEFAULT)
+                self._empty_sub.setTextColor_(_white(0.45))
+            except Exception:  # noqa: BLE001
+                pass
 
         # -- window lifecycle -----------------------------------------------
         @objc.python_method
@@ -4030,9 +4170,9 @@ def _history_controller_class():
     import objc
     from Cocoa import (
         NSObject, NSView, NSWindow, NSScrollView, NSStackView, NSTextField,
-        NSButton, NSImage, NSImageView, NSSearchField, NSAlert, NSApplication,
+        NSButton, NSImageView, NSSearchField, NSAlert, NSApplication,
         NSColor, NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
-        NSApplicationActivationPolicyRegular, NSApplicationActivationPolicyAccessory,
+        NSApplicationActivationPolicyRegular,
         NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
         NSWindowStyleMaskResizable, NSWindowStyleMaskMiniaturizable,
         NSBackingStoreBuffered, NSViewWidthSizable, NSViewHeightSizable,
@@ -4237,7 +4377,10 @@ def _history_controller_class():
             if simg2 is not None:
                 siv.setImage_(simg2)
                 try:
-                    siv.setContentTintColor_(GREEN)
+                    # Same appearance-aware green as the title-bar pill: static
+                    # pale lime is nearly invisible on light glass.
+                    siv.setContentTintColor_(
+                        _dyn((0.788, 0.925, 0.431, 1.0), (0.34, 0.52, 0.10, 1.0)))
                 except Exception:  # noqa: BLE001
                     pass
             siv.setImageScaling_(_SCALE_FIT)
@@ -4761,7 +4904,7 @@ def _hud_controller_class():
     import objc
     from Cocoa import (
         NSObject, NSPanel, NSView, NSVisualEffectView, NSTextField, NSButton,
-        NSImage, NSColor, NSFont, NSScreen,
+        NSColor, NSFont, NSScreen,
         NSMakeRect, NSBackingStoreBuffered,
         NSTextAlignmentCenter, NSTextAlignmentRight,
         NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel,
@@ -5028,12 +5171,22 @@ def _hud_controller_class():
             try:
                 self._build()
                 fresh = self._state == "hidden"
+                new_capture = self._state != "listening"
                 self._state = "listening"
                 self._label.setStringValue_("Listening")
                 self._wave.setAlphaValue_(1.0)
-                if fresh:
+                if new_capture:
+                    # Entering listening from ANY other state is a new clip:
+                    # restart the clock. (Resetting only from "hidden" left the
+                    # previous clip's time running when a capture began while
+                    # the worker was still transcribing.)
                     self._t0 = time.monotonic()
                     self._time.setStringValue_("0:00")
+                    # Hotkey and mode are live-changeable in Settings; recompute
+                    # the hint so it never shows the old key/verb.
+                    self._hint.setStringValue_(self._hint_text())
+                    self._apply_hint_shadow(self._hint)
+                if fresh:
                     self._position()
                     self._panel.orderFrontRegardless()
                 self._start_anim()
@@ -5187,8 +5340,8 @@ def _settings_controller_class():
     import objc
     from Cocoa import (
         NSObject, NSView, NSWindow, NSScrollView, NSTextField, NSButton,
-        NSSwitch, NSSlider, NSSegmentedControl, NSPopUpButton,
-        NSImageView, NSImage, NSAlert, NSApplication, NSColor, NSEvent,
+        NSSwitch, NSSlider, NSSegmentedControl,
+        NSImageView, NSAlert, NSApplication, NSColor, NSEvent,
         NSApplicationActivationPolicyRegular,
         NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
         NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
@@ -5247,7 +5400,6 @@ def _settings_controller_class():
     BANNER_BG = _dyn((0.788, 0.925, 0.431, 0.08), (0.788, 0.925, 0.431, 0.16))
     BANNER_RIM = _dyn((0.788, 0.925, 0.431, 0.20), (0.34, 0.52, 0.10, 0.35))
     CHIP_BG = _dyn((0, 0, 0, 0.26), (0, 0, 0, 0.06))
-    CHIP_RIM = _dyn((1, 1, 1, 0.09), (0, 0, 0, 0.12))
     TILE_BG = _dyn((1, 1, 1, 0.06), (0, 0, 0, 0.05))
 
     WIN_W, WIN_H = 520.0, 500.0
@@ -5278,7 +5430,6 @@ def _settings_controller_class():
             self._panes = {}            # name -> flipped pane view
             self._switch_meta = {}      # tag -> (cfg_key, apply_name_or_None)
             self._seg_meta = {}         # tag -> (values, cfg_key_or_None, apply_name_or_None)
-            self._popup_meta = {}       # tag -> (values, cfg_key_or_None, apply_name_or_None)
             self._perm_rows = {}        # key -> {"pill":btn, "url":str, "tag":int}
             self._perm_tag_to_key = {}  # button tag -> perm key
             self._correction_edit_rows = {}
@@ -5313,6 +5464,14 @@ def _settings_controller_class():
                 self._app.cfg[key] = value
             except Exception:  # noqa: BLE001
                 pass
+            if key == "mode":
+                # The popover bakes hold/toggle into its pill + Start button
+                # at build time — rebuild it on next open so it can't show
+                # "Hold to talk" after a live switch to Toggle.
+                try:
+                    self._app._invalidate_popover()
+                except Exception:  # noqa: BLE001
+                    pass
 
         # ---- window construction -----------------------------------------
         @objc.python_method
@@ -5515,34 +5674,6 @@ def _settings_controller_class():
             return seg
 
         @objc.python_method
-        def _add_popup(self, inner, row_idx, labels, values, cur_value,
-                       cfg_key=None, apply_name=None, pop_w=172.0):
-            top = self._row_top(inner, row_idx)
-            pop = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-                NSMakeRect(0, 0, pop_w, 26), False)
-            for label in labels:
-                pop.addItemWithTitle_(label)
-            sel = 0
-            for i, v in enumerate(values):
-                if v == cur_value:
-                    sel = i
-                    break
-            try:
-                pop.selectItemAtIndex_(sel)
-            except Exception:  # noqa: BLE001
-                pass
-            tag = self._tag()
-            pop.setTag_(tag)
-            pop.setTarget_(self)
-            pop.setAction_("popupChanged:")
-            self._popup_meta[tag] = (tuple(values), cfg_key, apply_name)
-            x = inner.frame().size.width - 14 - pop_w
-            pop.setFrame_(NSMakeRect(x, top - ROW_H / 2 - 13, pop_w, 26))
-            pop.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
-            inner.addSubview_(pop)
-            return pop
-
-        @objc.python_method
         def _add_hotkey_control(self, inner, row_idx):
             top = self._row_top(inner, row_idx)
             btn_w = 86.0
@@ -5573,29 +5704,6 @@ def _settings_controller_class():
             inner.addSubview_(btn)
             self._hotkey_change_button = btn
             return btn
-
-        @objc.python_method
-        def _add_chip(self, inner, row_idx, glyph, text):
-            top = self._row_top(inner, row_idx)
-            lbl = NSTextField.labelWithString_(
-                (glyph + "  " if glyph else "") + text)
-            lbl.setFont_(G.rounded_font(12.5, 0.2))
-            lbl.setTextColor_(TITLE_COL)
-            lbl.sizeToFit()
-            lw = lbl.frame().size.width + 22
-            box = NSView.alloc().initWithFrame_(
-                NSMakeRect(inner.frame().size.width - 14 - lw,
-                           top - ROW_H / 2 - 13, lw, 26))
-            box.setWantsLayer_(True)
-            G.round_layer(box, 8.0)
-            _paint(box.layer(), "setBackgroundColor_", CHIP_BG)
-            box.layer().setBorderWidth_(1.0)
-            _paint(box.layer(), "setBorderColor_", CHIP_RIM)
-            box.setAutoresizingMask_(NSViewMinXMargin | NSViewMinYMargin)
-            lbl.setFrame_(NSMakeRect(11, 5, lw - 22, 16))
-            box.addSubview_(lbl)
-            inner.addSubview_(box)
-            return box
 
         @objc.python_method
         def _add_status_pill(self, inner, row_idx, text, good):
@@ -5701,7 +5809,6 @@ def _settings_controller_class():
             return pane
 
         @objc.python_method
-        @objc.python_method
         def _pane_dictation(self):
             pane = self._flipped(WIN_W, 340)
             y = PAD
@@ -5716,10 +5823,14 @@ def _settings_controller_class():
                               self._cfg("mode", "hold"), cfg_key="mode", seg_w=64.0)
             self._row_divider(inner, 2)
             self._row_text(inner, 2, "Insert method",
-                           "Paste, or type character by character", right_x=180.0)
-            self._add_segment(inner, 2, ("Paste", "Type"), ("paste", "type"),
+                           "Paste, type, or copy-only (no permissions)",
+                           right_x=210.0)
+            # All three config values, or a "clipboard" user would see "Paste"
+            # selected — one click from silently overwriting their setting.
+            self._add_segment(inner, 2, ("Paste", "Type", "Copy"),
+                              ("paste", "type", "clipboard"),
                               self._cfg("insert_method", "paste"),
-                              cfg_key="insert_method", seg_w=64.0)
+                              cfg_key="insert_method", seg_w=54.0)
             self._row_divider(inner, 3)
             self._row_text(inner, 3, "Max recording length",
                            "Auto-stops a runaway capture", right_x=210.0)
@@ -5793,18 +5904,20 @@ def _settings_controller_class():
         @objc.python_method
         def _correction_row_card(self, pane, y_top, rows):
             if not rows:
+                # The card view is NOT flipped: y counts from the bottom, so
+                # the title needs the HIGH y (same pattern as _privacy_banner).
                 inner = self._card_h(pane, y_top, 116.0)
                 title = NSTextField.labelWithString_("No saved corrections yet")
                 title.setFont_(G.rounded_font(14, 0.25))
                 title.setTextColor_(TITLE_COL)
-                title.setFrame_(NSMakeRect(14, 25, CONTENT_W - 28, 20))
+                title.setFrame_(NSMakeRect(14, 89, CONTENT_W - 28, 20))
                 inner.addSubview_(title)
                 body = NSTextField.wrappingLabelWithString_(
                     "Use Teach a Word from the menu bar to save the words früt "
                     "Flow should repair next time.")
                 body.setFont_(G.rounded_font(12.0))
                 body.setTextColor_(SUB_COL)
-                body.setFrame_(NSMakeRect(14, 52, CONTENT_W - 28, 42))
+                body.setFrame_(NSMakeRect(14, 30, CONTENT_W - 28, 48))
                 inner.addSubview_(body)
                 return 116.0
 
@@ -5938,7 +6051,7 @@ def _settings_controller_class():
                              bool(self._cfg("learn_from_edits", True)))
             self._row_divider(inner2, 1)
             self._row_text(inner2, 1, "Dictation history",
-                           "Keep the last 100 dictations on this Mac")
+                           f"Keep the last {HISTORY_CAP} dictations on this Mac")
             self._add_switch(inner2, 1, "history_enabled",
                              bool(self._cfg("history_enabled", True)))
             y += h2 + PAD
@@ -5983,7 +6096,9 @@ def _settings_controller_class():
                  "“Paste” drops the whole transcript in at once — fast, "
                  "and what you'll usually want. “Type” simulates "
                  "keystrokes one character at a time; it's slower but works in the "
-                 "few apps that block pasting."),
+                 "few apps that block pasting. “Copy” only puts the text on "
+                 "the clipboard — you press Cmd-V yourself, and no Accessibility "
+                 "permission is needed."),
                 ("Max recording length",
                  "A safety cap. If a recording ever runs this long without "
                  "stopping, früt Flow ends it automatically so a stuck key can't "
@@ -6003,8 +6118,9 @@ def _settings_controller_class():
                  "languages. This one takes effect after you Restart the app."),
                 ("Cleanup",
                  "How much früt Flow tidies the raw transcript before inserting "
-                 "it. “None” inserts it word-for-word. “Basic” "
-                 "fixes spacing, capitalization, and words you've taught it. "
+                 "it. “None” keeps the engine's words as-is (your taught "
+                 "corrections still apply). “Basic” also fixes fillers, "
+                 "spacing, and capitalization. "
                  "“On-device” uses a local model to fix misheard words "
                  "from context — no cloud, no API key, still private."),
                 ("Normalize audio",
@@ -6240,12 +6356,6 @@ def _settings_controller_class():
                        self._cfg("hotkey", "alt_r"))
             return _hotkey_display_name(name)
 
-        @objc.python_method
-        def _hotkey_glyph(self):
-            name = str(getattr(self._app, "hotkey_name", "") or
-                       self._cfg("hotkey", "alt_r"))
-            return _hotkey_glyph(name)
-
         # ---- launchd agent reflection (read-only) ------------------------
         @objc.python_method
         def _agent_loaded(self):
@@ -6423,6 +6533,10 @@ def _settings_controller_class():
         def _capture_hotkey_event(self, event):
             try:
                 keycode = int(event.keyCode())
+                # Escape cancels the capture instead of becoming the binding —
+                # otherwise the tap would own Esc system-wide with no way out.
+                if keycode == 53:
+                    return None
                 value = _hotkey_name_for_vk(keycode)
                 self.apply_hotkey(value)
             except Exception as e:  # noqa: BLE001
@@ -6471,24 +6585,6 @@ def _settings_controller_class():
             elif cfg_key:
                 self._save(cfg_key, val)
 
-        def popupChanged_(self, sender):
-            meta = self._popup_meta.get(int(sender.tag()))
-            if not meta:
-                return
-            values, cfg_key, apply_name = meta
-            try:
-                i = int(sender.indexOfSelectedItem())
-            except Exception:  # noqa: BLE001
-                return
-            if not (0 <= i < len(values)):
-                return
-            val = values[i]
-            if apply_name:
-                fn = getattr(self, apply_name, None)
-                if fn:
-                    fn(val)
-            elif cfg_key:
-                self._save(cfg_key, val)
 
         @objc.python_method
         def _is_live_drag(self):
@@ -6615,27 +6711,21 @@ def _onboarding_controller_class():
     from pathlib import Path as _Path
     from Cocoa import (
         NSObject, NSView, NSWindow, NSTextField, NSButton, NSImage,
-        NSImageView, NSApplication, NSColor, NSFont, NSBezierPath,
-        NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
+        NSImageView, NSApplication, NSColor,
+        NSMakeRect, NSMakePoint, NSOperationQueue, NSTimer,
         NSApplicationActivationPolicyRegular,
         NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
         NSWindowStyleMaskMiniaturizable,
         NSBackingStoreBuffered, NSViewWidthSizable, NSViewHeightSizable,
-        NSViewMinXMargin, NSViewMinYMargin, NSViewMaxYMargin, NSViewMaxXMargin,
+        NSViewMinXMargin, NSViewMaxYMargin, NSViewMaxXMargin,
         NSTextAlignmentCenter, NSTextAlignmentLeft, NSLineBreakByWordWrapping,
     )
     try:
-        from Cocoa import (
-            NSImageScaleProportionallyUpOrDown as _SCALE_FILL,
-            NSImageAlignmentCenter as _IMG_CENTER,
-        )
+        from Cocoa import NSImageScaleProportionallyUpOrDown as _SCALE_FILL
     except ImportError:  # pragma: no cover
-        _SCALE_FILL, _IMG_CENTER = 3, 0
+        _SCALE_FILL = 3
 
     G = _glass()
-
-    def _white(a):
-        return NSColor.whiteColor().colorWithAlphaComponent_(a)
 
     def _rgb(r, g, b, a=1.0):
         return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, a)
@@ -6848,7 +6938,7 @@ def _onboarding_controller_class():
             self._icon_tile(v, "lock.open", (W - side) / 2.0, top - side,
                             side, 15, 26)
             y = top - side - 18 - 26
-            self._label(v, "Two quick permissions", 0, y, W, 26, 21, 0.6,
+            self._label(v, "A few quick permissions", 0, y, W, 26, 21, 0.6,
                         _dyn((1, 1, 1, 1.0), (0, 0, 0, 0.88)), NSTextAlignmentCenter)
             self._label(
                 v, "früt Flow needs these to hear you and type for you. They "
@@ -7189,8 +7279,6 @@ def _onboarding_controller_class():
                 row["granted"] = granted
                 row["pill"].setHidden_(not granted)
                 row["button"].setHidden_(granted)
-            # Emphasize Continue only when all three granted (still allow proceed).
-            self._all_granted = all(states.values())
 
         @objc.python_method
         def _start_perm_timer(self):
@@ -7241,6 +7329,20 @@ def _onboarding_controller_class():
 
         @objc.python_method
         def _grant_mic(self):
+            # The TCC prompt can only be shown while the status is
+            # notDetermined. Once the user has clicked "Don't Allow" (or the
+            # app launch already consumed the prompt), requesting again is a
+            # silent no-op — the ONLY remaining path is System Settings, so
+            # deep-link there exactly like the Accessibility/Input rows do.
+            try:
+                import AVFoundation
+                status = AVFoundation.AVCaptureDevice.\
+                    authorizationStatusForMediaType_(AVFoundation.AVMediaTypeAudio)
+            except Exception:  # noqa: BLE001
+                status = None
+            if status is not None and status != 0:
+                self._open_pane("Privacy_Microphone")
+                return
             # Trigger the AVFoundation prompt off the main thread (the module-level
             # helper blocks/polls up to 120s — must never run on the UI thread).
             def _work():
@@ -7751,6 +7853,7 @@ def _popover_controller_class():
             self._app = app
             self._popover = None
             self._vc = None
+            self._closed_at = 0.0
             return self
 
         @objc.python_method
@@ -7786,6 +7889,12 @@ def _popover_controller_class():
             self._ensure()
             if self._popover.isShown():
                 self._popover.performClose_(None)
+                return
+            # Transient popovers dismiss on mouse-DOWN outside; the status
+            # button's action arrives on mouse-UP of that same click. Without
+            # this guard, clicking the glyph while the popover is open closes
+            # it and instantly re-shows it — the icon can only ever blink it.
+            if time.monotonic() - getattr(self, "_closed_at", 0.0) < 0.25:
                 return
             item = getattr(self._app, "_status_item", None)
             btn = item.button() if item is not None else None
@@ -7840,9 +7949,21 @@ def _popover_controller_class():
             except Exception:  # noqa: BLE001
                 pass
 
-        # NSPopoverDelegate — nothing special; keep default transient behavior.
+        # NSPopoverDelegate — timestamp closes for toggle()'s re-show guard.
         def popoverDidClose_(self, _note):
-            pass
+            self._closed_at = time.monotonic()
+
+        @objc.python_method
+        def invalidate(self):
+            """Drop the built popover so the NEXT open rebuilds its content.
+            Called after live config changes (hotkey, activation mode) that are
+            baked into the popover's static labels/buttons at build time."""
+            try:
+                self.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._popover = None
+            self._vc = None
 
         # -- row actions (tag-dispatched; MAIN thread) ----------------------
         def rowClicked_(self, sender):
@@ -8058,9 +8179,21 @@ class FlowApp:
 
         if stop_hold_recording:
             self._request_capture(False)
+        # The popover bakes the hotkey chip into its content at build time.
+        self._invalidate_popover()
         print(f"[flow] hotkey changed: {old} -> {name} "
               f"(vks={sorted(target_vks)}).", flush=True)
         return True
+
+    def _invalidate_popover(self) -> None:
+        """Rebuild the menu-bar popover on its next open (after live config
+        changes whose values are baked into its static content)."""
+        ctrl = getattr(self, "_popover_ctrl", None)
+        if ctrl is not None:
+            try:
+                ctrl.invalidate()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _set_status(self, glyph: str, label: str) -> None:
         """Reflect the dictation state in the menu bar. No-op unless in app mode.
@@ -8119,11 +8252,8 @@ class FlowApp:
             transition = self._capture_q.get()
             if transition is None:
                 return
-            if isinstance(transition, tuple):
-                generation, begin = transition
-            else:  # compatibility with older in-memory callers/tests
-                generation, begin = None, bool(transition)
             try:
+                generation, begin = transition
                 if begin:
                     # Process every accepted transition in FIFO order. Re-reading
                     # only the latest desired state here would collapse a very fast
@@ -8172,6 +8302,23 @@ class FlowApp:
             threading.Thread(target=self._reconcile_edit_learning,
                              daemon=True).start()
 
+    def _reflect_pipeline_status(self) -> None:
+        """Sync the menu bar + HUD with the capture/worker truth.
+
+        Called on every path where a capture ends WITHOUT reaching the worker's
+        own end-of-clip update — a too-short clip, a full queue, or a clip
+        queued behind a busy worker. Without this, the status (and the HUD)
+        stays on "Listening" with the mic off until the next dictation.
+        """
+        with self._state_lock:
+            busy = self._processing_started is not None
+        if self.recorder.recording:
+            self._set_status("🔴", "● Listening…")
+        elif busy or not self._work_q.empty():
+            self._set_status("⏳", "● Transcribing…")
+        else:
+            self._set_status("🎙️", "● Idle")
+
     def _end(self, *, generation: int | None = None) -> None:
         with self._state_lock:
             # Authoritative single reset point for the hands-free latch: clear it
@@ -8197,6 +8344,7 @@ class FlowApp:
         play("Pop", self.cfg)
         if audio is None or len(audio) / SAMPLE_RATE < self.cfg["min_seconds"]:
             print("[flow] (too short, ignored)")
+            self._reflect_pipeline_status()
             return
         # Hand the clip to the single transcription worker and return immediately —
         # capture is never blocked by a slow transcribe.
@@ -8207,7 +8355,9 @@ class FlowApp:
                   "memory cannot grow without bound. Restart früt Flow if text "
                   "has stopped appearing.", flush=True)
             play("Basso", self.cfg)
+            self._reflect_pipeline_status()
             return
+        self._reflect_pipeline_status()
         depth = self._work_q.qsize()
         if depth > 1:
             print(f"[flow] queued — {depth} clips waiting to transcribe.")
@@ -8233,10 +8383,7 @@ class FlowApp:
                 # bounded queue, warm before the first post-wake clip anyway.
                 if self._wake_warm_event.is_set():
                     self._warm_models_after_wake()
-                if isinstance(item, tuple):
-                    audio, enqueued_at = item
-                else:  # compatibility with any tests/older in-memory producer
-                    audio, enqueued_at = item, time.monotonic()
+                audio, enqueued_at = item
                 queue_wait = max(0.0, time.monotonic() - enqueued_at)
                 with self._state_lock:
                     self._processing_started = time.monotonic()
@@ -8248,12 +8395,7 @@ class FlowApp:
                 with self._state_lock:
                     self._processing_started = None
                 # Reflect the resulting state in the menu bar (cosmetic only).
-                if self.recorder.recording:
-                    self._set_status("🔴", "● Listening…")
-                elif not self._work_q.empty():
-                    self._set_status("⏳", "● Transcribing…")
-                else:
-                    self._set_status("🎙️", "● Idle")
+                self._reflect_pipeline_status()
                 self._work_q.task_done()
 
     def _schedule_audio_refresh(self) -> None:
@@ -8365,7 +8507,11 @@ class FlowApp:
         model_seconds = cleanup_seconds = insert_seconds = 0.0
         try:
             print("[flow] transcribing...")
-            self._set_status("⏳", "● Transcribing…")
+            # An actively-recording NEW capture outranks this clip's progress:
+            # keep the red glyph/HUD wave while the mic is hot; the worker's
+            # finally block re-syncs when this clip is done.
+            if not self.recorder.recording:
+                self._set_status("⏳", "● Transcribing…")
             # Bias the model toward YOUR vocabulary. "hotwords" is the reliable
             # lever (short curated list); "prompt" is the legacy initial_prompt
             # blob. Ignored by the Parakeet backend (no decoder biasing), but the
@@ -8543,11 +8689,7 @@ class FlowApp:
 
         if not last:
             return _refuse("(never mind — but nothing to undo)", put_back=False)
-        if len(last) == 3:
-            last_text, last_app, last_el = last
-        else:  # compatibility with any in-memory stack from an older code path
-            last_text, last_app = last
-            last_el = None
+        last_text, last_app, last_el = last
         # SAFETY (app identity): only backspace if focus is still in the SAME app we
         # dictated into. Otherwise 'never mind' — said to yourself after clicking into
         # a terminal/editor — would eat that app's text. Refuse on any app change.
@@ -8811,13 +8953,30 @@ class FlowApp:
 
         if is_down is None:
             # Bare modifier (flagsChanged): derive down/up from the flag bits.
-            mask = _MODIFIER_MASK_BY_VK.get(keycode)
-            if mask is not None and flags is not None:
-                is_down = bool(int(flags) & mask)
+            side = _MODIFIER_MASK_BY_VK.get(keycode)
+            cls = _MODIFIER_CLASS_MASK_BY_VK.get(keycode)
+            probe = _MODIFIER_DEVICE_BITS_BY_VK.get(keycode)
+            if (flags is not None and side is not None and probe is not None
+                    and (int(flags) & probe)):
+                # Device-side bits present: exact per-side state, so releasing
+                # Right Option while Left is still held reads correctly as up.
+                is_down = bool(int(flags) & side)
+            elif flags is not None and cls is not None:
+                # No side info (exotic keyboard driver, or Caps Lock / Fn which
+                # have no per-side bit): the generic class bit. For Caps Lock
+                # this tracks the LOCK state, so each press alternates
+                # down/up — deterministic, never stuck.
+                is_down = bool(int(flags) & cls)
             else:
-                # Last-resort fallback: no mask known, so toggle our state.
+                # Last-resort fallback: no mask known, alternate our own state
+                # and dispatch DIRECTLY — the idempotence guard below compares
+                # against the state we just toggled and would swallow the event.
                 self._key_down = not self._key_down
-                is_down = self._key_down
+                if self._key_down:
+                    self._on_key_down()
+                else:
+                    self._on_key_up()
+                return True
 
         # Self-healing for a missed event: if we think the key is already in the
         # state this event reports, there's nothing to do (re-reading absolute
@@ -8985,8 +9144,14 @@ class FlowApp:
                     return True
                 self._locked = False       # clear BEFORE the stop so the auto-cap path can't re-guard
                 stopping = True
-            elif self.recorder.recording and self._key_down and not is_repeat:
-                self._locked = True        # hotkey genuinely held AND recording -> LATCH
+            elif ((self.recorder.recording or self._capture_requested)
+                  and self._key_down and not is_repeat):
+                # Latch when recording OR when a capture is requested but the
+                # (possibly slow, post-wake) CoreAudio open hasn't finished —
+                # otherwise the backtick falls through and TYPES into the app.
+                # If that pending start ultimately fails, _end()'s
+                # authoritative reset clears the latch.
+                self._locked = True
                 latched = True
             else:
                 return False               # idle backtick (or its repeats) -> real character, pass through
@@ -9149,6 +9314,15 @@ class FlowApp:
             ok = self._install_tap() and self._tap_enabled()
             self._tap_ok = bool(ok)
             print(f"[flow] hotkey tap rebuilt (enabled={ok}).", flush=True)
+            if not ok:
+                # Surface a dead hotkey in the menu bar: without this the glyph
+                # stays on a healthy "Idle" while the watchdog logs rebuild
+                # failures every few seconds and dictation is unusable.
+                self._set_status("⚠️", "● Hotkey unavailable — check Input "
+                                       "Monitoring, or Restart")
+            elif getattr(self, "_last_glyph", None) == "⚠️":
+                # The tap is back — clear the warning glyph.
+                self._reflect_pipeline_status()
             # Rebuild the lock tap in its OWN inner try so a lock-tap failure NEVER
             # affects main-tap state or triggers the main tap's escalation.
             try:
@@ -9218,21 +9392,37 @@ class FlowApp:
         # Populate the modifier flag masks now that Quartz is imported. For a
         # bare modifier we read down/up from the event's flag bits (see
         # _handle_event) instead of toggling a Python flag that gets stuck
-        # inverted if an event is ever missed. We map BOTH Option keycodes to
-        # the generic Alternate mask: this pyobjc build does not export the
-        # device-specific NX_DEVICE*ALT* masks, and since we accept either
-        # Option interchangeably, the generic "any Alt is down" bit is exactly
-        # the right signal (set while either Option is held, clear when both
-        # are released).
+        # inverted if an event is ever missed. Side masks are the NX_DEVICE*
+        # bits from IOKit's IOLLEvent.h — stable ABI constants this pyobjc
+        # build doesn't export — so a binding named "Right Option" matches only
+        # the right key and typing @/€/[ with LEFT Option on EU layouts no
+        # longer opens the mic. Keyboards whose drivers report no device-side
+        # bits fall back to the generic class mask in _handle_event.
         _alt = int(Quartz.kCGEventFlagMaskAlternate)
         _ctrl = int(Quartz.kCGEventFlagMaskControl)
         _cmd = int(Quartz.kCGEventFlagMaskCommand)
         _shift = int(Quartz.kCGEventFlagMaskShift)
+        _caps = int(Quartz.kCGEventFlagMaskAlphaShift)
+        _fn = int(Quartz.kCGEventFlagMaskSecondaryFn)
         _MODIFIER_MASK_BY_VK.update({
+            58: 0x00000020, 61: 0x00000040,   # NX_DEVICEL/RALTKEYMASK
+            59: 0x00000001, 62: 0x00002000,   # NX_DEVICEL/RCTLKEYMASK
+            55: 0x00000008, 54: 0x00000010,   # NX_DEVICEL/RCMDKEYMASK
+            56: 0x00000002, 60: 0x00000004,   # NX_DEVICEL/RSHIFTKEYMASK
+        })
+        _MODIFIER_CLASS_MASK_BY_VK.update({
             58: _alt, 61: _alt,        # left / right Option
             59: _ctrl, 62: _ctrl,      # left / right Control
             55: _cmd, 54: _cmd,        # left / right Command
             56: _shift, 60: _shift,    # left / right Shift
+            57: _caps,                 # Caps Lock (lock STATE bit — see below)
+            63: _fn,                   # Fn / Globe
+        })
+        _MODIFIER_DEVICE_BITS_BY_VK.update({
+            58: 0x60, 61: 0x60,
+            59: 0x2001, 62: 0x2001,
+            55: 0x18, 54: 0x18,
+            56: 0x06, 60: 0x06,
         })
 
         verb = "Hold" if self.cfg["mode"] == "hold" else "Tap"
@@ -9454,6 +9644,24 @@ class FlowApp:
         except Exception as e:  # noqa: BLE001
             print(f"[flow] couldn't open the history window: {e}", flush=True)
 
+    def _needs_onboarding_permissions(self) -> bool:
+        """True when a permission the app depends on is still missing — the
+        exact situation the first-run Welcome window exists to fix."""
+        try:
+            if not _ax_trusted():
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        if not self._tap_ok:            # Input Monitoring not granted yet
+            return True
+        try:
+            import AVFoundation
+            status = AVFoundation.AVCaptureDevice.authorizationStatusForMediaType_(
+                AVFoundation.AVMediaTypeAudio)
+            return int(status) != 3     # anything but authorized
+        except Exception:  # noqa: BLE001
+            return False
+
     def _show_onboarding_window(self) -> None:
         """Open (or re-focus) the first-run Onboarding window. Built lazily."""
         try:
@@ -9599,6 +9807,23 @@ class FlowApp:
         # _popup_menu (control/right-click), leaving left-click for the popover.
         if not button_wired:
             item.setMenu_(menu)
+
+        # First-run onboarding. The Welcome window is otherwise only reachable
+        # through the control/right-click menu — which a brand-new user has no
+        # reason to discover — and without it nobody walks them through the
+        # Accessibility grant, so their first dictation silently lands on the
+        # clipboard. Auto-show ONCE, and only when a permission is actually
+        # missing; a healthy install just records the flag and shows nothing.
+        if not self.cfg.get("onboarding_done", False):
+            try:
+                _settings_config_save("onboarding_done", True)
+                self.cfg["onboarding_done"] = True
+            except Exception:  # noqa: BLE001
+                pass
+            if self._needs_onboarding_permissions():
+                from Cocoa import NSOperationQueue
+                NSOperationQueue.mainQueue().addOperationWithBlock_(
+                    self._show_onboarding_window)
 
         # We're on the main thread here, so paint the initial state directly.
         app.run()
@@ -9757,6 +9982,12 @@ def compare_engines(cfg: dict, seconds: float = 6.0) -> int:
     which to keep as `transcribe_backend`. Latency is the trustworthy signal; accuracy
     differences on your real speech are what to judge."""
     ensure_microphone_access()
+    # Clamp before the mic opens: argparse happily passes "--compare=-5" or
+    # "nan" through, and time.sleep would then die mid-recording.
+    seconds = float(seconds)
+    if not np.isfinite(seconds):
+        seconds = 6.0
+    seconds = max(0.5, min(60.0, seconds))
     rec = Recorder()
     print(f"[flow] recording {seconds:.0f}s — start speaking (or WHISPER) now...",
           flush=True)
@@ -9810,6 +10041,9 @@ def compare_engines(cfg: dict, seconds: float = 6.0) -> int:
             print(f"     cleaned: {cleaned or '(nothing)'}\n")
         except Exception as e:  # noqa: BLE001
             print(f"── {name}: ERROR {e}\n")
+    if not engines:
+        print("[flow] neither engine could be loaded — nothing was compared.")
+        return 1
     print("[flow] tip: run this a few times with different quiet/whispered lines. "
           "To switch engines, set \"transcribe_backend\" in "
           f"{CONFIG_PATH} to \"parakeet\" or \"local\".")
@@ -9970,7 +10204,7 @@ def main() -> int:
         print(f"[flow] distinctive vocab used for biasing + fuzzy-correct "
               f"({len(terms)}):")
         print("    " + ", ".join(terms) if terms else "    (none yet)")
-        print(f"[flow] hotwords sent to the model:")
+        print("[flow] hotwords sent to the model:")
         print("    " + (build_hotwords(load_config()) or "(none)"))
         top = sorted((vocab or {}).values(),
                      key=lambda e: e.get("count", 0), reverse=True)[:30]
@@ -10004,6 +10238,33 @@ def main() -> int:
         print(f"[flow] missing dependency: {e.name}\n"
               f"       install requirements first:  pip install -r requirements.txt")
         return 1
+    except Exception as e:  # noqa: BLE001
+        # e.g. offline with an empty model cache. Exit cleanly instead of
+        # letting the raw traceback feed the watchdog's relaunch loop forever.
+        print(f"[flow] could not load a transcription engine: {e}\n"
+              f"       Check your network for the one-time model download, "
+              f"then relaunch früt Flow.", flush=True)
+        return 1
+
+    # Single-instance guard for the LONG-RUNNING app only (one-shot commands
+    # like --transcribe stay usable while the app runs). Launching from
+    # Terminal while the installed .app is already live would otherwise give
+    # TWO hotkey listeners typing every dictation twice. flock releases
+    # automatically when the process dies, so a crash can never wedge it.
+    global _INSTANCE_LOCK_FD
+    try:
+        import fcntl
+        _secure_dir()
+        _INSTANCE_LOCK_FD = open(INSTANCE_LOCK_PATH, "w")
+        os.chmod(INSTANCE_LOCK_PATH, 0o600)   # empty, but keep the dir uniform
+        fcntl.flock(_INSTANCE_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("[flow] another früt Flow instance is already running — leaving "
+              "it in charge and exiting. (Quit it from the menu bar first, or "
+              "use restart.sh to swap instances.)", flush=True)
+        return 0
+    except Exception:  # noqa: BLE001  best-effort guard, never fatal
+        pass
 
     app = FlowApp(cfg, transcriber)
     # The mic TCC prompt can only be presented by a bona-fide app. In classic /

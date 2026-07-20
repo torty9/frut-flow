@@ -513,6 +513,11 @@ class HuggingFaceCacheTests(unittest.TestCase):
             "huggingface_hub.constants": constants,
         }
 
+    @staticmethod
+    def _add_weights(snap_dir: Path):
+        """Make a fixture snapshot look fully downloaded (nonzero weights)."""
+        (snap_dir / "model.safetensors").write_bytes(b"w" * 8)
+
     def test_main_ref_wins_over_newer_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache = Path(tmp)
@@ -521,6 +526,8 @@ class HuggingFaceCacheTests(unittest.TestCase):
             new = repo / "snapshots" / "new-commit"
             old.mkdir(parents=True)
             new.mkdir()
+            self._add_weights(old)
+            self._add_weights(new)
             now = 1_700_000_000
             os.utime(old, (now, now))
             os.utime(new, (now + 10, now + 10))
@@ -541,6 +548,8 @@ class HuggingFaceCacheTests(unittest.TestCase):
             newest = repo / "snapshots" / "newest"
             older.mkdir(parents=True)
             newest.mkdir()
+            self._add_weights(older)
+            self._add_weights(newest)
             (repo / "refs").mkdir()
             (repo / "refs" / "main").write_text(
                 "missing-commit", encoding="utf-8")
@@ -558,6 +567,41 @@ class HuggingFaceCacheTests(unittest.TestCase):
             cache = Path(tmp)
             with mock.patch.dict(sys.modules, self._fake_hub(cache)):
                 self.assertIsNone(flow._hf_cached_snapshot("acme/missing"))
+
+    def test_incomplete_snapshot_is_not_reported_as_cached(self):
+        """An interrupted first-run download (config.json present, weights
+        absent) must NOT be handed to model loaders: returning it would
+        permanently suppress the resumable hub download."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            repo = cache / "models--acme--speech-model"
+            snap = repo / "snapshots" / "torn"
+            snap.mkdir(parents=True)
+            (snap / "config.json").write_text("{}", encoding="utf-8")
+            (repo / "refs").mkdir()
+            (repo / "refs" / "main").write_text("torn", encoding="utf-8")
+            with mock.patch.dict(sys.modules, self._fake_hub(cache)):
+                self.assertIsNone(flow._hf_cached_snapshot("acme/speech-model"))
+
+    def test_complete_older_snapshot_beats_incomplete_preferred(self):
+        """If the ref'd snapshot is torn but an older complete one exists, the
+        complete one is used (offline startup still works)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp)
+            repo = cache / "models--acme--speech-model"
+            torn = repo / "snapshots" / "torn"
+            good = repo / "snapshots" / "good"
+            torn.mkdir(parents=True)
+            good.mkdir()
+            self._add_weights(good)
+            now = 1_700_000_000
+            os.utime(good, (now, now))
+            os.utime(torn, (now + 10, now + 10))
+            (repo / "refs").mkdir()
+            (repo / "refs" / "main").write_text("torn", encoding="utf-8")
+            with mock.patch.dict(sys.modules, self._fake_hub(cache)):
+                resolved = flow._hf_cached_snapshot("acme/speech-model")
+            self.assertEqual(resolved, good)
 
 
 class UsageStatsTests(unittest.TestCase):
@@ -640,6 +684,46 @@ class UsageStatsTests(unittest.TestCase):
             stats, ok = flow._load_usage_stats_for_update()
             self.assertTrue(ok)                               # a real first run
             self.assertEqual(stats["dictations"], 0)
+
+
+class CorrectionsEscapeTests(unittest.TestCase):
+    """apply_corrections must insert taught text LITERALLY. As a re.sub
+    template, a taught target containing a backslash either raised re.error
+    (silently killing every later dictation until corrections.json was
+    hand-edited) or injected control characters into the pasted text."""
+
+    def test_backslash_path_is_inserted_literally(self):
+        with mock.patch.object(flow, "load_corrections",
+                               return_value={"see users": r"C:\Users\me"}):
+            out = flow.apply_corrections("please see users now")
+        self.assertEqual(out, r"please C:\Users\me now")
+
+    def test_backslash_sequences_are_not_escapes(self):
+        # "\a" (BEL) and "\n" (newline) must come out as two characters each.
+        with mock.patch.object(flow, "load_corrections",
+                               return_value={"alpha": "\\alpha", "newline": "\\n"}):
+            out = flow.apply_corrections("alpha then newline")
+        self.assertEqual(out, "\\alpha then \\n")
+
+
+class DefaultConfigWriteTests(unittest.TestCase):
+    """--setup runs write_default_config on every install/update; it must never
+    clobber an existing, possibly hand-tuned config.json."""
+
+    def test_existing_config_is_left_byte_identical(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg_path = tmp_path / "config.json"
+            payload = '{"hotkey": "cmd_r", "cleanup": "basic", "custom": 1}\n'
+            cfg_path.write_text(payload, encoding="utf-8")
+            with mock.patch.object(flow, "CONFIG_DIR", tmp_path), \
+                 mock.patch.object(flow, "CONFIG_PATH", cfg_path), \
+                 mock.patch.object(flow, "CODE_DIR_PATH", tmp_path / "code_dir"), \
+                 redirect_stdout(io.StringIO()):
+                flow.write_default_config()
+            self.assertEqual(cfg_path.read_text(encoding="utf-8"), payload)
+            # the code-dir pointer is the one thing it should (re)write
+            self.assertTrue((tmp_path / "code_dir").is_file())
 
 
 if __name__ == "__main__":

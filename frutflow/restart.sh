@@ -29,13 +29,22 @@ prepare_flowdictate_dir() {
   chmod 600 "$LOG"
 }
 
-process_cwd_matches_repo() {
+process_cwd_matches_flow() {
   local pid="$1"
   local cwd
   cwd="$(LC_ALL=UTF-8 lsof -a -p "$pid" -d cwd -Fn 2>/dev/null |
     sed -n 's/^n//p' | head -n 1)"
+  [ -n "$cwd" ] || return 1
   # Compare directory identity so NFC/NFD spellings of "früt" are equivalent.
-  [ -n "$cwd" ] && [ "$cwd" -ef "$SCRIPT_DIR" ]
+  # Accept this script's folder AND the installed instance's code directory,
+  # so restart works from any copy of the script, not only the one sitting
+  # next to the running code.
+  [ "$cwd" -ef "$SCRIPT_DIR" ] && return 0
+  local code_dir=""
+  if [ -f "$FLOWDICTATE_DIR/code_dir" ]; then
+    code_dir="$(head -n 1 "$FLOWDICTATE_DIR/code_dir" 2>/dev/null || true)"
+  fi
+  [ -n "$code_dir" ] && [ -d "$code_dir" ] && [ "$cwd" -ef "$code_dir" ]
 }
 
 flow_process_matches() {
@@ -47,7 +56,11 @@ flow_process_matches() {
   if [[ "$args" == *python*"/flow.py"* ||
         "$args" == *python*" flow.py"* ||
         "$args" == *python*" ./flow.py"* ]]; then
-    process_cwd_matches_repo "$pid"
+    # The installed .app instance is identifiable by its ASCII bundle path.
+    if [[ "$args" == *"frutflow.app/Contents/MacOS/"* ]]; then
+      return 0
+    fi
+    process_cwd_matches_flow "$pid"
     return
   fi
 

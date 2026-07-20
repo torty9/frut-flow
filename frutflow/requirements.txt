@@ -21,4 +21,6 @@ jellyfish>=1.0
 # enables this and preloads the model; manual installs can still leave cleanup
 # set to "basic" in ~/.flowdictate/config.json if they do not want the extra model.
 mlx-lm>=0.28
+# Not imported by flow.py directly: mlx-lm's tokenizer dependency. Pinned <5
+# here so a transformers major bump can't break the repair path underneath us.
 transformers>=4.44,<5

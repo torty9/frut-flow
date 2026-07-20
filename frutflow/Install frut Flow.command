@@ -86,6 +86,13 @@ if [ "$(uname -m)" != "arm64" ]; then
   fail "This version is built for Apple Silicon Macs."
 fi
 
+# mlx publishes wheels only for macOS 14+; gating here beats a cryptic pip
+# "no matching distribution" failure after minutes of Homebrew setup.
+MACOS_MAJOR="$(/usr/bin/sw_vers -productVersion | cut -d. -f1)"
+if [ "${MACOS_MAJOR:-0}" -lt 14 ]; then
+  fail "frut Flow needs macOS 14 (Sonoma) or newer — this Mac runs $(/usr/bin/sw_vers -productVersion)."
+fi
+
 ensure_homebrew
 ensure_python
 
@@ -134,8 +141,27 @@ fi
 
 create_app_bundle() {
   if [ -d "$APP" ]; then
-    echo "Using existing app bundle:"
-    echo "  $APP"
+    # Keep the permissioned bundle, but refresh its embedded Python when the
+    # system Python moved on: after a brew upgrade the old copied binary would
+    # otherwise run against a NEWER venv's site-packages — an ABI mismatch
+    # that crashes at launch and feeds the watchdog's relaunch loop.
+    local want have python_path
+    want="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+    have="$("$APP/Contents/MacOS/python3" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo missing)"
+    if [ "$have" != "$want" ]; then
+      echo "Updating the app bundle's Python ($have -> $want)..."
+      python_path="$(python3 -c 'import sys; print(sys.executable)')"
+      cp -f "$python_path" "$APP/Contents/MacOS/python3"
+      chmod +x "$APP/Contents/MacOS/python3"
+      if command -v codesign >/dev/null 2>&1; then
+        codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+      fi
+      echo "(If macOS asks for the Microphone/Accessibility/Input Monitoring"
+      echo " permissions again, re-allow frutflow in Privacy & Security.)"
+    else
+      echo "Using existing app bundle:"
+      echo "  $APP"
+    fi
     echo
     return 0
   fi
@@ -171,7 +197,7 @@ create_app_bundle() {
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
-  <string>11.0</string>
+  <string>14.0</string>
   <key>LSMultipleInstancesProhibited</key>
   <true/>
   <key>NSHighResolutionCapable</key>

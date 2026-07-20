@@ -28,6 +28,7 @@
   "learn_from_edits": true,
   "learn_window_seconds": 20,
   "history_enabled": true,
+  "onboarding_done": false,
   "insert_method": "paste",
   "restore_clipboard": true,
   "auto_space": true,

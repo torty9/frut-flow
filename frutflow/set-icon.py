@@ -29,8 +29,11 @@ def main() -> int:
         return 1
     ok = NSWorkspace.sharedWorkspace().setIcon_forFile_options_(img, APP, 0)
     print(f"applied {icon.name} to {APP}: {'ok' if ok else 'FAILED'}")
-    # nudge Finder to refresh the icon
-    Path(APP).touch()
+    if ok:
+        # nudge Finder to refresh the icon. Only on success: touch() on a
+        # MISSING app would create a stray empty file squatting on the exact
+        # path the watchdog and installer expect the real bundle at.
+        Path(APP).touch()
     return 0 if ok else 1
 
 

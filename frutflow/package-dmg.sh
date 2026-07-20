@@ -72,7 +72,7 @@ After installation, allow frutflow in Privacy & Security for:
 
 Requirements:
 - Apple Silicon Mac
-- macOS 11 or newer
+- macOS 14 (Sonoma) or newer
 - Internet access during installation
 README
 

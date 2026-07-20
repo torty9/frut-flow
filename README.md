@@ -20,7 +20,8 @@ Restart, Open Log, and Quit**.
 
 - **On‑device, private** transcription (Parakeet‑MLX on the GPU; `faster‑whisper` fallback).
 - **Automatic accuracy**: phonetic proper‑noun repair + learns corrections from your edits.
-- **Menu‑bar app** — no Terminal window needed; self‑contained `frutflow.app`.
+- **Menu‑bar app** — no Terminal window needed; `frutflow.app` owns the macOS
+  permissions while the code and venv live beside it for easy updates.
 - **Voice undo — "never mind."** If a whole utterance is *"never mind"* (or *"scratch
   that"*, *"actually never mind"*, …), the previous dictation is deleted instead of
   typed — but only while your cursor is still in the app you dictated into.

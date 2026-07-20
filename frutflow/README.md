@@ -33,7 +33,7 @@ Three layers stack so you rarely have to fix anything — all **on-device, autom
 
 ## Requirements
 
-- macOS 11+ on Apple Silicon
+- macOS 14 (Sonoma)+ on Apple Silicon
 - [Homebrew](https://brew.sh) (used to install the PortAudio audio library)
 - Python 3.10+
 
@@ -61,19 +61,6 @@ signed or notarized, macOS may require the one-time **System Settings ▸ Privac
 For the smallest possible attachment, send **`Install frut Flow from
 GitHub.command`** instead. It downloads the latest app from the GitHub `main`
 branch, so commit and push the current repo before sending it.
-
-## Make a shareable installer DMG
-
-From this project folder:
-
-```bash
-./package-dmg.sh
-```
-
-That builds and verifies
-`dist/frut-flow-mac-installer-YYYY-MM-DD.dmg`. Its visible installer runs the
-same setup as the zip installer while keeping the supporting payload hidden in
-the disk image.
 
 ## Quick start
 
@@ -156,7 +143,7 @@ Edit `~/.flowdictate/config.json` (see `config.example.json`, or use the in-app
 | `fuzzy_correct` | `true` | Phonetic proper-noun repair against your learned vocab (engine-agnostic) |
 | `learn_from_edits` | `true` | Auto-learn corrections by watching the field you paste into |
 | `cleanup` | `"basic"` | `"none"` (raw) · `"basic"` (strip fillers) · `"local"` (on-device misheard-word repair — no cloud, no key) |
-| `insert_method` | `"paste"` | `"paste"` (clipboard+Cmd-V) or `"type"` (key-by-key) |
+| `insert_method` | `"paste"` | `"paste"` (clipboard+Cmd-V), `"type"` (key-by-key), or `"clipboard"` (copy only — you press Cmd-V; needs **no** Accessibility permission) |
 | `restore_clipboard` | `true` | Put your previous clipboard back after pasting the dictation |
 | `auto_space` | `true` | Prepend a space so dictation merges naturally with existing text |
 | `undo_phrases` | `["never mind", …]` | Whole-utterance phrases that delete the previous dictation instead of typing |
@@ -218,13 +205,10 @@ optional extra is a **fully on-device** cleanup step:
   dictation and fixes clear mishearings (homophones like *there/their*,
   *pier/peer*, or a garbled term the sentence makes obvious). It's conservative:
   it never paraphrases, answers, or touches a word that was already right. No
-  cloud, no account, no API key:
-
-  ```bash
-  pip install "mlx-lm>=0.28" "transformers>=4.44,<5"
-  ```
-  then set `"cleanup": "local"`. The repair model (~0.9 GB) downloads once on
-  first use, then runs entirely on your Apple-Silicon GPU.
+  cloud, no account, no API key. Everything it needs is already installed by
+  `requirements.txt` — just set `"cleanup": "local"` (or pick **On-device** in
+  Settings ▸ Model). The repair model (~0.9 GB) downloads once on first use,
+  then runs entirely on your Apple-Silicon GPU.
 
 ## Troubleshooting
 
@@ -239,7 +223,7 @@ optional extra is a **fully on-device** cleanup step:
 | It keeps misspelling a name | Just fix it once after it pastes — it learns the correction automatically. Or `./run.sh --correct "heard" "correct"`. |
 | A real word gets "corrected" | Raise `"fuzzy_threshold"` (e.g. `0.85`), or set `"fuzzy_correct": false`. |
 | Old clipboard isn't restored | `restore_clipboard` is on by default; if it misses on a slow Mac, set `"restore_clipboard": false` for dictation-only behavior. |
-| Transcription too aggressive | Set `"cleanup": "none"` to get verbatim model output. |
+| Transcription too aggressive | Set `"cleanup": "none"` to keep the raw engine output (your taught corrections still apply). |
 
 ## Privacy
 
@@ -253,11 +237,14 @@ transcript unless `debug` is enabled.
 
 ## Credits & licenses
 
-- **früt Flow** is released under the [MIT License](../LICENSE).
+- **früt Flow** is released under the [MIT License](LICENSE).
 - **Speech models:** [NVIDIA Parakeet](https://huggingface.co/nvidia) via
   [Apple MLX](https://github.com/ml-explore/mlx) /
   [parakeet-mlx](https://github.com/senstella/parakeet-mlx); optional
   [faster-whisper](https://github.com/SYSTRAN/faster-whisper) fallback.
+- **Repair model:** [Qwen2.5-1.5B-Instruct](https://huggingface.co/mlx-community/Qwen2.5-1.5B-Instruct-4bit)
+  (Apache-2.0) via [mlx-lm](https://github.com/ml-explore/mlx-lm), used by the
+  optional on-device cleanup.
 - **Icons:** [Phosphor Icons](https://phosphoricons.com) — MIT License,
   © Phosphor Icons.
 - **Libraries:** rapidfuzz, jellyfish, sounddevice, pynput, numpy, pyobjc.

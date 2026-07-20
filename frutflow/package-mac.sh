@@ -58,7 +58,7 @@ send audio or dictated text to a cloud service.
 
 Requirements:
 - Apple Silicon Mac
-- macOS 11 or newer
+- macOS 14 (Sonoma) or newer
 - Homebrew installed from https://brew.sh
 - Python 3.10 or newer
 
