@@ -8,6 +8,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+/frutflow/dist/
 
 # --- Timestamped dev backups created while iterating (flow.py.bak.*, etc.) ---
 *.bak

@@ -14,10 +14,8 @@ cd "$ROOT"
 required=(
   "flow.py"
   "run.sh"
-  "start.sh"
   "restart.sh"
   "watchdog.sh"
-  "try_repair.py"
   "set-icon.py"
   "requirements.txt"
   "config.example.json"
@@ -44,7 +42,13 @@ for path in "${required[@]}"; do
   cp -p "$ROOT/$path" "$STAGE/"
 done
 
-rsync -a --exclude ".DS_Store" "$ROOT/assets/" "$STAGE/assets/"
+# Ship runtime assets only. Logo/wordmark source files and the repair-model
+# eyeballing harness remain useful to developers but do not belong in an end-user
+# installer archive.
+mkdir -p "$STAGE/assets/phosphor"
+cp -p "$ROOT/assets/frut-flow.icns" "$STAGE/assets/"
+rsync -a --exclude ".DS_Store" --exclude "microphone-stage-fill.png" \
+  "$ROOT/assets/phosphor/" "$STAGE/assets/phosphor/"
 
 cat > "$STAGE/README_FIRST.txt" <<'README'
 frut Flow - quick setup
@@ -56,7 +60,7 @@ Requirements:
 - Apple Silicon Mac
 - macOS 11 or newer
 - Homebrew installed from https://brew.sh
-- Python 3.9 or newer
+- Python 3.10 or newer
 
 First run:
 1. Unzip this folder.

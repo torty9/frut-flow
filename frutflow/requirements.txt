@@ -7,7 +7,7 @@ mlx>=0.31                     # Apple MLX runtime (Metal GPU); pulls mlx-metal
 faster-whisper>=1.0.2          # fallback backend ("local"); >=1.0.2 for `hotwords`
 sounddevice>=0.4.6
 pynput>=1.7.6
-numpy>=1.24
+numpy>=2.2.5                 # parakeet-mlx 0.5.2 minimum
 pyobjc-framework-AVFoundation>=10.0   # to request the macOS microphone prompt
 pyobjc-framework-Cocoa>=10.0          # NSWorkspace + AX reads + in-process NSPasteboard
 

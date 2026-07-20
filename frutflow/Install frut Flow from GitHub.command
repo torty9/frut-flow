@@ -35,7 +35,7 @@ python_is_new_enough() {
   command -v python3 >/dev/null 2>&1 || return 1
   python3 - <<'PY'
 import sys
-raise SystemExit(0 if sys.version_info >= (3, 9) else 1)
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
 PY
 }
 
@@ -64,12 +64,12 @@ ensure_python() {
     return 0
   fi
 
-  echo "Python 3.9 or newer is required."
+  echo "Python 3.10 or newer is required."
   echo "Installing Python with Homebrew..."
   echo
   brew install python
   load_homebrew_path
-  python_is_new_enough || fail "Python 3.9 or newer is still not available."
+  python_is_new_enough || fail "Python 3.10 or newer is still not available."
 }
 
 clear || true
@@ -98,7 +98,11 @@ ditto -x -k "$ZIP_PATH" "$EXTRACT_DIR" || fail "Could not unpack the GitHub zip.
 SOURCE_DIR="$(find "$EXTRACT_DIR" -maxdepth 1 -type d -name 'frut-flow-*' -print -quit)"
 [ -n "$SOURCE_DIR" ] || fail "Could not find the app folder inside the GitHub zip."
 
-INSTALLER="$SOURCE_DIR/Install frut Flow.command"
+INSTALLER="$SOURCE_DIR/frutflow/Install frut Flow.command"
+if [ ! -f "$INSTALLER" ]; then
+  # Backward-compatible fallback for archives that put the app directly at root.
+  INSTALLER="$SOURCE_DIR/Install frut Flow.command"
+fi
 [ -f "$INSTALLER" ] || fail "The downloaded repo does not contain the macOS installer."
 chmod +x "$INSTALLER"
 

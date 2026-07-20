@@ -35,22 +35,45 @@ Three layers stack so you rarely have to fix anything — all **on-device, autom
 
 - macOS 11+ on Apple Silicon
 - [Homebrew](https://brew.sh) (used to install the PortAudio audio library)
-- Python 3.9+
+- Python 3.10+
 
 ## Easiest install for friends
 
-Send them **`Install frut Flow from GitHub.command`**. They can double-click that
-one file; it downloads the latest app from GitHub, installs the local
+Build the unsigned installer disk image:
+
+```bash
+./package-dmg.sh
+```
+
+Send the generated `dist/frut-flow-mac-installer-YYYY-MM-DD.dmg`. Your friend
+opens the disk image and double-clicks **`Install frut Flow.command`**. It
+offers to install Homebrew and Python when needed, installs the local
 dependencies, creates `~/Applications/frutflow.app`, enables on-device repair
 cleanup, and downloads the local models once:
 
 - Parakeet for speech recognition
 - Qwen for on-device correction/cleanup
 
-No API key or cloud code is needed.
+No API key or cloud code is needed. Because the disk image is not Developer ID
+signed or notarized, macOS may require the one-time **System Settings ▸ Privacy
+& Security ▸ Open Anyway** approval.
 
-Because this installer pulls from the GitHub `main` branch, commit and push the
-current repo before sending the file.
+For the smallest possible attachment, send **`Install frut Flow from
+GitHub.command`** instead. It downloads the latest app from the GitHub `main`
+branch, so commit and push the current repo before sending it.
+
+## Make a shareable installer DMG
+
+From this project folder:
+
+```bash
+./package-dmg.sh
+```
+
+That builds and verifies
+`dist/frut-flow-mac-installer-YYYY-MM-DD.dmg`. Its visible installer runs the
+same setup as the zip installer while keeping the supporting payload hidden in
+the disk image.
 
 ## Quick start
 
@@ -207,10 +230,11 @@ optional extra is a **fully on-device** cleanup step:
 
 | Symptom | Fix |
 |---|---|
-| Hotkey does nothing | Grant **Input Monitoring** to your terminal, then restart it. |
+| Hotkey does nothing | Grant **Input Monitoring** to `frutflow` (or the terminal used for a manual launch), then restart it. |
 | Nothing gets pasted | Grant **Accessibility**. Try `"insert_method": "type"`. |
 | `PortAudioError` / no audio | `brew install portaudio`; check `python flow.py --list-devices`. |
-| First run is slow | It's downloading the speech model once; subsequent runs are instant. |
+| First run is slow | It's downloading the speech model once; subsequent launches load it from the local cache. |
+| First dictation is slow after opening the lid | The current build automatically coalesces closed-lid maintenance wakes, refreshes audio once, and warms the model after a visible wake. Open `~/.flowdictate/flow.log` if this still repeats. |
 | Dictation feels slow | The default Parakeet backend is already sub-second/clip. If you switched to `"local"` (faster-whisper), that's the ~2–5 s CPU path — switch back to `"parakeet"`. |
 | It keeps misspelling a name | Just fix it once after it pastes — it learns the correction automatically. Or `./run.sh --correct "heard" "correct"`. |
 | A real word gets "corrected" | Raise `"fuzzy_threshold"` (e.g. `0.85`), or set `"fuzzy_correct": false`. |

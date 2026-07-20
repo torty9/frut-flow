@@ -19,44 +19,75 @@ enabled() {
   esac
 }
 
+pause() {
+  echo
+  read -r -p "Press Return to close this window."
+}
+
+fail() {
+  echo
+  echo "Install failed: $*"
+  pause
+  exit 1
+}
+
+load_homebrew_path() {
+  if [ -x /opt/homebrew/bin/brew ]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  fi
+}
+
+python_is_new_enough() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - <<'PY'
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+}
+
+ensure_homebrew() {
+  load_homebrew_path
+  if command -v brew >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "Homebrew is needed to install the local audio and Python dependencies."
+  echo "This will run the official installer from https://brew.sh."
+  echo
+  read -r -p "Install Homebrew now? [y/N] " answer
+  case "$answer" in
+    y|Y|yes|YES) ;;
+    *) fail "Homebrew was not installed." ;;
+  esac
+
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  load_homebrew_path
+  command -v brew >/dev/null 2>&1 ||
+    fail "Homebrew installed, but brew is not available on PATH."
+}
+
+ensure_python() {
+  if python_is_new_enough; then
+    return 0
+  fi
+
+  echo "Installing Python 3.10 or newer with Homebrew..."
+  echo
+  brew install python
+  load_homebrew_path
+  python_is_new_enough || fail "Python 3.10 or newer is still not available."
+}
+
 clear || true
 echo "frut Flow installer"
 echo
 
 if [ "$(uname -m)" != "arm64" ]; then
-  echo "This version is built for Apple Silicon Macs."
-  echo
-  read -r -p "Press Return to close this window."
-  exit 1
+  fail "This version is built for Apple Silicon Macs."
 fi
 
-if ! command -v brew >/dev/null 2>&1; then
-  echo "Homebrew is required before setup can continue."
-  echo "Install it from: https://brew.sh"
-  echo
-  read -r -p "Press Return to close this window."
-  exit 1
-fi
-
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "Python 3 is required before setup can continue."
-  echo "Install Python 3, then run this file again."
-  echo
-  read -r -p "Press Return to close this window."
-  exit 1
-fi
-
-if ! python3 - <<'PY'
-import sys
-raise SystemExit(0 if sys.version_info >= (3, 9) else 1)
-PY
-then
-  echo "Python 3.9 or newer is required before setup can continue."
-  echo "Install a newer Python 3, then run this file again."
-  echo
-  read -r -p "Press Return to close this window."
-  exit 1
-fi
+ensure_homebrew
+ensure_python
 
 mkdir -p "$HOME/Applications"
 
@@ -163,10 +194,24 @@ BUNDLE_PY="$HERE/python3"
 FLOWDICTATE_DIR="$HOME/.flowdictate"
 LOG="$FLOWDICTATE_DIR/flow.log"
 PTR="$FLOWDICTATE_DIR/code_dir"
+MAX_LOG_BYTES=$((5 * 1024 * 1024))
+
+rotate_log_if_needed() {
+  local size
+  [ -f "$LOG" ] || return 0
+  size="$(/usr/bin/wc -c < "$LOG" 2>/dev/null | /usr/bin/tr -d '[:space:]')"
+  case "$size" in
+    ""|*[!0-9]*) return 0 ;;
+  esac
+  if [ "$size" -ge "$MAX_LOG_BYTES" ]; then
+    /bin/mv -f "$LOG" "$LOG.1" 2>/dev/null || return 0
+  fi
+}
 
 umask 077
 mkdir -p "$FLOWDICTATE_DIR"
 chmod 700 "$FLOWDICTATE_DIR"
+rotate_log_if_needed
 : >> "$LOG"
 chmod 600 "$LOG"
 
