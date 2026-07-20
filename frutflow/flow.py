@@ -1294,8 +1294,33 @@ def _clean_usage_stats(data) -> dict:
 
 
 def load_usage_stats() -> dict:
-    """Aggregate usage stats used by the History home page. No transcript text."""
+    """Aggregate usage stats used by the History home page. No transcript text.
+    Read-only: a missing/unreadable file yields zeros for display, but callers
+    that WRITE back the totals must use _load_usage_stats_for_update instead."""
     return _clean_usage_stats(_read_json(STATS_PATH, {}))
+
+
+def _load_usage_stats_for_update() -> "tuple[dict, bool]":
+    """Read stats.json for a read-modify-write of the CUMULATIVE totals.
+
+    Returns (stats, ok). ok is False ONLY when the file already exists but could
+    not be read or parsed — a transient OSError, or a truncated/corrupt file. In
+    that case the caller MUST NOT write: overwriting would reset the lifetime
+    total down to a single dictation (the "my time-saved keeps resetting" bug).
+    A genuinely ABSENT file returns (zeros, True) — a real first run starts at 0.
+    Writes here are atomic (os.replace), so a reader never sees a torn file; this
+    guard covers the remaining cases (disk hiccup, external truncation)."""
+    try:
+        raw = STATS_PATH.read_text()
+    except FileNotFoundError:
+        return _clean_usage_stats({}), True      # first run — nothing to preserve
+    except OSError:
+        return _clean_usage_stats({}), False     # transient — keep the old file
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return _clean_usage_stats({}), False     # corrupt — keep the old file
+    return _clean_usage_stats(data), True
 
 
 def record_usage_stats(text: str, spoken_seconds: float) -> None:
@@ -1308,7 +1333,11 @@ def record_usage_stats(text: str, spoken_seconds: float) -> None:
         typed = (words / TYPING_WPM) * 60.0
         saved = max(0.0, typed - spoken)
         with _STATS_LOCK:
-            stats = load_usage_stats()
+            stats, ok = _load_usage_stats_for_update()
+            if not ok:
+                # The file is there but unreadable right now — skip this one
+                # update rather than clobber the lifetime total with a reset.
+                return
             stats["dictations"] += 1
             stats["words"] += words
             stats["spoken_seconds"] += spoken
@@ -2660,16 +2689,48 @@ def _menu_actions_class():
             except Exception:  # noqa: BLE001
                 pass
 
-        # NSApplication delegate: fires when you double-click the app (or click its
-        # Dock icon) while it's ALREADY running. A menu-bar app has no main window,
-        # so without this "opening" the app does nothing visible — here we open the
-        # History window (the home page) so it behaves like a normal app you open.
+        # NSApplication delegate: fires when the app is "opened" while ALREADY
+        # running — a Dock/Finder click on früt Flow's icon, but ALSO the
+        # watchdog's periodic `open -g` self-heal and the Restart relaunch. We open
+        # History (the home page) for a REAL user click, but must stay silent for
+        # the self-heal — otherwise the window would pop up on its own every so
+        # often. The tell: a user click brings us to the FOREGROUND, while the
+        # self-heal uses `open -g` and never activates us. So we latch the reopen
+        # and only surface History once we're actually frontmost. Return False:
+        # there is no document/window to restore — we present History ourselves.
         def applicationShouldHandleReopen_hasVisibleWindows_(self, app, flag):
+            from Cocoa import NSOperationQueue
+            self._reopen_at = time.monotonic()
+            # Handle either delivery order: if activation already happened, this
+            # deferred check sees it; if it lands after us, didBecomeActive does.
+            NSOperationQueue.mainQueue().addOperationWithBlock_(
+                lambda: self._reopen_maybe_history())
+            return False
+
+        # The activation half of a Dock/Finder reopen. Pairs with a fresh reopen
+        # latch to open History; a no-op at any other time (no recent latch), so
+        # ordinary focus changes never surface a window.
+        def applicationDidBecomeActive_(self, note):
+            self._reopen_maybe_history()
+
+        @objc.python_method
+        def _reopen_maybe_history(self):
+            """Open History for a genuine reopen — but only once we're frontmost.
+            A real Dock/Finder click activates us within a moment of the reopen
+            event (either order); the `open -g` self-heal never activates us, so it
+            falls through here and stays quietly in the menu bar. The 2s window
+            bounds a stale latch so an unrelated later activation can't pop the
+            window; the latch is consumed so History opens exactly once per click."""
+            t = getattr(self, "_reopen_at", 0.0)
+            if not t or (time.monotonic() - t) > 2.0:
+                return
+            if not NSApplication.sharedApplication().isActive():
+                return                       # background self-heal — not frontmost
+            self._reopen_at = 0.0            # consume before showing (show re-activates)
             try:
                 self._app._show_history_window()
             except Exception:  # noqa: BLE001
                 pass
-            return True
 
         def restart_(self, sender):
             # Relaunch a fresh instance, then quit this one. Detached so it
@@ -8986,8 +9047,8 @@ class FlowApp:
 
         target = _menu_actions_class().alloc().initWithApp_(self)
         self._menu_target = target
-        # Make `target` the app delegate too, so double-clicking the app (a "reopen"
-        # while it's already running) opens the transcribe window.
+        # Make `target` the app delegate too, so clicking the app's Dock/Finder
+        # icon (a "reopen" while it's already running) opens the History window.
         app.setDelegate_(target)
 
         # Initial state: healthy (idle) unless the hotkey tap couldn't be created
