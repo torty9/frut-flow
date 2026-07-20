@@ -7,15 +7,42 @@
 # self-heal, independent of launchd StartInterval timing.
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-FLOW_SCRIPT="$SCRIPT_DIR/flow.py"
 APP="$HOME/Applications/frutflow.app"
 FLOWDICTATE_DIR="$HOME/.flowdictate"
 LOG="$FLOWDICTATE_DIR/watchdog.log"
+FLOW_LOG="$FLOWDICTATE_DIR/flow.log"
+MAX_LOG_BYTES=$((1024 * 1024))
+MAX_FLOW_LOG_BYTES=$((5 * 1024 * 1024))
+
+rotate_log_if_needed() {
+  local size
+  [ -f "$LOG" ] || return 0
+  size="$(/usr/bin/wc -c < "$LOG" 2>/dev/null | /usr/bin/tr -d '[:space:]')"
+  case "$size" in
+    ""|*[!0-9]*) return 0 ;;
+  esac
+  if [ "$size" -ge "$MAX_LOG_BYTES" ]; then
+    /bin/mv -f "$LOG" "$LOG.1" 2>/dev/null || return 0
+  fi
+}
+
+rotate_flow_log_if_needed() {
+  local size
+  [ -f "$FLOW_LOG" ] || return 0
+  size="$(/usr/bin/wc -c < "$FLOW_LOG" 2>/dev/null | /usr/bin/tr -d '[:space:]')"
+  case "$size" in
+    ""|*[!0-9]*) return 0 ;;
+  esac
+  if [ "$size" -ge "$MAX_FLOW_LOG_BYTES" ]; then
+    /bin/mv -f "$FLOW_LOG" "$FLOW_LOG.1" 2>/dev/null || return 0
+  fi
+}
 
 prepare_flowdictate_dir() {
   umask 077
   mkdir -p "$FLOWDICTATE_DIR"
   chmod 700 "$FLOWDICTATE_DIR"
+  rotate_log_if_needed
   : >> "$LOG"
   chmod 600 "$LOG"
 }
@@ -23,19 +50,24 @@ prepare_flowdictate_dir() {
 process_cwd_matches_repo() {
   local pid="$1"
   local cwd
-  cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1)"
-  [ "$cwd" = "$SCRIPT_DIR" ]
+  cwd="$(LC_ALL=UTF-8 lsof -a -p "$pid" -d cwd -Fn 2>/dev/null |
+    sed -n 's/^n//p' | head -n 1)"
+  # Compare filesystem identity, not path bytes. macOS accepts both NFC and NFD
+  # spellings of "früt"; argv and pwd can therefore name the same directory
+  # with different Unicode byte sequences.
+  [ -n "$cwd" ] && [ "$cwd" -ef "$SCRIPT_DIR" ]
 }
 
 flow_process_matches() {
   local pid="$1"
   local args="$2"
 
-  if [[ "$args" == *python*" $FLOW_SCRIPT"* ]]; then
-    return 0
-  fi
-
-  if [[ "$args" == *python*" flow.py"* || "$args" == *python*" ./flow.py"* ]]; then
+  # Only the ASCII script basename is inspected in argv. The cwd/inode check is
+  # the authoritative repository match and is immune to locale escaping and
+  # Unicode-normalization differences in the full path.
+  if [[ "$args" == *python*"/flow.py"* ||
+        "$args" == *python*" flow.py"* ||
+        "$args" == *python*" ./flow.py"* ]]; then
     process_cwd_matches_repo "$pid"
     return
   fi
@@ -44,8 +76,12 @@ flow_process_matches() {
 }
 
 find_flow_pids() {
+  # pgrep -fl prints pid + raw argv bytes. ps is NOT usable here: under
+  # launchd's C locale it vis-encodes non-ASCII paths ("früt" -> "frM-CM-<t"),
+  # so full-script-path comparisons never matched and the watchdog re-`open`ed
+  # the already-running app every cycle (each open fires a reopen event).
   local pid args
-  ps -axww -o pid= -o args= | while read -r pid args; do
+  pgrep -fl 'flow\.py' 2>/dev/null | while read -r pid args; do
     [ -n "$pid" ] || continue
     case "$pid" in
       *[!0-9]*) continue ;;
@@ -64,6 +100,10 @@ prepare_flowdictate_dir
 while true; do
   if ! flow_is_running; then
     ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    rotate_log_if_needed
+    rotate_flow_log_if_needed
+    : >> "$LOG"
+    chmod 600 "$LOG"
     echo "[$ts] flow.py not running — relaunching frutflow.app" >> "$LOG"
     /usr/bin/open -g "$APP"
     sleep 8
