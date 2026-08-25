@@ -914,15 +914,23 @@ class ParakeetTranscriber:
         print(f"[flow] loading Parakeet model '{model_name}' (MLX/GPU) ...",
               file=sys.stderr, flush=True)
         self.model = from_pretrained(str(cached) if cached is not None else model_name)
+        # Force-materialize EVERY weight now, on this thread. from_pretrained
+        # loads lazily, and the warm-up below cannot be relied on to touch the
+        # decoder/joint weights: on a near-silent clip the decode loop can run
+        # ZERO steps (v3 does exactly that), leaving those weights as lazy
+        # graph nodes recorded against THIS thread's MLX stream. MLX ≥0.31
+        # keeps stream registries per-thread, so the first real dictation on
+        # the transcription worker thread would then die with "There is no
+        # Stream(gpu, 0) in current thread". Materialized buffers are
+        # thread-safe; this is what let v2 work by luck (its noisy warm-up
+        # happened to emit a token) and what v3 needs explicitly.
+        mx.eval(self.model.parameters())
 
-        # A real inference on the MAIN thread here is REQUIRED, not merely an
-        # optimization. It does two things: (1) compiles the Metal kernels so the
-        # first real dictation isn't slowed by ~2s, and (2) initializes MLX's default
-        # GPU stream so the transcription WORKER THREAD can use it — a fresh thread
-        # otherwise raises "no Stream(gpu, 0) in current thread" on the first decode.
-        # It must run on NON-SILENT audio: a silent clip short-circuits before doing
-        # any GPU work and does NOT initialize the stream (verified), so we feed a
-        # faint noise clip. This always runs; `warmup` only controls the log line.
+        # A real inference on the MAIN thread here also compiles the Metal
+        # kernels so the first real dictation isn't slowed by ~2s. It runs on
+        # NON-SILENT audio (a silent clip short-circuits before doing any GPU
+        # work), so we feed a faint noise clip. This always runs; `warmup` only
+        # controls the log line.
         try:
             elapsed = self.warm_up()
             if warmup:
