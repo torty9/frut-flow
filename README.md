@@ -19,6 +19,14 @@ Restart, Open Log, and Quit**.
 ## Features
 
 - **On‑device, private** transcription (Parakeet‑MLX on the GPU; `faster‑whisper` fallback).
+- **Multilingual** — English, Spanish, and 23 more languages via the Parakeet v3
+  model. Pick **Auto / English / Español** in Settings ▸ Model; Auto detects the
+  language of each dictation, and the cleanup rules follow (Spanish spoken
+  punctuation, `¿ ¡` spacing, Spanish voice undo like *"borra eso"*).
+- **Spoken punctuation** — say *"quote … end quote"* for real `"…"` marks,
+  *"new paragraph"*, *"question mark"*, or in Spanish *"abrir comillas"*,
+  *"punto y aparte"*, *"signo de interrogación"* — with guards so prose like
+  "the trial period" or "punto de vista" is never mangled.
 - **Automatic accuracy**: phonetic proper‑noun repair + learns corrections from your edits.
 - **Menu‑bar app** — no Terminal window needed; `frutflow.app` owns the macOS
   permissions while the code and venv live beside it for easy updates.

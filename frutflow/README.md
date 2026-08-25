@@ -127,6 +127,69 @@ After granting, **fully quit and reopen** that program.
 
 Quit with `Ctrl-C`.
 
+## Languages (English, Spanish, and 23 more)
+
+Pick your language in **Settings ▸ Model ▸ Spoken language**:
+
+- **Auto** — the engine detects the language of each dictation. Great if you
+  switch between English and Spanish mid-day. Selecting it also switches the
+  Parakeet model to the **Multilingual** v3 checkpoint (25 languages, Spanish
+  included), which detects the spoken language on its own and punctuates
+  Spanish properly (`¿…?`, `¡…!`, accents).
+- **English / Español** — lock it to one language (slightly more accurate if
+  you only ever use one).
+
+Details the app handles for you:
+
+- Choosing Auto or Español automatically uses a **multilingual model**: the
+  English-only Parakeet v2 is swapped for v3, and on the Whisper backend the
+  English-only `distil-large-v3` is swapped for `large-v3-turbo`. Each swap is
+  a one-time model download; restart the app after changing the language.
+- Cleanup is language-aware: Spanish text gets Spanish spoken-punctuation
+  commands, RAE-style spacing for `¿ ¡`, and a fail-closed Spanish filler list
+  (words like *este*, *pues*, or *eh* are never stripped).
+- The classic Whisper silence hallucinations, English **and** Spanish
+  ("Thanks for watching!", "Subtítulos realizados por la comunidad de
+  Amara.org", "[Música]"…), are filtered out in every cleanup mode.
+- Voice undo also understands Spanish: say **"borra eso"**, **"olvídalo"**,
+  **"elimina eso"**, or **"deshaz eso"**.
+
+## Spoken punctuation
+
+The engines already punctuate from your pauses and intonation. On top of that,
+`cleanup: "basic"` (the default) converts punctuation you *say*, like Apple
+dictation or Wispr Flow:
+
+| You say (English) | You get |
+|---|---|
+| "quote … end quote" (or "unquote" / "close quote") | `"…"` |
+| "open quote" with no closer | quotes the rest of the utterance |
+| "the quote unquote expert" | the "expert" |
+| "period" · "full stop" · "comma" · "colon" · "semicolon" | `.` `,` `:` `;` |
+| "question mark" · "exclamation point" | `?` `!` |
+| "new line" · "new paragraph" | line / paragraph break |
+| "dot dot dot" / "ellipsis" · "dash" · "hyphen" | `…` ` - ` `-` |
+| "john at sign gmail dot com" | `john@gmail.com` |
+| "open paren … close paren" · "underscore" · "hashtag" | `(…)` `_` `#` |
+
+| Dices (español) | Sale |
+|---|---|
+| "abrir comillas … cerrar comillas" (o "comillas de apertura/cierre") | `"…"` |
+| "punto" · "coma" · "dos puntos" · "punto y coma" | `.` `,` `:` `;` |
+| "signo de interrogación" · "signo de exclamación/admiración" | `?` `!` |
+| "abrir interrogación" · "abrir exclamación" | `¿` `¡` |
+| "punto y aparte" | `.` + new paragraph |
+| "punto y seguido" · "puntos suspensivos" | `.` `…` |
+| "nueva línea" · "nuevo párrafo" | salto de línea / párrafo |
+| "maría arroba gmail punto com" | `maría@gmail.com` |
+| "guion bajo" / "barra baja" · "almohadilla" | `_` `#` |
+
+Safety first: ambiguous words only convert when the context says *command*, not
+prose — "the **trial period** ends", "**punto de vista**", "colon **cancer**",
+"en **coma**", "ganamos por **dos puntos**" are all left exactly as spoken. A
+bare "quote"/"comillas" needs a matching closer ("end quote"/"cerrar comillas")
+so "get a quote from the plumber" is never touched.
+
 ## Configuration
 
 Edit `~/.flowdictate/config.json` (see `config.example.json`, or use the in-app
@@ -137,12 +200,13 @@ Edit `~/.flowdictate/config.json` (see `config.example.json`, or use the in-app
 | `hotkey` | `"alt_r"` | Use Settings ▸ Dictation ▸ **Change**, then press the single key you want. Regular keys are stored as `vk:N`; modifier names like `alt`, `cmd`, `ctrl`, `shift`, or `cmd_r` also work in JSON. |
 | `mode` | `"hold"` | `"hold"` = push-to-talk · `"toggle"` = tap to start/stop |
 | `transcribe_backend` | `"parakeet"` | `"parakeet"` (NVIDIA Parakeet on the GPU — fastest, default) · `"local"` (faster-whisper on CPU). Both on-device. |
-| `parakeet_model` | `"mlx-community/parakeet-tdt-0.6b-v2"` | v2 = English (best English accuracy) · `...-v3` = 25 languages |
-| `model` | `"distil-large-v3"` | faster-whisper model, used when `transcribe_backend: "local"`. `medium.en`/`small.en` faster, miss more names. |
+| `language` | `"en"` | `"en"` · `"es"` · any ISO code · `"auto"` (detect per dictation). Non-English auto-selects a multilingual model. |
+| `parakeet_model` | `"mlx-community/parakeet-tdt-0.6b-v2"` | v2 = English (best English accuracy) · `...-v3` = 25 languages incl. Spanish (auto-detects) |
+| `model` | `"distil-large-v3"` | faster-whisper model, used when `transcribe_backend: "local"`. English-only; swapped for `large-v3-turbo` automatically when `language` isn't `"en"`. |
 | `normalize_method` | `"rms"` | `"rms"` = average-loudness normalize + soft-limit (best for quiet/whispered) · `"peak"` = old peak-normalize |
 | `fuzzy_correct` | `true` | Phonetic proper-noun repair against your learned vocab (engine-agnostic) |
 | `learn_from_edits` | `true` | Auto-learn corrections by watching the field you paste into |
-| `cleanup` | `"basic"` | `"none"` (raw) · `"basic"` (strip fillers) · `"local"` (on-device misheard-word repair — no cloud, no key) |
+| `cleanup` | `"basic"` | `"none"` (raw) · `"basic"` (fillers, spacing, caps + spoken punctuation like "quote … end quote") · `"local"` (on-device misheard-word repair — no cloud, no key) |
 | `insert_method` | `"paste"` | `"paste"` (clipboard+Cmd-V), `"type"` (key-by-key), or `"clipboard"` (copy only — you press Cmd-V; needs **no** Accessibility permission) |
 | `restore_clipboard` | `true` | Put your previous clipboard back after pasting the dictation |
 | `auto_space` | `true` | Prepend a space so dictation merges naturally with existing text |

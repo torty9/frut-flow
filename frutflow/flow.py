@@ -122,6 +122,10 @@ DEFAULT_CONFIG = {
                                  # clip vs ~0.5-2s. Want it snappier? Drop to
                                  # "medium.en" or "small.en" (less accurate). Want
                                  # the max-accuracy ceiling? keep this.
+                                 # NOTE: distil-* and *.en models are ENGLISH-
+                                 # ONLY; with a non-English "language" below the
+                                 # app auto-substitutes "large-v3-turbo"
+                                 # (multilingual, same accuracy class).
     "compute_type": "int8",      # "int8" (CPU, default) or "float16" (GPU)
     "cpu_threads": 0,            # CPU threads for transcription. 0 = auto: use all
                                  # of this Mac's cores. Measured ~28% faster than
@@ -129,7 +133,15 @@ DEFAULT_CONFIG = {
                                  # with byte-identical output — a free speedup. Set a
                                  # smaller number to leave more headroom for other
                                  # apps while dictating.
-    "language": "en",
+    "language": "en",            # "en" | "es" | any ISO-639-1 code | "auto".
+                                 # "auto" lets the engine detect the spoken
+                                 # language per clip (Parakeet v3 always does;
+                                 # whisper gets language=None) and picks the
+                                 # matching cleanup rules from the text.
+                                 # Non-English needs a multilingual model —
+                                 # Parakeet v3 / a non-distil whisper — which
+                                 # the app substitutes automatically if the
+                                 # configured one is English-only.
 
     # --- accuracy tuning (esp. for quiet / whispered speech) ---
     "normalize_audio": True,     # normalize the clip's loudness before transcribing
@@ -218,6 +230,11 @@ DEFAULT_CONFIG = {
         "never mind", "nevermind", "actually never mind", "actually nevermind",
         "scratch that", "actually scratch that", "delete that", "actually delete that",
         "cancel that", "forget that", "undo that",
+        # Spanish ("borrar eso"/"eliminar eso"/"deshacer eso" are the phrases
+        # Apple Voice Control and Windows voice access use; "olvídalo" is the
+        # natural "never mind")
+        "olvídalo", "olvidalo", "borra eso", "borrar eso", "elimina eso",
+        "eliminar eso", "deshaz eso", "deshacer eso", "cancela eso",
     ],
 
     # --- feedback / guards ---
@@ -458,6 +475,7 @@ def _normalize_config(cfg: dict) -> dict:
     ):
         val = _clean_text_value(clean.get(key), max_chars=max_chars)
         clean[key] = val or DEFAULT_CONFIG[key]
+    clean["language"] = clean["language"].lower()
     if clean["parakeet_model"] not in _ALLOWED_PARAKEET_MODELS:
         clean["parakeet_model"] = DEFAULT_CONFIG["parakeet_model"]
     if clean["local_repair_model"] not in _ALLOWED_LOCAL_REPAIR_MODELS:
@@ -691,7 +709,10 @@ class LocalTranscriber:
                  vad_filter: bool = False, beam_size: int = 5,
                  initial_prompt: str = "", cpu_threads: int = 0):
         from faster_whisper import WhisperModel
-        self.language = language
+        # "auto"/empty → None, which tells faster-whisper to detect the spoken
+        # language per clip instead of forcing one.
+        lang = str(language or "").strip().lower()
+        self.language = None if lang in ("", "auto") else lang
         self.normalize = normalize
         self.normalize_peak = normalize_peak
         self.normalize_method = normalize_method
@@ -997,6 +1018,36 @@ class ParakeetTranscriber:
         return (result.text or "").strip()
 
 
+def _resolve_parakeet_model(cfg: dict) -> str:
+    """The Parakeet checkpoint to load, honouring the language setting: v2 is
+    English-only, so any non-English (or auto) language needs the multilingual
+    v3 checkpoint — silently transcribing Spanish through v2 yields garbage."""
+    model = cfg.get("parakeet_model", DEFAULT_CONFIG["parakeet_model"])
+    lang = str(cfg.get("language", "en") or "en").strip().lower()
+    if lang not in ("", "en") and model.endswith("-v2"):
+        print(f"[flow] language '{lang}': the English-only Parakeet v2 model "
+              "can't transcribe it — using the multilingual v3 model instead.",
+              flush=True)
+        return "mlx-community/parakeet-tdt-0.6b-v3"
+    return model
+
+
+def _resolve_whisper_model(cfg: dict) -> str:
+    """The faster-whisper model to load, honouring the language setting: the
+    default distil-large-v3 (and any *.en model) is English-only, so a
+    non-English or auto language switches to the multilingual large-v3-turbo
+    (same accuracy class and comparable speed, ~1.6 GB one-time download)."""
+    model = cfg.get("model", DEFAULT_CONFIG["model"])
+    lang = str(cfg.get("language", "en") or "en").strip().lower()
+    english_only = model.endswith(".en") or "distil" in model
+    if lang not in ("", "en") and english_only:
+        print(f"[flow] language '{lang}': whisper model '{model}' is "
+              "English-only — using multilingual 'large-v3-turbo' instead.",
+              flush=True)
+        return "large-v3-turbo"
+    return model
+
+
 def build_transcriber(cfg: dict):
     backend = cfg.get("transcribe_backend", "parakeet")
     # Only on-device engines are supported. Anything else (e.g. a legacy
@@ -1013,7 +1064,7 @@ def build_transcriber(cfg: dict):
     if backend == "parakeet":
         try:
             return ParakeetTranscriber(
-                cfg.get("parakeet_model", "mlx-community/parakeet-tdt-0.6b-v2"),
+                _resolve_parakeet_model(cfg),
                 cfg["language"], warmup=cfg.get("warmup_on_start", True),
                 **norm_kwargs)
         except Exception as e:  # noqa: BLE001  never leave the user with no engine
@@ -1021,7 +1072,7 @@ def build_transcriber(cfg: dict):
                   "falling back to faster-whisper ('local').", flush=True)
 
     return LocalTranscriber(
-        cfg["model"], cfg["compute_type"], cfg["language"],
+        _resolve_whisper_model(cfg), cfg["compute_type"], cfg["language"],
         vad_filter=cfg.get("vad_filter", False),
         beam_size=cfg.get("beam_size", 5),
         initial_prompt=cfg.get("initial_prompt", ""),
@@ -1869,26 +1920,562 @@ def learn_from_edit(el, pasted: str, *, max_learn: int = 3) -> int:
 # Post-processing / cleanup
 # ---------------------------------------------------------------------------
 
-# Conservative: only strip true vocal fillers. Whisper already punctuates and
-# capitalizes, so we don't try to rewrite meaning (the on-device "local" repair
+# Conservative: only strip true vocal fillers. The engines already punctuate and
+# capitalize, so we don't try to rewrite meaning (the on-device "local" repair
 # mode handles misheard words; basic cleanup never touches word identity).
-# Deliberately absent: bare "er"/"err" — "To err is human" is real English, and
-# the whole set is English-only, so non-English dictation is never touched
-# ("um" is a top-frequency German preposition, "er" the pronoun "he").
-_FILLER_RE = re.compile(
+# Filler sets are PER-LANGUAGE so one language's noise can't eat another
+# language's words ("um" is a top-frequency German preposition, "er" the German
+# pronoun "he"). Deliberately absent from the English set: bare "er"/"err" —
+# "To err is human" is real English.
+_FILLER_RE_EN = re.compile(
     r"\b(?:u+h+|u+m+|a+h+|e+h+|e+rm+|hm+|mm+-?hmm+|uh-huh)\b[,.]?",
+    re.IGNORECASE,
+)
+# Spanish keeps only never-a-word hesitation noises (same fail-closed stance as
+# Handy's language-gated filler tiers). "este"/"pues"/"o sea" are real words,
+# and "eh"/"ah" are deliberate interjections ("¡eh, tú!"), so they all stay.
+_FILLER_RE_ES = re.compile(
+    r"\b(?:u+h+m*|u+m{2,}|e+h{2,}m*|e+h+m+|a+h+m+|hm+|m{3,})\b[,.]?",
+    re.IGNORECASE)
+
+_FILLER_RES = {"en": _FILLER_RE_EN, "es": _FILLER_RE_ES}
+
+
+# --- which language's cleanup rules apply -----------------------------------
+# cfg["language"] may be a fixed code ("en", "es", ...) or "auto". With "auto"
+# the multilingual engines detect the SPEECH language on their own, so the
+# transcript text itself is the only signal for which cleanup rules fit.
+# Shared words ("no", "me", "a", ...) are deliberately in NEITHER hint set.
+
+_ES_MARK_RE = re.compile(r"[¿¡ñÑ]")
+_ES_ACCENT_RE = re.compile(r"[áéíóúüÁÉÍÓÚÜ]")
+_ES_HINT_WORDS = frozenset("""
+el la los las un una unos unas de del al que qué como cómo cuando cuándo donde
+dónde quién quiero quiere puedo puede tengo tiene hay está estás estoy es somos
+eres soy para por pero porque también sí señor señora gracias hola bueno buena
+buenos buenas mañana ahora aquí allí luego hasta desde muy más menos mucho poco
+todo toda todos nada algo esto esta este ese esa eso favor entonces así ya le
+les lo te se mi tu su nos usted ustedes hacer hace dime dile vamos venga nunca
+siempre nuevo nueva
+""".split())
+_EN_HINT_WORDS = frozenset("""
+the an and or but if of to in on at is are was were be been am do does did have
+has had i you he she it we they him her them my your his its our their this
+that these those there here what which who not yes so than too very just also
+with for from about after before when where how why will would can could should
+might must please thanks hello
+""".split())
+
+
+def _detect_cleanup_language(text: str) -> str:
+    """Best-effort guess ("en" or "es") of a transcript's language. Used only to
+    pick CLEANUP rules when cfg language is "auto" — never to change words.
+    Unknown/mixed leans "en" (whose rules are the most conservative)."""
+    if not text:
+        return "en"
+    score_es = (3.0 * len(_ES_MARK_RE.findall(text))
+                + 1.0 * len(_ES_ACCENT_RE.findall(text)))
+    score_en = 0.0
+    for w in re.findall(r"[^\W\d_]+", text.lower()):
+        if w in _ES_HINT_WORDS:
+            score_es += 2.0
+        if w in _EN_HINT_WORDS:
+            score_en += 2.0
+    return "es" if (score_es >= 2.0 and score_es > score_en) else "en"
+
+
+# --- ASR hallucination guard -------------------------------------------------
+# On silence/breath/noise clips, Whisper-family models famously emit YouTube-ish
+# boilerplate learned from subtitled training data ("Thanks for watching!",
+# "Subtítulos realizados por la comunidad de Amara.org", "[Música]"...). None of
+# these can be real push-to-talk dictation, so they are dropped in EVERY cleanup
+# mode. Only phrases implausible as an actual dictated message belong in the
+# list — a bare "Thank you." is a perfectly real dictation and is NOT here.
+
+_ASR_TAG_RE = re.compile(
+    r"[\[(]\s*(?:m[úu]sica|music|aplausos?|applause|risas?|laughter|laughing|"
+    r"ruidos?|noise|silencio|silence|sonido|inaudible|blank[_ ]?audio|"
+    r"audio en blanco|coughs?|tos|suspiros?|sighs?|typing|clicking|breathing|"
+    r"respiraci[oó]n|static|viento|wind)\s*[\])]"
+    r"|♪+[^♪\n]*♪+|♪+",
     re.IGNORECASE,
 )
 
 
-def basic_cleanup(text: str, language: str = "en") -> str:
-    if str(language or "en").lower().startswith("en"):
-        text = _FILLER_RE.sub("", text)
-    text = re.sub(r"\s+([,.;:!?])", r"\1", text)   # no space before punctuation
-    text = re.sub(r"\s{2,}", " ", text).strip()
-    if text:
-        text = text[0].upper() + text[1:]
+def _match_key(s: str) -> str:
+    """Lowercase and keep only letters/digits/spaces, for whole-phrase matching."""
+    s = re.sub(r"[^\w\s]|_", " ", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+_ASR_HALLUCINATIONS = frozenset(_match_key(p) for p in (
+    # English
+    "thanks for watching",
+    "thank you for watching",
+    "thanks so much for watching",
+    "thank you so much for watching",
+    "please subscribe",
+    "please like and subscribe",
+    "like and subscribe",
+    "like comment and subscribe",
+    "don't forget to subscribe",
+    "don't forget to like and subscribe",
+    "subscribe to my channel",
+    "subscribe to the channel",
+    "see you in the next video",
+    "see you next video",
+    "see you in the next one",
+    "i'll see you in the next video",
+    "i'll see you in the next one",
+    "and i'll see you in the next one",
+    "thank you for watching please subscribe",
+    "thanks for watching please subscribe",
+    "subtitles by the amara.org community",
+    "subtitles by amara.org",
+    "transcription by castingwords",
+    # Spanish
+    "subtítulos realizados por la comunidad de amara.org",
+    "subtitulos realizados por la comunidad de amara.org",
+    "subtítulos por la comunidad de amara.org",
+    "subtitulado por la comunidad de amara.org",
+    "subtítulos creados por la comunidad de amara.org",
+    "gracias por ver el vídeo",
+    "gracias por ver el video",
+    "gracias por ver este vídeo",
+    "gracias por ver este video",
+    "gracias por ver",
+    "muchas gracias por ver",
+    "gracias por su atención",
+    "gracias por su atencion",
+    "no olvides suscribirte",
+    "no olviden suscribirse",
+    "no te olvides de suscribirte",
+    "suscríbete",
+    "suscribete",
+    "suscríbete al canal",
+    "suscríbete a mi canal",
+    "suscríbete al canal gracias",
+    "dale like y suscríbete",
+    "dale like y suscribete",
+    "hola a todos bienvenidos a mi canal",
+    "nos vemos en el próximo vídeo",
+    "nos vemos en el próximo video",
+    "hasta el próximo vídeo",
+))
+
+
+_STUTTER_RE = re.compile(
+    r"\b([^\W\d_][\w'’\-]*)(?:[ \t]+\1\b){3,}", re.IGNORECASE)
+
+
+def strip_asr_hallucinations(text: str) -> str:
+    """Drop non-speech tags anywhere, and the whole utterance when it is nothing
+    but a known silence-hallucination phrase. Also collapses the classic Whisper
+    repetition loop (the same bare word 4+ times in a row → once; a deliberate
+    "no, no, no" keeps its commas and is untouched)."""
+    if not text:
+        return text
+    out = _ASR_TAG_RE.sub(" ", text)
+    out = _STUTTER_RE.sub(r"\1", out)
+    key = _match_key(out)
+    if not key or key in _ASR_HALLUCINATIONS:
+        return ""
+    return re.sub(r"[ \t]{2,}", " ", out).strip()
+
+
+# --- spoken punctuation ------------------------------------------------------
+# Turns punctuation the user SAID into the mark itself ("quote ... end quote" →
+# "...", "new paragraph" → a blank line, "signo de interrogación" → "?"), the
+# way Apple dictation and Wispr Flow do. The engines already punctuate from
+# prosody, so this only has to catch commands they wrote out as words.
+# Two tiers:
+#   • command phrases that basically never occur as ordinary prose ("question
+#     mark", "punto y aparte") convert wherever they appear;
+#   • single common nouns ("period", "colon", "punto", "coma") convert UNLESS a
+#     neighbouring word marks them as prose ("the trial period", "punto de
+#     vista"), so real sentences are never mangled.
+
+_CAP_MARK = "\x02"   # placed after an inserted sentence-ender; a later pass
+                     # capitalizes the following letter, then strips the mark.
+
+# Tier-A kinds: how the inserted mark attaches to its neighbours.
+#   open   – glues to the following word ( " ( ¿ ¡ $ # )
+#   close  – glues to the preceding word ( ) ; , … % )
+#   stop   – close + the next word starts a sentence ( . ? ! )
+#   break / break_cap – line / paragraph break (break_cap capitalizes after)
+#   join   – glues both neighbours ( - _ @ . )
+#   sep    – spaced separator (  &  )
+# The 4th element is a not_after word set: a determiner/possessive right before
+# the command marks it as PROSE ("the em dash is overused", "un punto y aparte
+# en su carrera") — you don't dictate "the" before a punctuation command.
+
+_DET_EN = frozenset("""a an the this that these those each every another one no
+    any some my your his her its our their first second last next missing
+    extra""".split())
+_DET_ES = frozenset("""el la los las un una unos unas este esta ese esa estos
+    estas esos esas cada otro otra mi tu su al del ese""".split())
+_NO_GUARD = frozenset()
+
+# Common domain endings + dev file extensions for "dot"/"punto" gluing.
+_TLD_ALT_EN = (
+    r"com|net|org|io|co|dev|edu|gov|gob|ai|app|me|us|uk|es|mx|ar|cl|pe|"
+    r"uy|py|js|jsx|ts|tsx|md|json|txt|csv|yml|yaml|toml|sh|swift|rs|rb|"
+    r"java|cpp|pdf|png|jpg|jpeg|gif|svg|zip|env|html|css")
+# Spanish drops the endings that are everyday Spanish words — "el punto es que"
+# must never become "el.es que" ("es" = "is", "me" = "me", "uy" = interjection).
+_TLD_ALT_ES = (
+    r"com|net|org|io|co|dev|edu|gov|gob|ai|app|us|uk|mx|ar|cl|pe|"
+    r"py|js|jsx|ts|tsx|md|json|txt|csv|yml|yaml|toml|sh|swift|rs|rb|"
+    r"java|cpp|pdf|png|jpg|jpeg|gif|svg|zip|env|html|css")
+
+_SPOKEN_TIER_A = {
+    "en": (
+        (r"new\s+paragraph|next\s+paragraph|paragraph\s+break",
+         "\n\n", "break_cap", _DET_EN),
+        (r"new\s+line|newline|next\s+line|line\s+break", "\n", "break", _DET_EN),
+        (r"question\s+mark", "?", "stop", _DET_EN),
+        (r"exclamation\s+(?:mark|point)", "!", "stop", _DET_EN),
+        (r"full\s+stop", ".", "stop", _DET_EN),
+        (r"dot\s+dot\s+dot|ellipsis", "...", "close", _DET_EN),
+        (r"semi\s*colon", ";", "close", _DET_EN),
+        (r"open\s+(?:parenthesis|parentheses|paren)", "(", "open", _DET_EN),
+        (r"close\s+(?:parenthesis|parentheses|paren)", ")", "close", _DET_EN),
+        (r"at\s+sign|at\s+symbol", "@", "join", _DET_EN),
+        (r"underscore", "_", "join", _DET_EN),
+        (r"hyphen", "-", "join", _DET_EN),
+        (r"em\s+dash", "—", "join", _DET_EN),
+        (r"en\s+dash", "–", "join", _DET_EN),
+        (r"forward\s+slash", "/", "join", _DET_EN),
+        (r"backslash|back\s+slash", "\\", "join", _DET_EN),
+        (r"ampersand", "&", "sep", _DET_EN),
+        (r"plus\s+sign", "+", "sep", _DET_EN),
+        (r"minus\s+sign", "-", "sep", _DET_EN),
+        (r"equals?\s+sign", "=", "sep", _DET_EN),
+        (r"percent\s+sign", "%", "close", _DET_EN),
+        (r"dollar\s+sign", "$", "open", _DET_EN),
+        (r"hashtag|hash\s+sign", "#", "open", _DET_EN),
+        # "gmail dot com" → "gmail.com" (the lookahead keeps every other "dot")
+        (r"dot(?=\s+(?:" + _TLD_ALT_EN + r")\b)", ".", "join", _DET_EN),
+    ),
+    "es": (
+        # Multi-word "punto ..." commands must run before the guarded bare
+        # "punto" below.
+        (r"punto\s+y\s+aparte", ".\n\n", "break_cap", _DET_ES),
+        (r"punto\s+y\s+seguido", ".", "stop", _DET_ES),
+        (r"punto\s+y\s+coma", ";", "close", _DET_ES),
+        (r"puntos\s+suspensivos", "...", "close", _DET_ES),
+        (r"nuevo\s+p[aá]rrafo|p[aá]rrafo\s+nuevo", "\n\n", "break_cap", _DET_ES),
+        (r"nueva\s+l[ií]nea|l[ií]nea\s+nueva|salto\s+de\s+l[ií]nea",
+         "\n", "break", _DET_ES),
+        (r"signo\s+de\s+interrogaci[oó]n|(?:cerrar|cierra)\s+interrogaci[oó]n|"
+         r"cierre\s+de\s+interrogaci[oó]n", "?", "stop", _DET_ES),
+        (r"(?:abrir|abre)\s+interrogaci[oó]n|apertura\s+de\s+interrogaci[oó]n|"
+         r"signo\s+de\s+apertura\s+de\s+interrogaci[oó]n", "¿", "open",
+         _NO_GUARD),
+        (r"signo\s+de\s+(?:exclamaci[oó]n|admiraci[oó]n)|"
+         r"(?:cerrar|cierra)\s+(?:exclamaci[oó]n|admiraci[oó]n)|"
+         r"cierre\s+de\s+exclamaci[oó]n", "!", "stop", _DET_ES),
+        (r"(?:abrir|abre)\s+(?:exclamaci[oó]n|admiraci[oó]n)|"
+         r"apertura\s+de\s+exclamaci[oó]n", "¡", "open", _NO_GUARD),
+        (r"(?:abrir|abre)\s+par[eé]ntesis", "(", "open", _NO_GUARD),
+        (r"(?:cerrar|cierra)\s+par[eé]ntesis", ")", "close", _NO_GUARD),
+        (r"gui[oó]n\s+bajo|barra\s+baja", "_", "join", _DET_ES),
+        (r"arroba", "@", "join", _DET_ES),
+        (r"almohadilla|hashtag", "#", "open", _DET_ES),
+        # "frut punto com" → "frut.com"
+        (r"punto(?=\s+(?:" + _TLD_ALT_ES + r")\b)", ".", "join", _DET_ES),
+    ),
+}
+
+# Guarded single words: (pattern, symbol, kind, not_after, not_before,
+# only_before). The word converts UNLESS the word right before it is in
+# `not_after` or the one right after is in `not_before` (prose markers: "the
+# trial period", "punto de vista", "colon cancer", "en coma"). When
+# `only_before` is non-empty the word is ALSO left alone mid-utterance unless
+# the next word is a typical sentence starter — "meeting period runs" can't be
+# enumerated away with blocklists, so the most ambiguous words ("period",
+# "punto") convert mid-text only before "and/then/y/luego/..."-style words.
+# End-of-utterance and engine-punctuated cases always convert.
+_SPOKEN_GUARDED = {
+    "en": (
+        (r"period", ".", "stop",
+         frozenset("""a an the this that these each every per any some no first
+            second third last next same whole entire full free grace trial time
+            notice waiting cooling probation probationary transition question
+            menstrual missed one two three my your his her its our their long
+            short brief quiet difficult tough rough big""".split()),
+         frozenset("""of drama dramas piece pieces film films movie movies
+            furniture costume costumes pain pains cramp cramps blood products
+            tracker underwear""".split()),
+         frozenset("""and then but so also now next anyway okay ok i i'm i'll
+            we we'll you he she they it it's this there that's let's please
+            thanks thank don't do just see call send tell remember note if
+            when first finally""".split())),
+        (r"comma", ",", "close",
+         frozenset("""a an the this that every each one another missing extra
+            oxford serial first second last no my your its""".split()),
+         frozenset(("butterfly", "splice", "splices")),
+         frozenset()),
+        (r"colon", ":", "close",
+         frozenset("""a an the this that my your his her its our their whole
+            entire""".split()),
+         frozenset("""cancer cancers screening screenings surgery cleanse
+            hydrotherapy polyp polyps""".split()),
+         frozenset()),
+        (r"dash", "-", "sep",
+         frozenset("""a an the this that my your his her its our their meter
+            metre yard mad quick mile em en""".split()),
+         frozenset(("of",)),
+         frozenset()),
+    ),
+    "es": (
+        (r"punto", ".", "stop",
+         frozenset("""el un este ese otro cada cierto buen mal mi tu su al del
+            hasta ningún ningun algún algun primer segundo tercer último
+            ultimo qué que cuál cual""".split()),
+         frozenset("""de débil debil fuerte flaco clave medio muerto crítico
+            critico álgido algido culminante cardinal final dónde donde
+            por""".split()),
+         frozenset("""y pero también tambien luego después despues entonces
+            ahora además ademas ya yo él ella ellos ellas nosotros esto eso
+            esta este esa ese hay no sí si gracias dile dime manda envía envia
+            llama recuerda vamos hasta lo los la las le les me te nos se
+            primero segundo finalmente cuando mañana hoy""".split())),
+        (r"coma", ",", "close",
+         frozenset("""en el un del la una esa esta ese este mi tu su profundo
+            estado""".split()),
+         frozenset("""inducido profundo etílico etilico diabético diabetico
+            irreversible vegetal""".split()),
+         frozenset()),
+        (r"dos\s+puntos", ":", "close",
+         frozenset(("por", "los", "estos", "esos", "unos", "de", "a", "mis",
+                    "tus", "sus")),
+         frozenset(("más", "mas", "menos", "extra", "adicionales", "arriba",
+                    "abajo")),
+         frozenset()),
+        (r"gui[oó]n", "-", "join",
+         frozenset(("el", "un", "este", "ese", "del", "al", "mi", "tu", "su",
+                    "buen", "mal")),
+         frozenset(("de",)),
+         frozenset()),
+    ),
+}
+
+# Spoken quotation marks. The open/close command forms convert on their own; a
+# BARE "quote"/"comillas" is a real word, so it only converts when a matching
+# explicit closer appears later in the same utterance ("quote I'm on my way end
+# quote") — the closer is what pins the meaning. (Talon's community config
+# excludes bare quotes from dictation entirely; Apple requires its paired
+# command forms. This is the middle ground.)
+_QUOTE_CMDS = {
+    "en": {
+        "open": r"(?:open|begin|start)\s+quotes?",
+        "close": r"(?:close|end)\s+(?:of\s+)?quotes?|unquote",
+        "pair_open": r"(?:open|begin|start)\s+quotes?|in\s+quotes|"
+                     r"quotation\s+marks?|quotes?",
+        "pair_close": r"(?:close|end)\s+(?:of\s+)?quotes?|unquote|"
+                      r"quotation\s+marks?",
+        # Apple's "begin/end single quote"
+        "single_open": r"(?:open|begin|start)\s+single\s+quotes?",
+        "single_close": r"(?:close|end)\s+single\s+quotes?",
+    },
+    "es": {
+        # Apple es-ES says "abrir/cerrar comillas (dobles)"; es-LatAm says
+        # "comillas de apertura/cierre". Support both dialects.
+        "open": r"(?:abrir|abre|abro)\s+comillas(?:\s+dobles)?|"
+                r"comillas\s+de\s+apertura",
+        "close": r"(?:cerrar|cierra|cierro)\s+comillas(?:\s+dobles)?|"
+                 r"fin\s+de\s+comillas|comillas\s+de\s+cierre",
+        "pair_open": r"(?:abrir|abre|abro)\s+comillas(?:\s+dobles)?|"
+                     r"comillas\s+de\s+apertura|entre\s+comillas|comillas",
+        "pair_close": r"(?:cerrar|cierra|cierro)\s+comillas(?:\s+dobles)?|"
+                      r"fin\s+de\s+comillas|comillas\s+de\s+cierre",
+        # "comilla de apertura/cierre" (singular) is Apple's single quote
+        "single_open": r"(?:abrir|abre|abro)\s+comillas\s+simples|"
+                       r"comilla\s+de\s+apertura",
+        "single_close": r"(?:cerrar|cierra|cierro)\s+comillas\s+simples|"
+                        r"comilla\s+de\s+cierre",
+    },
+}
+
+
+def _convert_quotes(text: str, lang: str) -> str:
+    cmds = _QUOTE_CMDS.get(lang)
+    if cmds is None or not re.search(r"quot|comilla", text, re.IGNORECASE):
+        return text
+    # Single quotes first, so "abrir comillas simples" isn't half-eaten by the
+    # double-quote commands below.
+    text = re.sub(r"(?<!\w)(?:" + cmds["single_open"] + r")(?!\w)[,:]?[ \t]*",
+                  "'", text, flags=re.IGNORECASE)
+    text = re.sub(r"[ \t]*,?[ \t]*(?<!\w)(?:" + cmds["single_close"] + r")(?!\w)",
+                  "'", text, flags=re.IGNORECASE)
+    # "the quote unquote expert" → the "expert" (air quotes around ONE word).
+    if lang == "en":
+        text = re.sub(
+            r"(?<!\w)quotes?,?\s+unquote,?\s+([^\W\d_][\w'’\-]*)",
+            r'"\1"', text, flags=re.IGNORECASE)
+    # Paired: quote ... end quote (the bare word only opens when an explicit
+    # closer pins it).
+    rx_pair = re.compile(
+        r"(?<!\w)(?:" + cmds["pair_open"] + r")(?!\w)[,:]?[ \t]*"
+        r"(.+?)"
+        r"[ \t]*,?[ \t]*(?<!\w)(?:" + cmds["pair_close"] + r")(?!\w)",
+        re.IGNORECASE)
+    text = rx_pair.sub(lambda m: '"' + m.group(1) + '"', text)
+    # Leftover EXPLICIT open/close commands convert even unpaired...
+    text, n_open = re.subn(r"(?<!\w)(?:" + cmds["open"] + r")(?!\w)[,:]?[ \t]*",
+                           '"', text, flags=re.IGNORECASE)
+    text = re.sub(r"[ \t]*,?[ \t]*(?<!\w)(?:" + cmds["close"] + r")(?!\w)",
+                  '"', text, flags=re.IGNORECASE)
+    # ...and an explicit opener nobody closed quotes the rest of the utterance
+    # ("tell her open quote I'll be late" → tell her "I'll be late").
+    if n_open and text.count('"') % 2 == 1:
+        text = text.rstrip() + '"'
     return text
+
+
+def _prose_guard(not_after: frozenset) -> str:
+    """A run of fixed-width lookbehinds, one per prose-marker word, placed just
+    before the command words ("(?<!\\bthe )(?<!\\ban )..."). Python's re only
+    allows fixed-width lookbehinds, so each word gets its own assertion."""
+    return "".join(r"(?<!\b" + re.escape(w) + r" )" for w in sorted(not_after))
+
+
+def _tier_a_sub(text: str, alts: str, repl: str, kind: str,
+                not_after: frozenset = frozenset()) -> str:
+    guard = _prose_guard(not_after)
+    if kind == "open":
+        rx = re.compile(guard + r"(?<!\w)(?:" + alts + r")(?!\w)[,:]?[ \t]*",
+                        re.IGNORECASE)
+        return rx.sub(lambda m: repl, text)
+    if kind == "close":
+        rx = re.compile(r"[ \t]*,?[ \t]*" + guard + r"(?<!\w)(?:" + alts
+                        + r")(?!\w)", re.IGNORECASE)
+        return rx.sub(lambda m: repl, text)
+    if kind == "stop":
+        # Absorb the engine's own duplicate mark after the command
+        # ("question mark?" → "?").
+        rx = re.compile(r"[ \t]*,?[ \t]*" + guard + r"(?<!\w)(?:" + alts
+                        + r")(?!\w)(?:[ \t]*[.!?])*", re.IGNORECASE)
+        return rx.sub(lambda m: repl + _CAP_MARK, text)
+    if kind in ("break", "break_cap"):
+        rx = re.compile(r"[ \t]*,?[ \t]*" + guard + r"(?<!\w)(?:" + alts
+                        + r")(?!\w)[,.]?[ \t]*", re.IGNORECASE)
+
+        def f(m):
+            out = repl
+            j = m.start()
+            prev = m.string[j - 1] if j else ""
+            if out.startswith(".") and prev in ".!?…":
+                out = out.lstrip(".")     # "gracias. punto y aparte" → no ".."
+            return out + (_CAP_MARK if kind == "break_cap" else "")
+        return rx.sub(f, text)
+    if kind == "join":
+        rx = re.compile(r"[ \t]*" + guard + r"(?<!\w)(?:" + alts
+                        + r")(?!\w)[ \t]*", re.IGNORECASE)
+        return rx.sub(lambda m: repl, text)
+    if kind == "sep":
+        rx = re.compile(r"[ \t]*" + guard + r"(?<!\w)(?:" + alts
+                        + r")(?!\w)[ \t]*", re.IGNORECASE)
+        return rx.sub(lambda m: " " + repl + " ", text)
+    return text
+
+
+def _guarded_sub(text: str, alts: str, sym: str, kind: str,
+                 not_after: frozenset, not_before: frozenset,
+                 only_before: frozenset = frozenset()) -> str:
+    if kind in ("stop", "close"):
+        # absorb the engine's own duplicate mark after the word ("period.")
+        tail = r"(?:[ \t]*" + re.escape(sym) + r")*"
+    elif kind in ("join", "sep"):
+        tail = r"[ \t]*"          # eat following spaces so both sides can glue
+    else:
+        tail = ""
+    rx = re.compile(
+        r"(?:([^\W\d_][\w'’\-]*)(,?)[ \t]+)?(?<!\w)(?:" + alts + r")(?!\w)"
+        + tail, re.IGNORECASE)
+
+    def f(m):
+        prev = (m.group(1) or "").lower()
+        if prev in not_after:
+            return m.group(0)
+        rest = m.string[m.end():]
+        nm = re.match(r"[ \t]*,?[ \t]*([^\W\d_][\w'’\-]*)", rest)
+        if nm and nm.group(1).lower() in not_before:
+            return m.group(0)
+        if nm and only_before and nm.group(1).lower() not in only_before:
+            return m.group(0)
+        # If the engine already ended the clause ("trabaja. Punto"), the spoken
+        # mark is redundant — drop the word instead of doubling punctuation.
+        j = m.start()
+        while j > 0 and m.string[j - 1] in " \t":
+            j -= 1
+        prevch = m.string[j - 1] if j else ""
+        lead = m.group(1) or ""
+        if prevch in ".!?,;:" and not lead:
+            return ""
+        if kind == "stop":
+            return lead + sym + _CAP_MARK
+        if kind == "join":
+            return lead + sym
+        if kind == "sep":
+            return lead + " " + sym + " "
+        return lead + sym
+    return rx.sub(f, text)
+
+
+def _convert_spoken_punctuation(text: str, lang: str) -> str:
+    text = _convert_quotes(text, lang)
+    for alts, repl, kind, not_after in _SPOKEN_TIER_A.get(lang, ()):
+        text = _tier_a_sub(text, alts, repl, kind, not_after)
+    for alts, sym, kind, not_after, not_before, only_before in (
+            _SPOKEN_GUARDED.get(lang, ())):
+        text = _guarded_sub(text, alts, sym, kind, not_after, not_before,
+                            only_before)
+    return text
+
+
+def _tidy_text(text: str, lang: str = "en") -> str:
+    """Spacing/capitalization pass shared by every cleanup path. Preserves the
+    newlines that spoken commands insert (the engines never emit any)."""
+    text = re.sub(r"[ \t]+([,.;:!?…%)])", r"\1", text)   # no space before closers
+    text = re.sub(r"([¿¡($#])[ \t]+", r"\1", text)       # no space after openers
+    text = re.sub(r",+([.!?;:])", r"\1", text)           # comma yields to a stronger mark
+    text = re.sub(r"([.!?;:]),+", r"\1", text)
+    text = re.sub(r"([?!])\.(?!\.)", r"\1", text)        # RAE: no period after ? or !
+    # A period both inside AND right after a closing quote ("…camino.". ) keeps
+    # only one — outside the quote in Spanish (RAE), inside in English.
+    if lang == "es":
+        text = re.sub(r"\.\"(?=\s*[.!?])", '"', text)
+    else:
+        text = re.sub(r"(\.\")\s*\.(?!\.)", r"\1", text)
+    text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)         # trim around breaks
+    text = re.sub(r"\n{3,}", "\n\n", text)               # at most one blank line
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    # Capitalize after inserted sentence enders, then drop the markers.
+    text = re.sub(_CAP_MARK + r"+(\s*)(.)",
+                  lambda m: m.group(1) + m.group(2).upper(), text, flags=re.S)
+    text = text.replace(_CAP_MARK, "")
+    text = text.strip()
+    # Capitalize the first LETTER, skipping openers ("¿hola?" → "¿Hola?",
+    # '"great' → '"Great') — never a digit ("20 people" stays).
+    m = re.match(r'^([\s"\'«»„“”‘’¿¡(\[\-–—…#$@]*)([^\W\d_])(.*)$', text, re.S)
+    if m:
+        text = m.group(1) + m.group(2).upper() + m.group(3)
+    return text
+
+
+def basic_cleanup(text: str, language: str = "en") -> str:
+    lang = str(language or "en").lower()
+    if lang.startswith("en"):
+        lang = "en"
+    elif lang.startswith("es"):
+        lang = "es"
+    filler = _FILLER_RES.get(lang)
+    if filler is not None:
+        text = filler.sub("", text)
+    text = _convert_spoken_punctuation(text, lang)
+    return _tidy_text(text, lang)
 
 
 def _prompt_block_text(value, *, max_chars: int = 120) -> str:
@@ -2190,8 +2777,17 @@ def local_repair(text: str, cfg: dict, context: dict | None = None,
 def clean(text: str, cfg: dict, context: dict | None = None, gpu_lock=None) -> str:
     if not text:
         return text
+    # Silence hallucinations ("Thanks for watching!", "Subtítulos por... Amara")
+    # are never the user's words, so they're dropped in EVERY mode, "none" too.
+    text = strip_asr_hallucinations(text)
+    if not text:
+        return ""
     mode = cfg["cleanup"]
-    lang = str(cfg.get("language", "en") or "en")
+    lang = str(cfg.get("language", "en") or "en").lower()
+    if lang in ("", "auto"):
+        # Multilingual engines detect the SPEECH language per-utterance; mirror
+        # that here so e.g. Spanish text gets Spanish cleanup rules.
+        lang = _detect_cleanup_language(text)
     if mode == "none":
         out = text
     elif mode == "local":
@@ -5440,6 +6036,7 @@ def _settings_controller_class():
             self._hotkey_value_label = None
             self._hotkey_change_button = None
             self._hotkey_capture_monitor = None
+            self._pkmodel_seg = None    # the v2/v3 segment; apply_language flips it
             self._build()
             return self
 
@@ -5841,9 +6438,9 @@ def _settings_controller_class():
 
         @objc.python_method
         def _pane_model(self):
-            pane = self._flipped(WIN_W, 380)
+            pane = self._flipped(WIN_W, 434)
             y = PAD
-            inner, h = self._card_at(pane, y, 4)
+            inner, h = self._card_at(pane, y, 5)
             self._row_text(inner, 0, "Transcription engine",
                            "Parakeet runs on the Apple-Silicon GPU", right_x=230.0)
             self._add_segment(inner, 0, ("Parakeet", "Whisper"),
@@ -5851,29 +6448,40 @@ def _settings_controller_class():
                               self._cfg("transcribe_backend", "parakeet"),
                               cfg_key="transcribe_backend", seg_w=66.0)
             self._row_divider(inner, 1)
-            self._row_text(inner, 1, "Language model",
+            self._row_text(inner, 1, "Spoken language",
+                           "Auto detects per dictation", right_x=230.0)
+            cur_lang = str(self._cfg("language", "en") or "en").lower()
+            if cur_lang not in ("auto", "en", "es"):
+                cur_lang = "auto"    # any other code: at least show a true state
+            self._add_segment(inner, 1, ("Auto", "English", "Español"),
+                              ("auto", "en", "es"), cur_lang,
+                              apply_name="apply_language", seg_w=72.0)
+            self._row_divider(inner, 2)
+            self._row_text(inner, 2, "Language model",
                            "v2 English, or v3 for 25 languages", right_x=210.0)
             cur_pk = "v3" if str(self._cfg("parakeet_model", PK_V2)).endswith(
                 "v3") else "v2"
-            self._add_segment(inner, 1, ("English", "Multilingual"),
-                              ("v2", "v3"), cur_pk,
-                              apply_name="apply_pkmodel", seg_w=94.0)
-            self._row_divider(inner, 2)
-            self._row_text(inner, 2, "Cleanup",
+            self._pkmodel_seg = self._add_segment(
+                inner, 2, ("English", "Multilingual"),
+                ("v2", "v3"), cur_pk,
+                apply_name="apply_pkmodel", seg_w=94.0)
+            self._row_divider(inner, 3)
+            self._row_text(inner, 3, "Cleanup",
                            "How much to tidy the text", right_x=220.0)
-            self._add_segment(inner, 2,
+            self._add_segment(inner, 3,
                               ("None", "Basic", "On-device"),
                               ("none", "basic", "local"),
                               self._cfg("cleanup", "basic"),
                               cfg_key="cleanup", seg_w=None)
-            self._row_divider(inner, 3)
-            self._row_text(inner, 3, "Normalize audio",
+            self._row_divider(inner, 4)
+            self._row_text(inner, 4, "Normalize audio",
                            "Boost quiet or whispered speech")
-            self._add_switch(inner, 3, "normalize_audio",
+            self._add_switch(inner, 4, "normalize_audio",
                              bool(self._cfg("normalize_audio", True)))
             y += h + 12
             note = NSTextField.wrappingLabelWithString_(
-                "Engine and language-model changes take effect after Restart.")
+                "Engine, language, and language-model changes take effect "
+                "after Restart.")
             note.setFont_(G.rounded_font(11.5))
             note.setTextColor_(SUB_COL)
             note.setFrame_(NSMakeRect(PAD + 2, 0, CONTENT_W - 4, 30))
@@ -6112,15 +6720,27 @@ def _settings_controller_class():
                  "model. Both run entirely on your Mac — your voice never "
                  "leaves the device, and neither engine needs an account or "
                  "API key."),
+                ("Spoken language",
+                 "The language you dictate in. “Auto” lets the engine "
+                 "detect it per dictation — great if you mix languages. "
+                 "“English”/“Español” lock it in, which is a bit "
+                 "more accurate if you only ever use one. Anything except "
+                 "English needs the Multilingual model, so picking Auto or "
+                 "Español switches it for you. Takes effect after Restart."),
                 ("Language model",
                  "Which Parakeet model to load. “English” is tuned for "
                  "English only; “Multilingual” understands about 25 "
-                 "languages. This one takes effect after you Restart the app."),
+                 "languages, Spanish included, and detects which one you're "
+                 "speaking. This one takes effect after you Restart the app."),
                 ("Cleanup",
                  "How much früt Flow tidies the raw transcript before inserting "
                  "it. “None” keeps the engine's words as-is (your taught "
                  "corrections still apply). “Basic” also fixes fillers, "
-                 "spacing, and capitalization. "
+                 "spacing, and capitalization, and converts spoken punctuation "
+                 "— “quote … end quote” becomes real quotation marks, "
+                 "“new paragraph” a blank line, “question mark” a ?, "
+                 "and in Spanish “abrir comillas”, “punto y aparte”, "
+                 "“signo de interrogación” and friends. "
                  "“On-device” uses a local model to fix misheard words "
                  "from context — no cloud, no API key, still private."),
                 ("Normalize audio",
@@ -6690,6 +7310,26 @@ def _settings_controller_class():
         @objc.python_method
         def apply_pkmodel(self, value):
             self._save("parakeet_model", PK_V3 if value == "v3" else PK_V2)
+
+        @objc.python_method
+        def apply_language(self, value):
+            self._save("language", value)
+            # Anything but forced-English needs the multilingual Parakeet v3
+            # checkpoint (v2 is English-only and would produce garbage), so
+            # flip the model along with the language — and keep the on-screen
+            # v2/v3 segment truthful.
+            if value != "en" and str(
+                    self._cfg("parakeet_model", PK_V2)).endswith("v2"):
+                self._save("parakeet_model", PK_V3)
+                try:
+                    if self._pkmodel_seg is not None:
+                        self._pkmodel_seg.setSelectedSegment_(1)
+                except Exception:  # noqa: BLE001
+                    pass
+                print("[flow] language set to "
+                      f"'{value}': switched the Parakeet model to the "
+                      "multilingual v3 (takes effect after Restart).",
+                      flush=True)
 
     _SETTINGS_CTRL_CLASS = _SettingsController
     return _SETTINGS_CTRL_CLASS
@@ -10007,19 +10647,19 @@ def compare_engines(cfg: dict, seconds: float = 6.0) -> int:
         normalize_rms_dbfs=cfg.get("normalize_rms_dbfs", -20.0),
     )
     engines = []
+    pk_model = _resolve_parakeet_model(cfg)
+    fw_model = _resolve_whisper_model(cfg)
     try:
         engines.append((
-            f"parakeet ({cfg.get('parakeet_model', '').split('/')[-1]})",
-            ParakeetTranscriber(
-                cfg.get("parakeet_model", "mlx-community/parakeet-tdt-0.6b-v2"),
-                cfg["language"], warmup=True, **norm)))
+            f"parakeet ({pk_model.split('/')[-1]})",
+            ParakeetTranscriber(pk_model, cfg["language"], warmup=True, **norm)))
     except Exception as e:  # noqa: BLE001
         print(f"[flow] parakeet unavailable: {e}")
     try:
         engines.append((
-            f"faster-whisper ({cfg['model']})",
+            f"faster-whisper ({fw_model})",
             LocalTranscriber(
-                cfg["model"], cfg["compute_type"], cfg["language"],
+                fw_model, cfg["compute_type"], cfg["language"],
                 vad_filter=cfg.get("vad_filter", False),
                 beam_size=cfg.get("beam_size", 5),
                 initial_prompt=cfg.get("initial_prompt", ""),
@@ -10061,12 +10701,11 @@ def preload_models(cfg: dict) -> int:
     backend = cfg.get("transcribe_backend", "parakeet")
     try:
         if backend == "parakeet":
-            model_name = cfg.get("parakeet_model",
-                                 DEFAULT_CONFIG["parakeet_model"])
+            model_name = _resolve_parakeet_model(cfg)
             print(f"[flow] preloading Parakeet speech model: {model_name}")
             ParakeetTranscriber(model_name, cfg["language"], warmup=True, **norm)
         else:
-            model_name = cfg.get("model", DEFAULT_CONFIG["model"])
+            model_name = _resolve_whisper_model(cfg)
             print(f"[flow] preloading faster-whisper speech model: {model_name}")
             LocalTranscriber(
                 model_name, cfg["compute_type"], cfg["language"],

@@ -4,7 +4,9 @@
 # than faster-whisper on this hardware AND more accurate, with punctuation built in.
 parakeet-mlx>=0.5.2            # NVIDIA Parakeet TDT on Apple MLX (default backend)
 mlx>=0.31                     # Apple MLX runtime (Metal GPU); pulls mlx-metal
-faster-whisper>=1.0.2          # fallback backend ("local"); >=1.0.2 for `hotwords`
+faster-whisper>=1.1            # fallback backend ("local"); >=1.0.2 for `hotwords`,
+                               # >=1.1 for the multilingual "large-v3-turbo" alias
+                               # (used automatically when language != English)
 sounddevice>=0.4.6
 pynput>=1.7.6
 numpy>=2.2.5                 # parakeet-mlx 0.5.2 minimum

@@ -44,7 +44,16 @@
     "actually delete that",
     "cancel that",
     "forget that",
-    "undo that"
+    "undo that",
+    "olvídalo",
+    "olvidalo",
+    "borra eso",
+    "borrar eso",
+    "elimina eso",
+    "eliminar eso",
+    "deshaz eso",
+    "deshacer eso",
+    "cancela eso"
   ],
   "play_sounds": true,
   "show_hud": true,
