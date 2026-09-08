@@ -15,6 +15,7 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 import weakref
@@ -728,3 +729,408 @@ class DefaultConfigWriteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TapKindTests(unittest.TestCase):
+    def test_modifier_hotkeys_use_a_passive_listener(self):
+        self.assertTrue(flow._hotkey_is_modifier_only({58}))
+        self.assertTrue(flow._hotkey_is_modifier_only({58, 61}))
+        self.assertTrue(flow._hotkey_is_modifier_only(
+            flow.resolve_target_vks("alt_l")))
+        self.assertTrue(flow._hotkey_is_modifier_only(
+            flow.resolve_target_vks("vk:63")))          # Fn / Globe
+
+    def test_regular_key_hotkeys_need_an_active_tap(self):
+        self.assertFalse(flow._hotkey_is_modifier_only(
+            flow.resolve_target_vks("vk:96")))          # F5
+        self.assertFalse(flow._hotkey_is_modifier_only({58, 96}))
+        self.assertFalse(flow._hotkey_is_modifier_only(set()))
+
+
+class ReleaseWatchTests(unittest.TestCase):
+    """A hold-mode key-up that never reaches the event tap (macOS disabled the
+    tap for a moment) must not keep the microphone open until the 120 s cap."""
+
+    @staticmethod
+    def _readings(*values):
+        """A physical-key fake replaying `values`, then repeating the last."""
+        seen = []
+
+        def physically_down():
+            seen.append(1)
+            return values[min(len(seen), len(values)) - 1]
+
+        physically_down.seen = seen
+        return physically_down
+
+    @staticmethod
+    def _app(*, physically_down, locked=False, mode="hold"):
+        app = flow.FlowApp.__new__(flow.FlowApp)
+        app._state_lock = threading.RLock()
+        app._capture_q = queue.SimpleQueue()
+        app._capture_requested = True
+        app._capture_generation = 1
+        app._locked = locked
+        app._key_down = True
+        app._keystate_confirmed = False
+        app._keystate_warned = False
+        app._record_started = time.monotonic() - 5.0    # held well past settling
+        app.recorder = types.SimpleNamespace(recording=True)
+        app.cfg = {"mode": mode}
+        app.target_vks = {58}
+        app._hotkey_physically_down = physically_down
+        app._RELEASE_POLL_SECONDS = 0.005
+        return app
+
+    def test_lost_key_up_is_recovered_from_the_physical_key_state(self):
+        # The window server confirms the key down, then reads it up for good.
+        down = self._readings(True, False)
+        app = self._app(physically_down=down)
+        with redirect_stdout(io.StringIO()) as out:
+            app._release_watch_loop(1)
+        self.assertEqual(app._capture_q.get_nowait(), (2, False))
+        self.assertFalse(app._capture_requested)
+        self.assertFalse(app._key_down)
+        self.assertEqual(len(down.seen), 4)      # 1 confirm + 3 consecutive "up"
+        self.assertIn("release watcher armed", out.getvalue())
+        self.assertIn("never reached the event tap", out.getvalue())
+
+    def test_needs_consecutive_up_readings(self):
+        # A single flicker between "down" readings must never end a capture.
+        down = self._readings(False, True, False, False, True, False, False, False)
+        app = self._app(physically_down=down)
+        with redirect_stdout(io.StringIO()):
+            app._release_watch_loop(1)
+        self.assertEqual(len(down.seen), 8)
+        self.assertEqual(app._capture_q.get_nowait(), (2, False))
+
+    def test_a_key_never_seen_down_is_never_acted_on(self):
+        # A keyboard the window server cannot see: the watcher must stay quiet
+        # until the capture ends for a real reason, and say so once.
+        down = self._readings(False)
+        app = self._app(physically_down=down)
+
+        def real_stop():
+            time.sleep(0.05)
+            with app._state_lock:
+                app.recorder.recording = False
+
+        threading.Thread(target=real_stop, daemon=True).start()
+        with redirect_stdout(io.StringIO()) as out:
+            app._release_watch_loop(1)
+        self.assertGreater(len(down.seen), 2)
+        self.assertTrue(app._capture_requested)
+        with self.assertRaises(queue.Empty):
+            app._capture_q.get_nowait()
+        self.assertIn("never saw the hotkey held", out.getvalue())
+        self.assertTrue(app._keystate_warned)
+
+    def test_a_held_key_never_stops_the_capture(self):
+        reads = []
+
+        def physically_down():
+            reads.append(1)
+            if len(reads) >= 6:
+                with app._state_lock:
+                    app._capture_generation = 2   # the tap delivered a real release
+            return True
+
+        app = self._app(physically_down=physically_down)
+        app._release_watch_loop(1)
+        self.assertTrue(app._capture_requested)
+        with self.assertRaises(queue.Empty):
+            app._capture_q.get_nowait()
+
+    def test_locked_capture_ignores_a_physical_release(self):
+        app = self._app(physically_down=lambda: False, locked=True)
+        app._release_watch_loop(1)     # hands-free latch: returns at once
+        self.assertTrue(app._capture_requested)
+        with self.assertRaises(queue.Empty):
+            app._capture_q.get_nowait()
+
+    def test_fresh_press_is_left_to_the_tap_while_it_settles(self):
+        # Confirmed down, then "up" readings — but inside the settle window a
+        # real release (generation bump) must be the only thing that ends it.
+        app = self._app(physically_down=self._readings(True, False))
+        app._record_started = time.monotonic()      # pressed just now
+
+        def real_release():
+            time.sleep(0.05)
+            with app._state_lock:
+                app._capture_generation = 2
+
+        threading.Thread(target=real_release, daemon=True).start()
+        app._release_watch_loop(1)
+        self.assertTrue(app._capture_requested)
+        with self.assertRaises(queue.Empty):
+            app._capture_q.get_nowait()
+
+    def test_toggle_mode_never_starts_a_watcher(self):
+        app = self._app(physically_down=lambda: False, mode="toggle")
+        started = []
+        with mock.patch.object(threading, "Thread",
+                               side_effect=lambda *a, **k: started.append(k)):
+            app._start_release_watch(1)
+        self.assertEqual(started, [])
+
+
+class KeyStateProbeTests(unittest.TestCase):
+    def test_physical_state_read_is_conservative(self):
+        app = flow.FlowApp.__new__(flow.FlowApp)
+        app.target_vks = {58}
+        fake = types.SimpleNamespace(
+            kCGEventSourceStateCombinedSessionState=0,
+            CGEventSourceKeyState=lambda _state, _vk: False,
+            CGEventSourceFlagsState=lambda _state: 0x80000)
+        with mock.patch.dict(flow._MODIFIER_CLASS_MASK_BY_VK, {58: 0x80000}), \
+                mock.patch.dict(sys.modules, {"Quartz": fake}):
+            # Key up, but the Option class flag is still set (sibling key held).
+            self.assertTrue(app._hotkey_physically_down())
+            fake.CGEventSourceFlagsState = lambda _state: 0x100
+            self.assertFalse(app._hotkey_physically_down())
+
+            def boom(_state, _vk):
+                raise RuntimeError("window server unavailable")
+
+            fake.CGEventSourceKeyState = boom
+            # A failed read can never cut a live dictation short.
+            self.assertTrue(app._hotkey_physically_down())
+
+
+class ForcedStopTests(unittest.TestCase):
+    def test_runaway_guard_can_close_a_recorder_that_outlived_its_request(self):
+        app = flow.FlowApp.__new__(flow.FlowApp)
+        app._state_lock = threading.RLock()
+        app._capture_q = queue.SimpleQueue()
+        app._capture_requested = False      # desired state already says "stopped"
+        app._capture_generation = 3
+        app._locked = True
+        app.recorder = types.SimpleNamespace(recording=True)
+
+        self.assertFalse(app._request_capture(False))               # coalesced
+        self.assertTrue(app._request_capture(False, force=True))    # still queued
+        self.assertEqual(app._capture_q.get_nowait(), (4, False))
+        self.assertFalse(app._locked)
+
+        # force never invents a stop for a recorder that is already closed.
+        app.recorder.recording = False
+        self.assertFalse(app._request_capture(False, force=True))
+        with self.assertRaises(queue.Empty):
+            app._capture_q.get_nowait()
+
+
+class PostWakeWarmupTests(unittest.TestCase):
+    @staticmethod
+    def _app():
+        app = flow.FlowApp.__new__(flow.FlowApp)
+        app._state_lock = threading.RLock()
+        app._wake_warm_event = threading.Event()
+        app._wake_warm_token = object()
+        app._work_q = queue.Queue(maxsize=5)
+        app._capture_requested = False
+        app.recorder = types.SimpleNamespace(recording=False)
+        app._processing_started = None
+        app._proc_warned = False
+        app.warmed = 0
+        app.processed = []
+
+        def warm():
+            app.warmed += 1
+            app._wake_warm_event.clear()
+
+        app._warm_models_after_wake = warm
+        app._process = lambda audio, *, queue_wait=0.0: app.processed.append(audio)
+        app._reflect_pipeline_status = lambda: None
+        return app
+
+    def _run_worker(self, app):
+        worker = threading.Thread(target=app._transcription_worker, daemon=True)
+        worker.start()
+        # Let the worker drain what was queued BEFORE handing it the shutdown
+        # sentinel; a sentinel already in the queue would look like a waiting
+        # clip to the warm-up decision.
+        deadline = time.monotonic() + 2.0
+        while app._work_q.unfinished_tasks and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(app._work_q.unfinished_tasks, 0)
+        app._work_q.put_nowait(None)
+        worker.join(2.0)
+        self.assertFalse(worker.is_alive())
+
+    def test_idle_wake_still_warms_the_model(self):
+        app = self._app()
+        app._wake_warm_event.set()
+        app._work_q.put_nowait(app._wake_warm_token)
+        self._run_worker(app)
+        self.assertEqual(app.warmed, 1)
+
+    def test_warm_up_never_runs_ahead_of_a_waiting_clip(self):
+        app = self._app()
+        app._wake_warm_event.set()
+        app._work_q.put_nowait(app._wake_warm_token)
+        app._work_q.put_nowait(("clip", 0.0))
+        self._run_worker(app)
+        self.assertEqual(app.warmed, 0)
+        self.assertEqual(app.processed, ["clip"])
+        self.assertFalse(app._wake_warm_event.is_set())
+
+    def test_warm_up_yields_to_an_open_microphone(self):
+        app = self._app()
+        app._wake_warm_event.set()
+        app.recorder.recording = True
+        app._work_q.put_nowait(app._wake_warm_token)
+        self._run_worker(app)
+        self.assertEqual(app.warmed, 0)
+        self.assertFalse(app._wake_warm_event.is_set())
+
+    def test_real_clip_clears_a_pending_warm_up_instead_of_paying_twice(self):
+        app = self._app()
+        app._wake_warm_event.set()     # token could not be queued: queue was full
+        app._work_q.put_nowait(("clip", 0.0))
+        self._run_worker(app)
+        self.assertEqual(app.warmed, 0)
+        self.assertEqual(app.processed, ["clip"])
+        self.assertFalse(app._wake_warm_event.is_set())
+
+
+class CaptureStopOrderTests(unittest.TestCase):
+    @staticmethod
+    def _app(audio):
+        class Recorder:
+            recording = True
+
+            def stop(self):
+                self.recording = False
+                return audio
+
+        app = flow.FlowApp.__new__(flow.FlowApp)
+        app._state_lock = threading.RLock()
+        app._capture_requested = True
+        app._capture_generation = 1
+        app._locked = True
+        app._record_started = 1.0
+        app._processing_started = None
+        app._work_q = queue.Queue(maxsize=5)
+        app.cfg = {"min_seconds": 0.1, "play_sounds": False}
+        app.recorder = Recorder()
+        app.events = []
+        app._set_status = lambda glyph, _label: app.events.append(("status", glyph))
+        app._refresh_audio_if_pending = (
+            lambda *_a, **_k: app.events.append(("refresh",)) or False)
+        return app
+
+    def test_status_is_published_before_the_post_wake_audio_refresh(self):
+        clip = flow.np.zeros(flow.SAMPLE_RATE, dtype=flow.np.float32)
+        app = self._app(clip)
+        with mock.patch.object(flow, "play"), redirect_stdout(io.StringIO()):
+            app._end(generation=1)
+        self.assertEqual(app.events, [("status", "⏳"), ("refresh",)])
+        self.assertEqual(app._work_q.qsize(), 1)
+        self.assertFalse(app._locked)
+        self.assertFalse(app._capture_requested)
+
+    def test_too_short_clip_still_refreshes_after_going_idle(self):
+        app = self._app(None)
+        with mock.patch.object(flow, "play"), redirect_stdout(io.StringIO()):
+            app._end(generation=1)
+        self.assertEqual(app.events, [("status", "🎙️"), ("refresh",)])
+        self.assertTrue(app._work_q.empty())
+
+    def test_status_is_published_while_holding_the_state_lock(self):
+        app = self._app(None)
+        owned = []
+        app._set_status = lambda _g, _l: owned.append(app._state_lock._is_owned())
+        app._reflect_pipeline_status()
+        self.assertEqual(owned, [True])
+        self.assertFalse(app._state_lock._is_owned())
+
+
+class EditLearningTests(unittest.TestCase):
+    def test_diff_runs_off_the_calling_thread_and_only_once(self):
+        app = flow.FlowApp.__new__(flow.FlowApp)
+        app._state_lock = threading.RLock()
+        app._pending_learn = {"el": "field", "pasted": "hello",
+                              "done": False, "generation": 1}
+        app._learn_timer = None
+        seen = []
+        done = threading.Event()
+
+        def fake_learn(el, pasted, **_kwargs):
+            seen.append((el, pasted, threading.current_thread().name))
+            done.set()
+            return 0
+
+        with mock.patch.object(flow, "learn_from_edit", side_effect=fake_learn):
+            app._reconcile_edit_learning()
+            app._reconcile_edit_learning()      # nothing pending any more
+            self.assertTrue(done.wait(2.0))
+            time.sleep(0.05)
+        self.assertEqual([s[:2] for s in seen], [("field", "hello")])
+        self.assertNotEqual(seen[0][2], threading.current_thread().name)
+        self.assertIsNone(app._pending_learn)
+
+
+class RecorderStopTests(unittest.TestCase):
+    def test_slow_stream_close_is_reported(self):
+        class Stream:
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        rec = flow.Recorder.__new__(flow.Recorder)
+        rec._lock = threading.Lock()
+        rec._frames_lock = threading.Lock()
+        rec._frames = [flow.np.zeros((160, 1), dtype=flow.np.float32)]
+        rec._stream = Stream()
+        rec.recording = True
+        with mock.patch.object(flow.time, "monotonic", side_effect=[0.0, 2.5]), \
+                redirect_stdout(io.StringIO()) as out:
+            audio = rec.stop()
+        self.assertIn("took 2.5s to close", out.getvalue())
+        self.assertEqual(audio.shape, (160,))
+        self.assertFalse(rec.recording)
+        self.assertIsNone(rec._stream)
+
+
+class LogTimestampTests(unittest.TestCase):
+    def test_lines_get_a_stamp_and_partial_writes_do_not(self):
+        raw = io.StringIO()
+        stream = flow._TimestampedStream(raw)
+        with mock.patch.object(flow.time, "strftime", return_value="[T] "):
+            stream.write("[flow] one\n")
+            stream.write("partial ")
+            stream.write("rest\n")
+            stream.write("\n")
+            stream.write("\rprogress 50%")
+            stream.write("\rprogress 100%\n")
+            stream.write("after\n")
+        self.assertEqual(
+            raw.getvalue(),
+            "[T] [flow] one\n[T] partial rest\n\n"
+            "\rprogress 50%\rprogress 100%\n[T] after\n")
+
+    def test_terminal_output_is_left_alone(self):
+        tty = io.StringIO()
+        tty.isatty = lambda: True
+        with mock.patch.object(sys, "stdout", tty), \
+                mock.patch.object(sys, "stderr", tty):
+            flow._timestamp_log_streams()
+            self.assertIs(sys.stdout, tty)
+
+    def test_redirected_output_is_wrapped_exactly_once(self):
+        log = io.StringIO()         # isatty() is False
+        with mock.patch.object(sys, "stdout", log), \
+                mock.patch.object(sys, "stderr", log):
+            flow._timestamp_log_streams()
+            wrapped = sys.stdout
+            self.assertIsInstance(wrapped, flow._TimestampedStream)
+            flow._timestamp_log_streams()
+            self.assertIs(sys.stdout, wrapped)
+            # Everything else (fileno, encoding, ...) is delegated to the raw
+            # stream, so libraries that poke at sys.stdout keep working.
+            with mock.patch.object(flow.time, "strftime", return_value="[T] "):
+                sys.stdout.write("hello\n")
+            self.assertEqual(log.getvalue(), "[T] hello\n")
+            self.assertFalse(sys.stdout.isatty())

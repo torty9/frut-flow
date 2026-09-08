@@ -58,6 +58,53 @@ LAUNCHCTL = "/bin/launchctl"
 OSASCRIPT = "/usr/bin/osascript"
 
 
+class _TimestampedStream:
+    """Prefix every log LINE with wall-clock time.
+
+    frutflow.app redirects stdout/stderr into ~/.flowdictate/flow.log, and a log
+    without times cannot answer the questions a stuck-state report raises: how
+    long did that capture really run, did a wake precede it, was the tap
+    disabled at the same moment. Partial writes (a print without a newline, a
+    progress bar's \r) are left alone; only the start of a new line gets a stamp.
+    """
+
+    def __init__(self, raw):
+        self._raw = raw
+        self._at_line_start = True
+
+    def write(self, s):
+        if not s:
+            return 0
+        out = []
+        for piece in str(s).splitlines(keepends=True):
+            if self._at_line_start and piece.strip():
+                out.append(time.strftime("[%Y-%m-%d %H:%M:%S] "))
+            out.append(piece)
+            self._at_line_start = piece.endswith("\n")
+        return self._raw.write("".join(out))
+
+    def flush(self):
+        return self._raw.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+def _timestamp_log_streams() -> None:
+    """Wrap stdout/stderr with line timestamps when they are NOT a terminal
+    (i.e. the app is writing flow.log). Interactive runs keep plain output."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None or isinstance(stream, _TimestampedStream):
+            continue
+        try:
+            if stream.isatty():
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        setattr(sys, name, _TimestampedStream(stream))
+
+
 def _secure_dir() -> None:
     """Create ~/.flowdictate as owner-only (0700). Everything we persist here —
     learned vocabulary, corrections, dictation history, the log — is personal
@@ -637,6 +684,7 @@ class Recorder:
             if not self.recording:
                 return None
             stream = self._stream
+            closing_started = time.monotonic()
             try:
                 if stream is not None:
                     try:
@@ -646,6 +694,14 @@ class Recorder:
             finally:
                 self._stream = None
                 self.recording = False
+            closed_in = time.monotonic() - closing_started
+            if closed_in > 1.0:
+                # CoreAudio can sit on a stop/close while a device is going away
+                # (AirPods switching, post-wake settling). The status keeps
+                # saying "Listening" for exactly this long after the key-up, so
+                # leave a trace that explains it.
+                print(f"[flow] the microphone took {closed_in:.1f}s to close.",
+                      flush=True)
             with self._frames_lock:
                 frames = list(self._frames)
                 self._frames = []
@@ -1824,6 +1880,26 @@ def _focused_app_name() -> str | None:
         return None
 
 
+# Accessibility requests are synchronous IPC into the focused app. A busy or
+# hung app (an Electron app mid-GC, an IDE indexing) would otherwise block the
+# dictation worker for the system default of several seconds PER request — the
+# text has already landed, yet the HUD keeps saying "Transcribing…" and the next
+# clip waits behind it. Everything we read this way is a best-effort extra
+# (undo safety, learning from edits), so bound each request tightly instead.
+_AX_TIMEOUT_SECONDS = 1.0
+
+
+def _ax_bound_timeout(el) -> None:
+    """Cap how long AX requests through `el` may block (best-effort)."""
+    if el is None:
+        return
+    try:
+        from ApplicationServices import AXUIElementSetMessagingTimeout
+        AXUIElementSetMessagingTimeout(el, float(_AX_TIMEOUT_SECONDS))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _ax_focused_element():
     """The AXUIElement with keyboard focus system-wide, or None. Needs the
     Accessibility permission (already required for paste)."""
@@ -1836,9 +1912,15 @@ def _ax_focused_element():
             kAXFocusedUIElementAttribute,
         )
         sysw = AXUIElementCreateSystemWide()
+        # On the system-wide element this sets the default for every AX request
+        # this process makes; the element-level call below is belt-and-braces.
+        _ax_bound_timeout(sysw)
         err, el = AXUIElementCopyAttributeValue(
             sysw, kAXFocusedUIElementAttribute, None)
-        return el if err == 0 else None
+        if err != 0:
+            return None
+        _ax_bound_timeout(el)
+        return el
     except Exception:  # noqa: BLE001
         return None
 
@@ -1852,6 +1934,7 @@ def _ax_read_value(el) -> str | None:
         from ApplicationServices import (
             AXUIElementCopyAttributeValue, kAXValueAttribute,
         )
+        _ax_bound_timeout(el)
         err, val = AXUIElementCopyAttributeValue(el, kAXValueAttribute, None)
         if err == 0 and isinstance(val, str):
             return val
@@ -3218,6 +3301,30 @@ _VK_GRAVE = 50   # kVK_ANSI_Grave (backtick / tilde key)
 _MODIFIER_MASK_BY_VK: dict[int, int] = {}
 _MODIFIER_CLASS_MASK_BY_VK: dict[int, int] = {}
 _MODIFIER_DEVICE_BITS_BY_VK: dict[int, int] = {}
+
+# Every virtual keycode that is a modifier key (both Command/Shift/Option/Control
+# sides, Caps Lock, Fn). A modifier hotkey only needs to be OBSERVED — it must
+# keep working as a modifier in other apps — while a regular-key hotkey must be
+# CONSUMED so it doesn't type. That difference decides which kind of Quartz tap
+# we install (see _hotkey_is_modifier_only).
+_MODIFIER_VKS = frozenset({54, 55, 56, 57, 58, 59, 60, 61, 62, 63})
+
+
+def _hotkey_is_modifier_only(target_vks) -> bool:
+    """True when every keycode of the hotkey is a modifier key.
+
+    Such a hotkey is served by a PASSIVE (listen-only) tap. An active tap sits
+    synchronously in the keyboard-delivery path: macOS gives its callback a
+    fixed time budget and, whenever this process is stalled — page-ins after
+    wake on a 16 GB Mac, a busy main thread — it DISABLES the tap and delivers
+    the events of that window without us. A key-up lost that way kept the mic
+    recording until the 120 s cap ("still listening after I let go"). A passive
+    listener is never waited on, so a stall delays our events instead of
+    dropping them. Only a regular-key hotkey needs the active variant, to
+    swallow the key so it doesn't also type into the target app.
+    """
+    vks = [int(vk) for vk in (target_vks or ())]
+    return bool(vks) and all(vk in _MODIFIER_VKS for vk in vks)
 
 
 def resolve_target_vks(name: str) -> set[int]:
@@ -8790,6 +8897,12 @@ class FlowApp:
         self._menu = None          # NSMenu (retained so it isn't GC'd)
         self._menu_target = None   # _MenuActions instance (retained; action target)
         self._tap_ok = True        # False if Input Monitoring not yet granted
+        self._tap_passive = False  # main tap installed as a passive listener?
+        # One-time log flags for the release watcher: did the window server's
+        # key state ever confirm a held hotkey (armed), or fail to on a long
+        # capture (this keyboard is invisible to it)?
+        self._keystate_confirmed = False
+        self._keystate_warned = False
         self._popover_ctrl = None  # _PopoverController (rich menu-bar popover; lazy)
         self._last_glyph = None    # most recent state glyph, so the popover can
                                    # colour its status dot to match the menu bar
@@ -8831,7 +8944,29 @@ class FlowApp:
         self._invalidate_popover()
         print(f"[flow] hotkey changed: {old} -> {name} "
               f"(vks={sorted(target_vks)}).", flush=True)
+        # A modifier hotkey is observed through a passive tap; a regular key
+        # needs an active one so it can be swallowed. Swap the tap when the
+        # binding crosses that line — otherwise a new regular-key hotkey keeps
+        # typing, or a modifier inherits the timeout-prone active tap.
+        if (self._tap is not None
+                and _hotkey_is_modifier_only(target_vks) != self._tap_passive):
+            self._rebuild_taps_on_main("hotkey kind changed")
         return True
+
+    def _rebuild_taps_on_main(self, reason: str) -> None:
+        """Tear down + reinstall both taps on the main thread (run-loop source
+        work), bypassing the wake-recovery debounce."""
+        def _perform():
+            self._perform_wake_recovery(reason, runtime=False)
+
+        if threading.current_thread() is threading.main_thread():
+            _perform()
+            return
+        try:
+            from Foundation import NSOperationQueue
+            NSOperationQueue.mainQueue().addOperationWithBlock_(_perform)
+        except Exception:  # noqa: BLE001  terminal/old-AppKit fallback
+            _perform()
 
     def _invalidate_popover(self) -> None:
         """Rebuild the menu-bar popover on its next open (after live config
@@ -8881,18 +9016,31 @@ class FlowApp:
 
     # -- recording lifecycle -------------------------------------------------
 
-    def _request_capture(self, begin: bool) -> None:
-        """Queue a capture transition without blocking the event-tap callback."""
+    def _request_capture(self, begin: bool, *, force: bool = False) -> bool:
+        """Queue a capture transition without blocking the event-tap callback.
+
+        Returns True when a transition was queued. ``force`` queues a stop even
+        when the desired state already says "stopped": the runaway guard uses
+        it so a recorder that somehow outlived its request is still closed
+        instead of being re-reported as runaway every second.
+        """
         begin = bool(begin)
         with self._state_lock:
-            if begin == self._capture_requested:
-                return
+            if begin == self._capture_requested and not (
+                    force and not begin and self.recorder.recording):
+                return False
             self._capture_requested = begin
             self._capture_generation += 1
             generation = self._capture_generation
             if not begin:
                 self._locked = False
         self._capture_q.put((generation, begin))
+        return True
+
+    def _capture_active(self) -> bool:
+        """Is the mic open, or asked to open? (A clip is about to arrive.)"""
+        with self._state_lock:
+            return bool(self.recorder.recording or self._capture_requested)
 
     def _capture_worker(self) -> None:
         """Run microphone open/close transitions serially off the Quartz tap."""
@@ -8941,6 +9089,7 @@ class FlowApp:
         play("Tink", self.cfg)
         print("[flow] ● recording...")
         self._set_status("🔴", "● Listening…")
+        self._start_release_watch(generation)
         # Lock in any edit you made to the LAST dictation — but do it OFF the Quartz
         # tap thread and AFTER the mic is already capturing. An Accessibility read of
         # the previous app can block, and doing it before recorder.start() (as we used
@@ -8958,14 +9107,19 @@ class FlowApp:
         queued behind a busy worker. Without this, the status (and the HUD)
         stays on "Listening" with the mic off until the next dictation.
         """
+        # Read the state AND publish the glyph under the same lock. Two threads
+        # reflect at once (the capture worker after a stop, the transcription
+        # worker after a clip); if one read "busy" and then published after the
+        # other's "idle", the menu bar and HUD stayed on "Transcribing…" with
+        # nothing running until the next dictation. _set_status never blocks.
         with self._state_lock:
             busy = self._processing_started is not None
-        if self.recorder.recording:
-            self._set_status("🔴", "● Listening…")
-        elif busy or not self._work_q.empty():
-            self._set_status("⏳", "● Transcribing…")
-        else:
-            self._set_status("🎙️", "● Idle")
+            if self.recorder.recording:
+                self._set_status("🔴", "● Listening…")
+            elif busy or not self._work_q.empty():
+                self._set_status("⏳", "● Transcribing…")
+            else:
+                self._set_status("🎙️", "● Idle")
 
     def _end(self, *, generation: int | None = None) -> None:
         with self._state_lock:
@@ -8988,29 +9142,35 @@ class FlowApp:
         audio = self.recorder.stop()
         with self._state_lock:
             self._record_started = 0.0
-        self._refresh_audio_if_pending()
-        play("Pop", self.cfg)
-        if audio is None or len(audio) / SAMPLE_RATE < self.cfg["min_seconds"]:
-            print("[flow] (too short, ignored)")
-            self._reflect_pipeline_status()
-            return
-        # Hand the clip to the single transcription worker and return immediately —
-        # capture is never blocked by a slow transcribe.
         try:
-            self._work_q.put_nowait((audio, time.monotonic()))
-        except queue.Full:
-            print("[flow] transcription queue is full — dropping this clip so "
-                  "memory cannot grow without bound. Restart früt Flow if text "
-                  "has stopped appearing.", flush=True)
-            play("Basso", self.cfg)
+            play("Pop", self.cfg)
+            if audio is None or len(audio) / SAMPLE_RATE < self.cfg["min_seconds"]:
+                print("[flow] (too short, ignored)")
+                self._reflect_pipeline_status()
+                return
+            # Hand the clip to the single transcription worker and return
+            # immediately — capture is never blocked by a slow transcribe.
+            try:
+                self._work_q.put_nowait((audio, time.monotonic()))
+            except queue.Full:
+                print("[flow] transcription queue is full — dropping this clip "
+                      "so memory cannot grow without bound. Restart früt Flow "
+                      "if text has stopped appearing.", flush=True)
+                play("Basso", self.cfg)
+                self._reflect_pipeline_status()
+                return
             self._reflect_pipeline_status()
-            return
-        self._reflect_pipeline_status()
-        depth = self._work_q.qsize()
-        if depth > 1:
-            print(f"[flow] queued — {depth} clips waiting to transcribe.")
-            # Distinct cue so you know earlier text is still on its way.
-            play("Morse", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
+            depth = self._work_q.qsize()
+            if depth > 1:
+                print(f"[flow] queued — {depth} clips waiting to transcribe.")
+                # Distinct cue so you know earlier text is still on its way.
+                play("Morse", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
+        finally:
+            # A post-wake PortAudio refresh re-enumerates devices and can take
+            # seconds with Bluetooth audio around. Run it LAST — after the clip
+            # is queued and the status no longer says "Listening" — where it is
+            # invisible; the serial worker still finishes it before the next open.
+            self._refresh_audio_if_pending()
 
     def _transcription_worker(self) -> None:
         """Single long-lived consumer of the capture queue. Serializes transcription
@@ -9019,18 +9179,25 @@ class FlowApp:
             item = self._work_q.get()
             if item is self._wake_warm_token:
                 try:
+                    # Warm only while nothing real is waiting. A queued or
+                    # in-flight clip pages the model in by itself; a warm-up in
+                    # front of it doubled the post-wake wait (each ran 3-6 s on
+                    # this Mac) while the HUD sat on "Transcribing…".
                     if self._wake_warm_event.is_set():
-                        self._warm_models_after_wake()
+                        if self._work_q.empty() and not self._capture_active():
+                            self._warm_models_after_wake()
+                        else:
+                            self._wake_warm_event.clear()
                 finally:
                     self._work_q.task_done()
                 continue
             try:
                 if item is None:
                     return
-                # If a warm token could not be queued because captures filled the
-                # bounded queue, warm before the first post-wake clip anyway.
-                if self._wake_warm_event.is_set():
-                    self._warm_models_after_wake()
+                # A real clip is the best warm-up there is — never run one
+                # ahead of it (even when the token had to be skipped because
+                # captures filled the bounded queue).
+                self._wake_warm_event.clear()
                 audio, enqueued_at = item
                 queue_wait = max(0.0, time.monotonic() - enqueued_at)
                 with self._state_lock:
@@ -9431,10 +9598,19 @@ class FlowApp:
             self._learn_timer = None
         if timer is not None and timer is not threading.current_thread():
             timer.cancel()
-        try:
-            learn_from_edit(pend["el"], pend["pasted"])
-        except Exception:  # noqa: BLE001  learning must never break dictation
-            pass
+
+        # The diff needs an Accessibility read of the previous field — IPC into
+        # that app, which can stall. Keep it off whichever thread called us (the
+        # dictation worker included, right after a paste). The pending record
+        # was claimed under the lock above, so this still runs at most once.
+        def _learn(pend=pend):
+            try:
+                learn_from_edit(pend["el"], pend["pasted"])
+            except Exception:  # noqa: BLE001  learning must never break dictation
+                pass
+
+        threading.Thread(target=_learn, name="frutflow-edit-learn",
+                         daemon=True).start()
 
     # -- logical key events (called from the Quartz tap callback) ------------
     #
@@ -9458,6 +9634,105 @@ class FlowApp:
         # so the latch guard lives here (not at the call sites).
         if self.cfg["mode"] == "hold" and not self._locked:
             self._request_capture(False)
+
+    # -- physical-key release watcher (hold mode) -----------------------------
+    #
+    # The event tap is the primary signal for a release, but it is not a
+    # guaranteed one: macOS disables a tap it considers slow and delivers the
+    # events of that window without us; secure input does the same. A key-up
+    # lost that way used to keep the mic open until the 120 s cap — the
+    # "it still says Listening after I let go" bug. While a hold-mode capture
+    # runs, a tiny poller therefore asks the window server whether the hotkey
+    # is physically held and stops the capture when it has clearly been let go.
+    #
+    # Trust is earned per capture: the poller may only act once the window
+    # server has confirmed the key DOWN during this very capture and then reads
+    # it up several times in a row. A keyboard the window server cannot see
+    # never confirms, so the poller never acts (the 120 s cap still applies).
+    # The check must not happen inside the tap callback: the tap sees a
+    # key-down BEFORE the key state reflects it (measured on macOS 15).
+
+    _RELEASE_POLL_SECONDS = 0.15      # cadence while recording (0.2 µs per query)
+    _RELEASE_MIN_HELD_SECONDS = 0.5   # let a fresh press settle before judging
+    _RELEASE_CONFIRM_POLLS = 3        # consecutive "up" readings before acting
+
+    def _start_release_watch(self, generation: int | None) -> None:
+        if self.cfg.get("mode") != "hold" or generation is None:
+            return
+        threading.Thread(target=self._release_watch_loop, args=(generation,),
+                         name="frutflow-release-watch", daemon=True).start()
+
+    def _hotkey_physically_down(self) -> bool:
+        """Is any key of the hotkey held RIGHT NOW, per the window server?
+
+        Conservative on purpose: for a modifier hotkey the generic modifier
+        flag must be clear as well (a held sibling key still counts as down),
+        and a failed query counts as "down" — so a broken read can never cut a
+        live dictation short.
+        """
+        try:
+            import Quartz
+            state = Quartz.kCGEventSourceStateCombinedSessionState
+            for vk in self.target_vks:
+                if Quartz.CGEventSourceKeyState(state, int(vk)):
+                    return True
+            masks = {_MODIFIER_CLASS_MASK_BY_VK.get(int(vk))
+                     for vk in self.target_vks}
+            masks.discard(None)
+            if masks:
+                flags = int(Quartz.CGEventSourceFlagsState(state))
+                if any(flags & mask for mask in masks):
+                    return True
+            return False
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _release_watch_loop(self, generation: int) -> None:
+        seen_down = False      # window server confirmed the key held THIS capture
+        misses = 0
+        held_for = 0.0
+        while True:
+            time.sleep(self._RELEASE_POLL_SECONDS)
+            with self._state_lock:
+                live = (self.recorder.recording
+                        and self._capture_generation == generation
+                        and not self._locked
+                        and self.cfg.get("mode") == "hold")
+                if live:
+                    held_for = time.monotonic() - self._record_started
+            if not live:
+                # Released normally, locked, or stopped. A long capture the
+                # window server never saw as "down" means this keyboard is
+                # invisible to the key-state query: say so once, so a stuck
+                # report on such a setup is explainable from the log.
+                if (not seen_down and held_for >= 1.0
+                        and not self._keystate_warned):
+                    self._keystate_warned = True
+                    print("[flow] the key-state query never saw the hotkey "
+                          "held — the release watcher cannot help on this "
+                          "keyboard (the event tap alone ends captures).",
+                          flush=True)
+                return
+            if self._hotkey_physically_down():
+                if not seen_down and not self._keystate_confirmed:
+                    self._keystate_confirmed = True
+                    print("[flow] release watcher armed: the physical key "
+                          "state mirrors the hotkey.", flush=True)
+                seen_down = True
+                misses = 0
+                continue
+            if not seen_down or held_for < self._RELEASE_MIN_HELD_SECONDS:
+                continue
+            misses += 1
+            if misses < self._RELEASE_CONFIRM_POLLS:
+                continue
+            print("[flow] the hotkey release never reached the event tap "
+                  "(macOS disabled it?) — stopping the capture from the "
+                  "physical key state.", flush=True)
+            with self._state_lock:
+                self._key_down = False
+            self._request_capture(False)
+            return
 
     def _watchdog_loop(self) -> None:
         """Background guardian on its own daemon thread. Jobs:
@@ -9521,9 +9796,13 @@ class FlowApp:
                 print("[flow] recording exceeded "
                       f"{self._MAX_RECORD_SECONDS:.0f}s — auto-stopping.",
                       flush=True)
-                self._key_down = False
-                self._locked = False   # a runaway LOCKED capture is still capped (belt-and-suspenders; _end clears it too)
-                self._request_capture(False)
+                with self._state_lock:
+                    self._key_down = False
+                    self._locked = False   # a runaway LOCKED capture is still capped (belt-and-suspenders; _end clears it too)
+                # force: close the mic even if the desired state already says
+                # "stopped" — otherwise a desynced recorder would be reported
+                # as runaway every second and never actually stop.
+                self._request_capture(False, force=True)
             # Event taps are expected to be disabled during lid-closed DarkWakes.
             # Do not re-enable/rebuild them until a visible wake is coalesced above.
             if not display_awake:
@@ -9676,12 +9955,26 @@ class FlowApp:
                 # port. Suppress that expected callback instead of misreporting it
                 # as a macOS failure on every legitimate wake rebuild.
                 if self._tap is not None:
-                    print("[flow] tap disabled by macOS — re-enabling.", flush=True)
+                    why = ("our callback was too slow"
+                           if et == int(Quartz.kCGEventTapDisabledByTimeout)
+                           else "user input / secure input")
+                    print(f"[flow] tap disabled by macOS ({why}) — re-enabling. "
+                          "Any key-up in that window was lost; the release "
+                          "watcher covers it.", flush=True)
                     Quartz.CGEventTapEnable(self._tap, True)
                 return event
 
             keycode = Quartz.CGEventGetIntegerValueField(
                 event, Quartz.kCGKeyboardEventKeycode)
+            # Never react to keystrokes we synthesized ourselves (the Cmd-V
+            # paste, the "never mind" backspaces): with V or Delete bound as
+            # the hotkey they would start a capture and be swallowed, so the
+            # dictation never landed.
+            if (keycode in self.target_vks
+                    and Quartz.CGEventGetIntegerValueField(
+                        event, Quartz.kCGEventSourceUnixProcessID)
+                    == os.getpid()):
+                return event
             handled = False
             if et == int(Quartz.kCGEventKeyDown):
                 handled = self._handle_event(et, keycode, True)
@@ -9710,11 +10003,18 @@ class FlowApp:
         mask = ((1 << int(Quartz.kCGEventKeyDown))
                 | (1 << int(Quartz.kCGEventKeyUp))
                 | (1 << int(Quartz.kCGEventFlagsChanged)))
+        # A modifier hotkey is only observed, so use a PASSIVE listener: macOS
+        # never waits on it, so a stalled process delays our events instead of
+        # dropping them (an active tap gets disabled on timeout and the key-up
+        # in that window is gone). A regular-key hotkey must be consumed so it
+        # doesn't type — only that case needs the active variant.
+        passive = _hotkey_is_modifier_only(self.target_vks)
+        option = (Quartz.kCGEventTapOptionListenOnly if passive
+                  else Quartz.kCGEventTapOptionDefault)
         tap = Quartz.CGEventTapCreate(
             Quartz.kCGSessionEventTap,           # session-level tap
             Quartz.kCGHeadInsertEventTap,        # see events first
-            Quartz.kCGEventTapOptionDefault,     # observe and optionally consume
-                                                 # target regular-key events
+            option,
             mask,
             self._tap_callback,
             None,
@@ -9728,6 +10028,7 @@ class FlowApp:
         # new source right away — matters when the rebuild happens off-thread.
         Quartz.CFRunLoopWakeUp(self._loop)
         self._tap, self._tap_source = tap, source
+        self._tap_passive = passive
         return True
 
     def _teardown_tap(self) -> None:
@@ -10125,7 +10426,9 @@ class FlowApp:
             # "needs permission" state). The user can grant the permission and pick
             # menu ▸ Restart — a fresh process then re-creates the tap successfully.
         else:
-            print(f"[flow] event tap enabled={self._tap_enabled()}", flush=True)
+            kind = "passive listener" if self._tap_passive else "active"
+            print(f"[flow] event tap enabled={self._tap_enabled()} ({kind}).",
+                  flush=True)
 
         # Best-effort: install the SEPARATE active tap for the hands-free lock key.
         # Runs in BOTH app- and terminal-mode (self._loop is set above, required by
@@ -10879,6 +11182,9 @@ def main() -> int:
         return 0
 
     cfg = load_config()
+    # Only the long-running app reaches this point; every one-shot command above
+    # returned already, so timestamps can never leak into piped CLI output.
+    _timestamp_log_streams()
     try:
         transcriber = build_transcriber(cfg)
     except ModuleNotFoundError as e:
