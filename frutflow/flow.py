@@ -629,7 +629,16 @@ class Recorder:
             dtype="float32",
             callback=self._callback,
         )
-        stream.start()
+        try:
+            stream.start()
+        except Exception:
+            # A constructed stream still owns a native handle when start fails.
+            # Release it before start() resets PortAudio and retries.
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001  preserve the original start error
+                pass
+            raise
         return stream
 
     def _reinitialize_locked(self) -> None:
@@ -689,8 +698,14 @@ class Recorder:
                 if stream is not None:
                     try:
                         stream.stop()
-                    finally:
+                    except Exception as e:  # noqa: BLE001  retain captured audio
+                        print(f"[flow] microphone stop failed ({e}); keeping captured audio.",
+                              flush=True)
+                    try:
                         stream.close()
+                    except Exception as e:  # noqa: BLE001  device may have disconnected
+                        print(f"[flow] microphone close failed ({e}); keeping captured audio.",
+                              flush=True)
             finally:
                 self._stream = None
                 self.recording = False
@@ -1943,6 +1958,30 @@ def _ax_read_value(el) -> str | None:
     return None
 
 
+def _ax_read_selected_range(el) -> tuple[int, int] | None:
+    """Return the selection/caret in UTF-16 units, or None if unverifiable."""
+    if el is None:
+        return None
+    try:
+        from ApplicationServices import (
+            AXUIElementCopyAttributeValue, kAXSelectedTextRangeAttribute,
+            AXValueGetValue, kAXValueCFRangeType,
+        )
+        _ax_bound_timeout(el)
+        err, value = AXUIElementCopyAttributeValue(
+            el, kAXSelectedTextRangeAttribute, None)
+        if err != 0 or value is None:
+            return None
+        ok, selected = AXValueGetValue(value, kAXValueCFRangeType, None)
+        if ok:
+            location, length = selected
+            if location >= 0 and length >= 0:
+                return int(location), int(length)
+    except Exception:  # noqa: BLE001  undo must refuse when selection is unknown
+        pass
+    return None
+
+
 def learn_from_edit(el, pasted: str, *, max_learn: int = 3) -> int:
     """Diff the field's CURRENT text against what we pasted; auto-learn any
     distinctive word the user replaced with a phonetically-similar one. Returns
@@ -2908,13 +2947,14 @@ def clean(text: str, cfg: dict, context: dict | None = None, gpu_lock=None) -> s
 
 def _pbpaste() -> str | None:
     try:
-        return subprocess.run([PBPASTE], capture_output=True, text=True).stdout
+        return subprocess.run([PBPASTE], capture_output=True, text=True,
+                              check=True, timeout=5).stdout
     except Exception:  # noqa: BLE001
         return None
 
 
 def _pbcopy(text: str) -> None:
-    subprocess.run([PBCOPY], input=text, text=True)
+    subprocess.run([PBCOPY], input=text, text=True, check=True, timeout=5)
 
 
 # In-process pasteboard via AppKit (pyobjc-framework-Cocoa is already a dependency).
@@ -2922,6 +2962,9 @@ def _pbcopy(text: str) -> None:
 # synchronous, sub-millisecond, locale-independent, and it exposes changeCount() so we
 # can tell whether anything else touched the clipboard without string-comparison polling.
 _NSPB = None
+_CLIPBOARD_LOCK = threading.RLock()
+# (changeCount, original snapshot) for the latest pending paste restoration.
+_CLIPBOARD_RESTORE = None
 
 
 def _pasteboard():
@@ -2935,15 +2978,21 @@ def _pasteboard():
 def _clip_set(text: str) -> int:
     """Put `text` on the clipboard. Returns the pasteboard changeCount after the
     write (or -1 if AppKit was unavailable and we fell back to pbcopy)."""
-    try:
-        from AppKit import NSPasteboardTypeString
-        pb = _pasteboard()
-        pb.clearContents()
-        pb.setString_forType_(text, NSPasteboardTypeString)
-        return int(pb.changeCount())
-    except Exception:  # noqa: BLE001
-        _pbcopy(text)
-        return -1
+    global _CLIPBOARD_RESTORE
+    with _CLIPBOARD_LOCK:
+        # Explicit copies (History, file transcription, error recovery) supersede
+        # a dictation's pending restore even if the pasteboard fallback is in use.
+        _CLIPBOARD_RESTORE = None
+        try:
+            from AppKit import NSPasteboardTypeString
+            pb = _pasteboard()
+            pb.clearContents()
+            if not pb.setString_forType_(text, NSPasteboardTypeString):
+                raise RuntimeError("pasteboard rejected text")
+            return int(pb.changeCount())
+        except Exception:  # noqa: BLE001
+            _pbcopy(text)
+            return -1
 
 
 def _clip_snapshot():
@@ -2965,10 +3014,12 @@ def _clip_snapshot():
                     saved.append(("string", typ_s, str(s)))
             if saved:
                 snap.append(saved)
-        return ("items", snap) if snap else None
+        # An empty clipboard is a valid state to restore; None means we could
+        # not capture its contents, rather than that it was empty.
+        return ("items", snap) if snap or not items else None
     except Exception:  # noqa: BLE001
         text = _pbpaste()
-        return ("text", text) if text else None
+        return ("text", text) if text is not None else None
 
 
 def _clip_restore(snapshot) -> int:
@@ -3070,6 +3121,10 @@ def _send_backspaces(n: int) -> None:
     for _ in range(n):
         down = Quartz.CGEventCreateKeyboardEvent(src, DELETE_KEYCODE, True)
         up = Quartz.CGEventCreateKeyboardEvent(src, DELETE_KEYCODE, False)
+        # A queued undo can run while the next hotkey is physically held. Never
+        # inherit Option/Command: those turn one Delete into word/line deletion.
+        Quartz.CGEventSetFlags(down, 0)
+        Quartz.CGEventSetFlags(up, 0)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
         time.sleep(0.003)
@@ -3129,9 +3184,9 @@ def apply_undo(text: str, cfg: dict):
         return "", 1
     # Treat undo phrases as commands only when they stand as their own clause.
     # This avoids deleting ordinary dictated content like "do not delete that file"
-    # or "I never mind waiting".
+    # or "I said never mind." Require a clause boundary on BOTH sides.
     rx = re.compile(
-        r"(?<!\w)(?:" + "|".join(re.escape(p) for p in pats)
+        r"(?:^|(?<=[,.!?;:]))\s*(?:" + "|".join(re.escape(p) for p in pats)
         + r")(?!\w)(?=\s*(?:$|[,.!?;:]))",
         re.IGNORECASE,
     )
@@ -3163,13 +3218,14 @@ def insert_text(text: str, cfg: dict) -> bool:
     fallback (so the caller can sound a distinct cue). The dictated text is
     NEVER lost: on any failure path it is left on the clipboard.
     """
+    global _CLIPBOARD_RESTORE
     if not text:
         return False
 
     if cfg["insert_method"] == "clipboard":
         # Copy only — needs NO Accessibility permission. You press Cmd-V to
         # paste. The most permission-light way to get text out of früt Flow.
-        _pbcopy(text)
+        _clip_set(text)
         print("[flow] ✓ copied to clipboard — press Cmd-V to paste it.")
         return False
 
@@ -3177,20 +3233,25 @@ def insert_text(text: str, cfg: dict) -> bool:
         # Typed insert never touches the clipboard. Layout caveat applies, and
         # any '\n' will submit forms; paste is the safer default.
         if not _ax_trusted() or _secure_input_active():
-            _pbcopy(text)
+            _clip_set(text)
             print("[flow] Accessibility is unavailable or Secure Keyboard Entry "
                   "is ON — left text on clipboard. Grant Accessibility / disable "
                   "Secure Keyboard Entry, then try again.")
             return False
-        from pynput.keyboard import Controller
-        Controller().type(text)
-        return True
+        try:
+            from pynput.keyboard import Controller
+            Controller().type(text)
+            return True
+        except Exception:  # noqa: BLE001  recover even a partially typed dictation
+            _clip_set(text)
+            print("[flow] typing failed — text left on clipboard; press Cmd-V.")
+            return False
 
     # ---- paste method (default) -------------------------------------------
     # Guard 1: Accessibility. If untrusted, Cmd-V is a silent no-op, so DON'T
     # paste and DON'T touch/restore the clipboard beyond leaving our text on it.
     if not _ax_trusted():
-        _pbcopy(text)
+        _clip_set(text)
         print("[flow] Accessibility NOT granted to this process — text left on "
               "clipboard, press Cmd-V. (Grant Accessibility to Terminal, then "
               "FULLY QUIT Terminal with Cmd-Q and relaunch — the grant is "
@@ -3199,39 +3260,50 @@ def insert_text(text: str, cfg: dict) -> bool:
 
     # Guard 2: Secure Input blocks synthetic Cmd-V even with Accessibility.
     if _secure_input_active():
-        _pbcopy(text)
+        _clip_set(text)
         print("[flow] Secure Keyboard Entry is ON — synthetic paste is blocked. "
               "Text left on clipboard; press Cmd-V. (Disable Terminal ▸ Secure "
               "Keyboard Entry, or click out of the password field.)")
         return False
 
-    # Stash the existing clipboard, including non-text items when AppKit exposes
-    # them, so dictation paste does not wipe images/files from the user's clipboard.
-    old = _clip_snapshot() if cfg["restore_clipboard"] else None
+    with _CLIPBOARD_LOCK:
+        old = None
+        pending = _CLIPBOARD_RESTORE
+        if cfg["restore_clipboard"]:
+            # Rapid dictations form one restoration chain. Snapshotting the
+            # current clipboard each time would restore the previous dictation
+            # and permanently lose what the user had copied before the burst.
+            if pending is not None and _clip_change_count() == pending[0]:
+                old = pending[1]
+            else:
+                old = _clip_snapshot()
+        _CLIPBOARD_RESTORE = None
+        our_count = _clip_set(text)
+        try:
+            _send_paste()
+        except Exception:  # noqa: BLE001  leave our text available for manual paste
+            print("[flow] paste failed — text left on clipboard; press Cmd-V.")
+            return False
 
-    # In-process write is synchronous and confirmed on return — no poll loop needed
-    # (the old pbcopy subprocess needed one; NSPasteboard does not).
-    our_count = _clip_set(text)
-    _send_paste()                       # Quartz Cmd-V — the text lands right here.
+        # Give the target app time to handle Cmd-V before restoring. With the
+        # pbcopy fallback (-1), ownership cannot be verified: never overwrite
+        # a possible newer user copy based on an unknown change count.
+        if old is not None and our_count >= 0:
+            restore = (our_count, old)
+            _CLIPBOARD_RESTORE = restore
 
-    # Restore the old clipboard AFTER the target app has consumed the paste, on a
-    # background timer so this call returns IMMEDIATELY (the success ding, the
-    # auto-learn arming, and readiness for the next dictation no longer wait ~0.25s).
-    # Only restore if nothing else changed the pasteboard since our write; if some
-    # other app/user copied meanwhile, their newer clipboard wins.
-    # The delay must comfortably outlast the target app's event processing: the
-    # pasteboard is read when the app HANDLES Cmd-V, not when we post it, and a
-    # busy Electron app or an IDE mid-GC can sit on the event for well over a
-    # second. Restoring too early pastes the user's OLD clipboard instead of the
-    # dictation — silently, with a success ding. 2s is imperceptible (the user's
-    # clipboard comes back before they can use it) and loses the race far less.
-    if old:
-        def _restore(expected=our_count, prev=old):
-            if expected < 0 or _clip_change_count() == expected:
-                _clip_restore(prev)
-        t = threading.Timer(2.0, _restore)
-        t.daemon = True
-        t.start()
+            def _restore():
+                global _CLIPBOARD_RESTORE
+                with _CLIPBOARD_LOCK:
+                    if _CLIPBOARD_RESTORE is not restore:
+                        return
+                    _CLIPBOARD_RESTORE = None
+                    if _clip_change_count() == restore[0]:
+                        _clip_restore(restore[1])
+
+            t = threading.Timer(2.0, _restore)
+            t.daemon = True
+            t.start()
     return True
 
 
@@ -9034,7 +9106,9 @@ class FlowApp:
             generation = self._capture_generation
             if not begin:
                 self._locked = False
-        self._capture_q.put((generation, begin))
+            # SimpleQueue.put never blocks. Publish under the same lock as the
+            # state change so a competing stop cannot overtake this begin.
+            self._capture_q.put((generation, begin))
         return True
 
     def _capture_active(self) -> bool:
@@ -9453,8 +9527,9 @@ class FlowApp:
         """Carry out an utterance that contained a 'never mind': retract `prev_delete`
         previously-pasted dictations (backspace), then type the `kept` remainder (the
         continuation after an inline retraction), if any."""
+        detail = repr(kept) if self.cfg.get("debug", False) else f"{len(kept)} chars"
         print(f"[flow] ↩︎ never mind — retract {prev_delete} prior dictation(s); "
-              f"keep {kept!r}", flush=True)
+              f"keep {detail}", flush=True)
         for _ in range(prev_delete):
             if not self._undo_last_insertion():   # pops stack, AX-verifies, backspaces
                 break
@@ -9479,6 +9554,7 @@ class FlowApp:
                 except Exception:  # noqa: BLE001
                     pass
         else:
+            self._record_history(kept, app=_focused_app_name(), delivered=False)
             self._record_usage_stats(kept, spoken_seconds)
             play("Basso", self.cfg)
 
@@ -9488,9 +9564,9 @@ class FlowApp:
 
         Refuses (rather than risk eating your other text) when it can tell the
         inserted span is no longer sitting untouched at the cursor — e.g. you edited
-        the pasted text in place (the auto-learn workflow) or moved the cursor. When
-        the app doesn't expose its text to Accessibility we can't check, so we delete
-        best-effort (counting whole characters, so accents/emoji don't over-delete)."""
+        the pasted text in place (the auto-learn workflow) or moved the cursor.
+        Requires a verified field and an unselected caret at the end of its text;
+        fields that do not expose this information cannot be safely undone."""
         with self._state_lock:
             last = self._undo_stack.pop() if self._undo_stack else None
 
@@ -9509,7 +9585,9 @@ class FlowApp:
         # dictated into. Otherwise 'never mind' — said to yourself after clicking into
         # a terminal/editor — would eat that app's text. Refuse on any app change.
         cur_app = _focused_app_name()
-        if last_app is not None and cur_app is not None and cur_app != last_app:
+        if last_app is None or cur_app is None:
+            return _refuse("never mind — could not verify the focused app.")
+        if cur_app != last_app:
             return _refuse(f"never mind — focus moved to {cur_app!r}; leaving your "
                            f"text in {last_app!r} untouched.")
         # Deleting uses synthetic keystrokes, same as paste: needs Accessibility and
@@ -9522,10 +9600,11 @@ class FlowApp:
         # trailing space from their AX value, so accept those variants too). If the
         # tail clearly isn't our dictation anymore (edited in place), refuse rather
         # than backspace into unrelated text. Delete exactly the MATCHED tail so the
-        # count is right even when a boundary space was trimmed. When the app is
-        # opaque to AX (val is None), delete best-effort.
+        # count is right even when a boundary space was trimmed.
         cur_el = _ax_focused_element()
-        if last_el is not None and cur_el is not None and cur_el != last_el:
+        if last_el is None or cur_el is None:
+            return _refuse("never mind — could not verify the focused field.")
+        if cur_el != last_el:
             return _refuse("never mind — focus moved to another field; leaving the "
                            "last dictation as is.")
         tail = last_text
@@ -9537,6 +9616,16 @@ class FlowApp:
                      if c and val.endswith(c)), None)
         if tail is None:
             return _refuse("never mind — the last dictation was changed; leaving it as is.")
+
+        # Matching the field's tail alone says nothing about where Delete will
+        # act. A moved caret or a selection can erase unrelated text even though
+        # our original dictation is still present at the end. AX ranges count
+        # UTF-16 code units, whereas Python len() counts Unicode code points.
+        selected = _ax_read_selected_range(cur_el)
+        end = len(val.encode("utf-16-le", errors="surrogatepass")) // 2
+        if selected != (end, 0):
+            return _refuse("never mind — cursor position cannot be verified at the "
+                           "end of the dictation; leaving it as is.")
 
         n = _composed_len(tail)   # one Backspace per composed character (macOS rule)
         print(f"[flow] ↩︎ never mind — deleting last dictation ({n} chars).", flush=True)
@@ -10891,38 +10980,47 @@ def transcribe_file(cfg: dict, path: str, *, copy: bool = False) -> int:
     """Transcribe an existing audio file through the configured engine + the full
     correction pipeline, and print the text. No mic, no paste — handy for dictating
     from a voice memo, cleaning up a recording, or scripting."""
-    audio = _load_audio_file(path)
-    if audio is None:
-        return 1
-    dur = len(audio) / SAMPLE_RATE
-    if dur < 0.05:
-        print("[flow] that file has essentially no audio.")
-        return 1
-    print(f"[flow] {Path(path).name}: {dur:.1f}s — transcribing with "
-          f"'{cfg.get('transcribe_backend', 'parakeet')}'...", file=sys.stderr,
-          flush=True)
+    from contextlib import redirect_stdout
+
     try:
-        tb = build_transcriber(cfg)
+        # This entry point runs in a standalone CLI process. Capture diagnostics
+        # from every pipeline stage (including fallback/cleanup warnings) so
+        # `--transcribe file > transcript.txt` contains only the transcript.
+        with redirect_stdout(sys.stderr):
+            audio = _load_audio_file(path)
+            if audio is None:
+                return 1
+            dur = len(audio) / SAMPLE_RATE
+            if dur < 0.05:
+                print("[flow] that file has essentially no audio.")
+                return 1
+            print(f"[flow] {Path(path).name}: {dur:.1f}s — transcribing with "
+                  f"'{cfg.get('transcribe_backend', 'parakeet')}'...", flush=True)
+            tb = build_transcriber(cfg)
+
+            # Same vocabulary biasing as live dictation (used by Whisper).
+            prompt = hotwords = None
+            if cfg.get("learn_vocab", True):
+                if cfg.get("vocab_biasing", "hotwords") == "prompt":
+                    prompt = build_learned_prompt(cfg)
+                elif cfg.get("vocab_biasing", "hotwords") == "hotwords":
+                    hotwords = build_hotwords(cfg)
+
+            raw = tb.transcribe(audio, prompt=prompt, hotwords=hotwords)
+            text = clean(raw, cfg)
     except Exception as e:  # noqa: BLE001
-        print(f"[flow] could not start the transcriber: {e}")
+        print(f"[flow] could not transcribe the file: {e}", file=sys.stderr)
         return 1
-
-    # Same vocabulary biasing the live path uses (ignored by Parakeet, used by whisper).
-    prompt = hotwords = None
-    if cfg.get("learn_vocab", True):
-        if cfg.get("vocab_biasing", "hotwords") == "prompt":
-            prompt = build_learned_prompt(cfg)
-        elif cfg.get("vocab_biasing", "hotwords") == "hotwords":
-            hotwords = build_hotwords(cfg)
-
-    raw = tb.transcribe(audio, prompt=prompt, hotwords=hotwords)
-    text = clean(raw, cfg)
     if not text:
         print("[flow] (no speech detected)", file=sys.stderr)
         return 0
     print(text)                         # transcript on stdout, clean for piping
     if copy:
-        _clip_set(text)
+        try:
+            _clip_set(text)
+        except Exception as e:  # noqa: BLE001  stdout still contains the transcript
+            print(f"[flow] could not copy the transcript: {e}", file=sys.stderr)
+            return 1
         print("[flow] ✓ copied to clipboard.", file=sys.stderr)
     return 0
 
@@ -11127,7 +11225,10 @@ def main() -> int:
         return compare_engines(load_config(), float(args.compare))
 
     if args.transcribe is not None:
-        return transcribe_file(load_config(), args.transcribe, copy=args.copy)
+        from contextlib import redirect_stdout
+        with redirect_stdout(sys.stderr):
+            cfg = load_config()
+        return transcribe_file(cfg, args.transcribe, copy=args.copy)
 
     if args.correct:
         add_correction(args.correct[0], args.correct[1],

@@ -12,6 +12,9 @@ REQ_STAMP="$VENV_DIR/.requirements.sha256"
 
 cd "$SCRIPT_DIR"
 
+# Setup and dependency progress belongs on stderr; stdout is reserved for the
+# command's result, including `--transcribe recording.wav > transcript.txt`.
+{
 # Same floors the installers enforce; failing here is friendlier than a
 # cryptic pip resolution error minutes later. mlx publishes wheels only for
 # macOS 14+ (Sonoma), and numpy/parakeet floors need Python 3.10+.
@@ -63,5 +66,6 @@ fi
 umask 077
 mkdir -p "$FLOWDICTATE_DIR"
 chmod 700 "$FLOWDICTATE_DIR"
+} >&2
 
 exec "$VENV_PY" "$SCRIPT_DIR/flow.py" "$@"

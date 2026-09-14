@@ -127,6 +127,12 @@ After granting, **fully quit and reopen** that program.
 
 Quit with `Ctrl-C`.
 
+Voice undo requires the original text field and an unselected cursor at the end
+of the unchanged dictation. If the app cannot expose the cursor position through
+Accessibility, früt Flow leaves the text in place. Inline undo commands must stand
+as a separate clause, such as “Remove this. Actually never mind.” Ordinary phrases
+such as “Do not delete that.” are preserved.
+
 ## Languages (English, Spanish, and 23 more)
 
 Pick your language in **Settings ▸ Model ▸ Spoken language**:
@@ -300,6 +306,18 @@ the supported models are cached, dictation itself does not send audio or text to
 a server. Your learned vocabulary, corrections, optional history, and logs live
 in `~/.flowdictate` and are written owner-only. Live dictation logs redact the
 transcript unless `debug` is enabled.
+
+## Development checks
+
+Run the regression suite from this folder after installing the dependencies:
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
+
+The tests use simulated audio devices, clipboard operations, and keyboard events;
+they do not record audio, paste into other apps, or load speech models. Installer
+checks run against temporary app folders with simulated Python versions.
 
 ## Credits & licenses
 

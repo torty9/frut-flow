@@ -33,3 +33,10 @@ _local-notes/
 
 # --- Runtime data & logs (the real data lives in ~/.flowdictate, outside the repo) ---
 *.log
+node_modules/
+*.pyc
+.env
+.env.*
+!.env.example
+.playwright-cli/
+.claude/worktrees/

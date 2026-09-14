@@ -140,17 +140,21 @@ if enabled "$PRELOAD_MODELS"; then
 fi
 
 create_app_bundle() {
+  # An existing, working venv may use an older Python than the current PATH.
+  # The embedded interpreter must match its native extension ABI, not whichever
+  # python3 Homebrew installed most recently.
+  local venv_py="$INSTALL_DIR/.venv/bin/python"
+  local want have python_path
+  want="$("$venv_py" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+  python_path="$("$venv_py" -c 'import sys; print(sys._base_executable)')"
   if [ -d "$APP" ]; then
     # Keep the permissioned bundle, but refresh its embedded Python when the
     # system Python moved on: after a brew upgrade the old copied binary would
     # otherwise run against a NEWER venv's site-packages — an ABI mismatch
     # that crashes at launch and feeds the watchdog's relaunch loop.
-    local want have python_path
-    want="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
     have="$("$APP/Contents/MacOS/python3" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo missing)"
     if [ "$have" != "$want" ]; then
       echo "Updating the app bundle's Python ($have -> $want)..."
-      python_path="$(python3 -c 'import sys; print(sys.executable)')"
       cp -f "$python_path" "$APP/Contents/MacOS/python3"
       chmod +x "$APP/Contents/MacOS/python3"
       if command -v codesign >/dev/null 2>&1; then
@@ -267,7 +271,6 @@ exec /usr/bin/arch -arm64 "$BUNDLE_PY" "$CODE_DIR/flow.py" >> "$LOG" 2>&1
 LAUNCHER
 
   chmod +x "$APP/Contents/MacOS/frutflow"
-  python_path="$(python3 -c 'import sys; print(sys.executable)')"
   cp "$python_path" "$APP/Contents/MacOS/python3"
   chmod +x "$APP/Contents/MacOS/python3"
 
