@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 # We load the Parakeet weights from the local cache, so the fast xet transfer path
@@ -199,13 +200,13 @@ DEFAULT_CONFIG = {
                                  # distance matching (case-preserving, guarded against
                                  # false positives). This is the layer that fixes the
                                  # names the model still gets slightly wrong.
-    "fuzzy_threshold": 0.74,     # 0..~1.25 match score floor. Higher = stricter
-                                 # (fewer corrections); lower = more aggressive.
+    "fuzzy_threshold": 0.74,     # 0..1.25 score floor; ambiguity, dictionary and
+                                 # phonetic guards always apply, even if lowered.
     "learn_from_edits": True,    # THE no-manual-teaching loop: after pasting, watch
                                  # the field you typed into; if you fix a word, learn
-                                 # that correction automatically (phonetically gated to
-                                 # real mis-hears, restricted to proper nouns). Kills
-                                 # the need to ever run `--correct` by hand.
+                                 # a name fix after two matching edits in separate
+                                 # dictations. Only our inserted text is compared;
+                                 # manual Teach a Word rules take effect immediately.
     "learn_window_seconds": 20,  # how long after a paste to keep watching for your
                                  # edit before finalizing what was learned.
     "history_enabled": True,     # persist the last HISTORY_CAP dictations locally
@@ -1103,6 +1104,7 @@ def build_transcriber(cfg: dict):
 VOCAB_PATH = CONFIG_DIR / "vocab.json"
 CORRECTIONS_PATH = CONFIG_DIR / "corrections.json"
 CORRECTION_EXAMPLES_PATH = CONFIG_DIR / "correction_examples.json"
+PENDING_CORRECTIONS_PATH = CONFIG_DIR / "pending_corrections.json"
 _PERSONALIZATION_LOCK = threading.RLock()
 
 # Ultra-common words add no value to the vocab prompt — skip them so only your
@@ -1345,17 +1347,44 @@ def update_correction(old_heard: str, heard: str, correct: str, *,
     return True
 
 
-def apply_corrections(text: str) -> str:
+def _correction_pattern(corrections: dict):
+    """One longest-first pass: inserted targets never become another rule's input.
+
+    Lookarounds also support punctuation-ended names such as C++ and .NET.
+    Newer case variants win, matching the case-insensitive teaching contract.
+    """
+    canonical = {h.casefold(): (h, c) for h, c in corrections.items() if h}
+    if not canonical:
+        return None, {}
+    ordered = sorted(canonical.values(), key=lambda pair: (-len(pair[0]), pair[0]))
+    rules = {f"c{i}": c for i, (_h, c) in enumerate(ordered)}
+    pattern = re.compile(r"(?<!\w)(?:" + "|".join(
+        f"(?P<c{i}>{re.escape(h)})" for i, (h, _c) in enumerate(ordered))
+        + r")(?!\w)", re.IGNORECASE)
+    return pattern, rules
+
+
+def apply_corrections(text: str, *, corrections: dict | None = None,
+                      transform_unmatched=None) -> str:
+    """Apply explicit rules once, protecting replacements from later fuzzy edits."""
     if not text:
         return text
-    for heard, correct in load_corrections().items():
-        if heard:
-            # The replacement goes through a lambda so backslashes in a taught
-            # correction (paths, LaTeX) are inserted literally — as a template
-            # string, re.sub would reject "\U" or corrupt "\n" into a newline.
-            text = re.sub(rf"\b{re.escape(heard)}\b", lambda _m, c=correct: c,
-                          text, flags=re.IGNORECASE)
-    return text
+    pattern, rules = _correction_pattern(
+        load_corrections() if corrections is None else corrections)
+    # Supply source offsets so unmatched fragments retain URL/code protection
+    # even when a taught rule splits a literal in two.
+    transform = transform_unmatched or (lambda s, _offset: s)
+    if pattern is None:
+        return transform(text, 0)
+    parts = []
+    end = 0
+    for match in pattern.finditer(text):
+        parts.append(transform(text[end:match.start()], end))
+        # Literal insertion preserves backslashes and the user's chosen case.
+        parts.append(rules[match.lastgroup])
+        end = match.end()
+    parts.append(transform(text[end:], end))
+    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -1671,6 +1700,8 @@ def distinctive_terms(max_terms: int = 60) -> list[str]:
         if v and v.lower() not in seen:
             seen.add(v.lower())
             terms.append(v)
+            if len(terms) >= max_terms:
+                return terms
     vocab = _sanitize_vocab(_read_json(VOCAB_PATH, {}))
     ranked = sorted(vocab.values(),
                     key=lambda e: e.get("count", 0), reverse=True)
@@ -1714,9 +1745,10 @@ def build_hotwords(cfg: dict) -> str:
 # but to snap the output token to a known-correct spelling afterwards. We match
 # each word against your distinctive vocabulary using BOTH edit distance
 # (rapidfuzz) and phonetic codes (jellyfish metaphone/soundex), with a length
-# guard and case preservation: "Versal"->"Vercel", "Frut"->"früt", while
-# "versatile" / "Boston" are left untouched. Validated on real distil-large-v3
-# output. No-ops gracefully if the libraries aren't installed.
+# guard and a clear lead over alternative candidates. Real dictionary words,
+# acronyms, and technical literals are left alone; ambiguous names require an
+# explicit teaching. Canonical spellings retain their user-selected case.
+# No-ops gracefully if the libraries or the English dictionary are unavailable.
 
 try:
     import jellyfish as _jellyfish
@@ -1734,8 +1766,13 @@ def _phonetic_match(a: str, b: str) -> bool:
     if not _jellyfish:
         return False
     try:
-        return (_jellyfish.metaphone(a) == _jellyfish.metaphone(b)
-                or _jellyfish.soundex(a) == _jellyfish.soundex(b))
+        # English phonetic encoders are not evidence for other alphabets, and
+        # two empty encodings must never count as a match.
+        if not a.isascii() or not b.isascii():
+            return False
+        return any(code_a and code_a == code_b for code_a, code_b in (
+            (_jellyfish.metaphone(a), _jellyfish.metaphone(b)),
+            (_jellyfish.soundex(a), _jellyfish.soundex(b))))
     except Exception:  # noqa: BLE001
         return False
 
@@ -1764,40 +1801,81 @@ def _preserve_case(src: str, repl: str) -> str:
     return repl
 
 
-def fuzzy_correct_text(text: str, terms: list[str], threshold: float = 0.74) -> str:
-    """Snap near-miss single words to known vocabulary. High-precision: only
-    alpha tokens length>=3, length-ratio guarded, phonetic+edit-distance scored,
-    case preserved. Surrounding spacing/punctuation is untouched."""
+_REPAIR_WORD_RE = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*", re.UNICODE)
+# Treat technical literals as indivisible: repairing a component of a URL,
+# path, identifier, code span, or version silently changes its destination/value.
+_LITERAL_RE = re.compile(
+    r"```[\s\S]*?```|`[^`\n]+`|(?:https?://|www\.)[^\s<>]+|"
+    r"[\w.+-]+@[\w.-]+|(?:[~/.]|[A-Za-z]:\\)[\w./\\~+-]+|"
+    r"\b\w+(?:[._/@\\+-]\w+)+\b|\b\w*\d\w*\b")
+
+
+def _overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start < b and end > a for a, b in spans)
+
+
+def _protected_spans(text: str, terms=()) -> list[tuple[int, int]]:
+    spans = [m.span() for m in _LITERAL_RE.finditer(text)]
+    for term in terms:
+        if term:
+            spans.extend(m.span() for m in re.finditer(
+                r"(?<!\w)" + re.escape(term) + r"(?!\w)", text, re.IGNORECASE))
+    return spans
+
+
+def fuzzy_correct_text(text: str, terms: list[str], threshold: float = 0.74,
+                       *, language: str = "en", protected_spans=()) -> str:
+    """Repair only an unambiguous English name near-miss, never valid words.
+
+    Both spelling proximity and phonetic evidence are required. A runner-up
+    within 0.20 of the best score makes the result ambiguous, so keep the input.
+    Explicit taught replacements remain available in every language.
+    """
     if not text or not terms or not FUZZY_AVAILABLE:
         return text
-    # Single-token candidates only: correction TARGETS can be multi-word
-    # phrases ("New York"), and snapping one dictated token onto a phrase
-    # rewrites words the user never said ("Newark" → "New York").
-    terms = [t for t in terms if " " not in t]
+    if not str(language).lower().startswith("en"):
+        return text
+    protected = _protected_spans(text, terms) + list(protected_spans)
+    terms = list(dict.fromkeys(t for t in terms if t.isalpha() and len(t) >= 4))
     if not terms:
         return text
-    parts = re.split(r"(\W+)", text)   # keeps the delimiters in place
-    for i, tok in enumerate(parts):
-        # Three-letter tokens are too collision-prone for fuzzy repair: API/App,
-        # EIN/Ian, LLC/lil, etc. Exact taught corrections still handle them.
-        if len(tok) < 4 or not tok.isalpha():
-            continue
+    known = {t.casefold() for t in terms}
+    dictionary = _english_words()
+
+    def repair(match):
+        tok = match.group()
+        if (len(tok) < 4 or not tok.isalpha() or tok.isupper()
+                or _overlaps(*match.span(), protected)):
+            return tok
         low = tok.lower()
-        best, best_score = None, 0.0
+        if low in known or low in _COMMON_WORDS or low in dictionary:
+            return tok
+        # Without a dictionary we cannot distinguish real words from names.
+        if not dictionary:
+            return tok
+        candidates = []
         for term in terms:
             tl = term.lower()
-            if low == tl:
-                best = None
-                break  # already correct — never touch it
             m = max(len(tok), len(term))
-            if m and abs(len(tok) - len(term)) / m > 0.34:
+            if abs(len(tok) - len(term)) / m > 0.25:
                 continue
-            score = _lev_sim(low, tl) + (0.25 if _phonetic_match(tok, term) else 0.0)
-            if score > best_score:
-                best_score, best = score, term
-        if best and best_score >= threshold:
-            parts[i] = _preserve_case(tok, best)
-    return "".join(parts)
+            similarity = _lev_sim(low, tl)
+            accent_only = (unicodedata.normalize("NFKD", low).encode("ascii", "ignore")
+                           == unicodedata.normalize("NFKD", tl).encode("ascii", "ignore")
+                           and low.isascii() and not tl.isascii())
+            phonetic = _phonetic_match(tok, term)
+            if similarity < 0.60 or not (phonetic or accent_only):
+                continue
+            candidates.append((similarity + 0.25, term))
+        candidates.sort(key=lambda c: (-c[0], c[1]))
+        if not candidates or candidates[0][0] < threshold:
+            return tok
+        if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.20:
+            return tok
+        # Canonical vocabulary carries deliberate brand spelling (früt, iPhone).
+        return candidates[0][1]
+
+    return _REPAIR_WORD_RE.sub(repair, text)
 
 
 # ---------------------------------------------------------------------------
@@ -1860,67 +1938,93 @@ def _ax_read_value(el) -> str | None:
     return None
 
 
-def learn_from_edit(el, pasted: str, *, max_learn: int = 3) -> int:
-    """Diff the field's CURRENT text against what we pasted; auto-learn any
-    distinctive word the user replaced with a phonetically-similar one. Returns
-    the number of corrections learned."""
+def _edited_dictation(current: str, pasted: str, baseline: str | None) -> str | None:
+    """Extract just our insertion while both surrounding anchors remain unchanged.
+
+    Ambiguous/repeated occurrences, missing snapshots, large fields, and edits
+    elsewhere in the document are deliberately ignored.
+    """
+    if (not baseline or not pasted or len(baseline) > 16_384
+            or len(current) > 16_384 or baseline.count(pasted) != 1):
+        return None
+    start = baseline.index(pasted)
+    prefix, suffix = baseline[:start], baseline[start + len(pasted):]
+    if (not current.startswith(prefix) or not current.endswith(suffix)
+            or len(current) < len(prefix) + len(suffix)):
+        return None
+    end = len(current) - len(suffix) if suffix else len(current)
+    return current[len(prefix):end]
+
+
+def _observe_correction(heard: str, correct: str, *, context: str, app: str) -> bool:
+    """Require the same edit in two dictations before promoting it to a rule.
+
+    Observations never feed vocabulary, hotwords, or model examples until
+    confirmed. A contradictory edit resets the count; an explicit rule wins.
+    """
+    key = heard.casefold()
+    with _PERSONALIZATION_LOCK:
+        if any(h.casefold() == key for h in load_corrections()):
+            return False
+        pending = _sanitize_correction_examples(_read_json(PENDING_CORRECTIONS_PATH, {}))
+        prev = pending.pop(key, {})
+        count = (int(prev.get("count", 0)) + 1
+                 if prev.get("correct") == correct and prev.get("app", "") == app
+                 else 1)
+        if count >= 2:
+            add_correction(heard, correct, context=context, app=app, silent=True)
+        else:
+            pending[key] = {"correct": correct, "context": context, "app": app,
+                            "count": count, "updated": time.time()}
+        pending = dict(list(pending.items())[-500:])
+        _write_private_json(PENDING_CORRECTIONS_PATH, pending, indent=2)
+        return count >= 2
+
+
+def learn_from_edit(el, pasted: str, *, max_learn: int = 3,
+                    baseline: str | None = None, app: str = "") -> int:
+    """Learn confirmed name fixes within the captured insertion, never the document."""
     current = _ax_read_value(el)
-    if not current or not pasted:
+    if not current:
         return 0
-    # Some apps expose an entire multi-megabyte document as the focused field.
-    # Diffing all of it against one short dictation blocks a learning thread and
-    # produces meaningless matches.  Until an app exposes a usable text range, skip
-    # oversized fields; dictation itself is never delayed or affected.
-    if len(current) > 16_384:
+    edited = _edited_dictation(current, pasted, baseline)
+    if not edited or edited == pasted:
         return 0
-    pasted_words = _NAME_RE.findall(pasted)
-    cur_words = _NAME_RE.findall(current)
-    if not pasted_words or not cur_words:
+    before = list(_REPAIR_WORD_RE.finditer(pasted))
+    after = list(_REPAIR_WORD_RE.finditer(edited))
+    if not before or len(before) != len(after):
         return 0
-    import difflib
-    pasted_l = [w.lower() for w in pasted_words]
-    cur_l = [w.lower() for w in cur_words]
-    matcher = difflib.SequenceMatcher(a=pasted_l, b=cur_l)
-    equal = sum(i2 - i1 for tag, i1, i2, _j1, _j2 in matcher.get_opcodes()
-                if tag == "equal")
-    candidates: list[tuple[str, str]] = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag != "replace":
-            continue
-        heard_span = pasted_words[i1:i2]
-        fixed_span = cur_words[j1:j2]
-        if len(heard_span) == len(fixed_span):
-            candidates.extend(zip(heard_span, fixed_span))
-        elif len(heard_span) == 1 and len(fixed_span) == 1:
-            candidates.append((heard_span[0], fixed_span[0]))
-    # Sanity gate: only learn from the same field/document. Multi-word dictations
-    # need substantial overlap; one-word replacements are allowed only when the
-    # replacement itself passes the phonetic/distinctiveness gate below.
-    if equal < max(1, len(pasted_words) * 0.45) and not (
-        len(pasted_words) <= 2 and candidates
-    ):
+    # A spelling edit may change internal apostrophes, but not values or layout.
+    if _REPAIR_WORD_RE.split(pasted) != _REPAIR_WORD_RE.split(edited):
         return 0
+    pairs = [(a, b) for a, b in zip(before, after) if a.group() != b.group()]
+    if len(pairs) > min(max_learn, max(1, int(len(before) * 0.25))):
+        return 0
+    protected = [m.span() for m in _LITERAL_RE.finditer(pasted)]
     learned = 0
-    for w, best in candidates:
-        if learned >= max_learn:
-            break
-        wl = w.lower()
-        bl = best.lower()
-        if len(w) < 2 or len(best) < 2 or wl == bl:
+    observed = set()
+    for original, fixed in pairs:
+        w, best = original.group(), fixed.group()
+        key = (w.casefold(), best)
+        if key in observed:
+            continue  # repeated instances in one paste are ONE observation
+        observed.add(key)
+        if (min(len(w), len(best)) < 3 or not best.isalpha()
+                or _overlaps(*original.span(), protected)
+                or _repair_key(w) in _NEGATIONS or _repair_key(best) in _NEGATIONS
+                or best.lower() in _COMMON_WORDS
+                or not _is_distinctive(best)):
             continue
-        if wl in _COMMON_WORDS and bl in _COMMON_WORDS:
+        a, b = _repair_key(w), _repair_key(best)
+        sim = _lev_sim(a, b)
+        # English phonetic evidence plus a spelling floor, or a very close
+        # spelling edit (also supports accents and non-English proper names).
+        if not (a == b or sim >= 0.80 or (sim >= 0.60 and _phonetic_match(a, b))):
             continue
-        # Learn proper-noun/jargon fixes when either side looks distinctive. This
-        # catches cases like "Versal" -> "Vercel" even if the heard token is a word.
-        if not (_is_distinctive(w) or _is_distinctive(best)):
-            continue
-        sim = _lev_sim(wl, bl)
-        if _phonetic_match(w, best) or sim >= 0.55:
-            add_correction(w, best, silent=True)
+        if _observe_correction(w, best, context=edited[:300], app=app):
             learned += 1
     if learned:
-        print(f"[flow] auto-learned {learned} correction(s) from your edit ✓",
-              flush=True)
+        print(f"[flow] confirmed {learned} correction(s) from your edits ✓", flush=True)
     return learned
 
 
@@ -2494,7 +2598,8 @@ def _prompt_block_text(value, *, max_chars: int = 120) -> str:
              .replace(">", "&gt;"))
 
 
-def _relevant_correction_examples(context: dict | None, max_examples: int = 8) -> list[dict]:
+def _relevant_correction_examples(context: dict | None, max_examples: int = 8,
+                                  *, text: str = "") -> list[dict]:
     """Pick correction examples worth showing the local repair model."""
     examples = load_correction_examples()
     if not examples:
@@ -2502,6 +2607,10 @@ def _relevant_correction_examples(context: dict | None, max_examples: int = 8) -
     app = str((context or {}).get("app") or "").lower()
     scored = []
     for heard, entry in examples.items():
+        if not any(re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)",
+                             text, re.IGNORECASE)
+                   for term in (heard, entry.get("correct", "")) if term):
+            continue
         score = float(entry.get("count", 1))
         eapp = str(entry.get("app") or "").lower()
         if app and eapp and app == eapp:
@@ -2522,7 +2631,7 @@ def _relevant_correction_examples(context: dict | None, max_examples: int = 8) -
     return out
 
 
-def _context_blocks(context: dict | None) -> str:
+def _context_blocks(context: dict | None, *, text: str = "") -> str:
     """The shared '<known_spellings>' / '<active_app>' suffix injected into the
     on-device local_repair prompt. Biasing the model toward your canonical spellings
     is what lets it prefer 'Vercel'/'früt' when it does touch a garbled proper noun.
@@ -2539,7 +2648,7 @@ def _context_blocks(context: dict | None) -> str:
     if app_name:
         blocks.append(f"<active_app>{app_name}</active_app>")
     examples = []
-    for ex in _relevant_correction_examples(context):
+    for ex in _relevant_correction_examples(context, text=text):
         heard = _prompt_block_text(ex.get("heard"), max_chars=80)
         correct = _prompt_block_text(ex.get("correct"), max_chars=80)
         if not heard or not correct:
@@ -2687,42 +2796,86 @@ def _get_local_repairer(repo_id: str) -> "_LocalRepairer":
         return _LOCAL_REPAIRER
 
 
-def _repair_output_ok(src: str, out: str) -> bool:
-    """Reject model output that looks like a paraphrase, an answer, or a refusal rather
-    than a light in-place repair (a bad repair is worse than none — we keep the input
-    on reject). Biased toward rejecting divergent output."""
+# Short homophones often have low edit similarity. These are candidates only:
+# the model still needs sentence context to propose one of these replacements.
+_HOMOPHONE_GROUPS = tuple(frozenset(group.split()) for group in (
+    "there their they're", "to too two", "your you're", "its it's",
+    "hear here", "bare bear", "pier peer", "whole hole", "right write rite",
+    "by buy bye", "of have", "affect effect", "than then", "weather whether",
+    "principal principle", "whose who's", "our hour", "are our",
+))
+_NEGATIONS = frozenset("no not never neither nor nobody nothing nowhere without "
+                       "cannot can't won't don't doesn't didn't isn't aren't "
+                       "wasn't weren't couldn't wouldn't shouldn't mustn't "
+                       "hasn't haven't hadn't ningún ninguna nunca jamás ni sin".split())
+
+
+def _repair_key(word: str) -> str:
+    return unicodedata.normalize("NFC", word).casefold().replace("’", "'")
+
+
+def _plausible_repair(heard: str, fixed: str, *, language: str = "en") -> bool:
+    a, b = _repair_key(heard), _repair_key(fixed)
+    if a == b:
+        return True
+    similarity = _lev_sim(a, b)
+    if str(language).lower().startswith("en"):
+        if any(a in group and b in group for group in _HOMOPHONE_GROUPS):
+            return True
+        return similarity >= 0.60 and _phonetic_match(a, b)
+    # English phonetic encoders are unsuitable for Spanish/other languages.
+    # Permit close spelling repairs only; all structural guards still apply.
+    return min(len(a), len(b)) >= 4 and similarity >= 0.80
+
+
+def _validated_repair(src: str, out: str, *, known_terms=(),
+                      language: str = "en") -> str | None:
+    """Accept only small, plausible in-place word substitutions.
+
+    Rebuild accepted edits in the source so the model never controls spacing,
+    capitalization, punctuation, literals, numbers, or taught spellings. Reject
+    the whole proposal on insertions/deletions, negation changes or any dubious
+    edit: a long sentence must not hide one meaning-changing substitution.
+    """
     if not out:
-        return False
-    li, lo = len(src), len(out)
-    if lo < 0.6 * li or lo > 1.5 * li + 40:
-        return False
-    src_l = src.strip().lower()
-    out_l = out.strip().lower()
-    bad_prefixes = ("assistant:", "user:", "system:", "sure,", "sure.",
-                    "here is", "here's", "the answer", "as an ai")
-    if out_l.startswith(bad_prefixes) and not src_l.startswith(bad_prefixes):
-        return False
-    if out.count("\n") > src.count("\n") + 1:
-        return False
-    src_tokens = re.findall(r"\S+", src_l)
-    out_tokens = re.findall(r"\S+", out_l)
-    if src_tokens and (
-        len(out_tokens) < max(1, int(len(src_tokens) * 0.65))
-        or len(out_tokens) > len(src_tokens) * 1.35 + 3
-    ):
-        return False
-    if len(src_tokens) >= 4:
-        import difflib
-        matcher = difflib.SequenceMatcher(a=src_tokens, b=out_tokens)
-        changed = 0
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-            if tag != "equal":
-                changed += max(i2 - i1, j2 - j1)
-        if changed > max(3, int(len(src_tokens) * 0.35)):
-            return False
-        if matcher.ratio() < 0.58:
-            return False
-    return True
+        return None
+    if src == out:
+        return src
+    before = list(_REPAIR_WORD_RE.finditer(src))
+    after = list(_REPAIR_WORD_RE.finditer(out))
+    if len(before) != len(after):
+        return None
+    # Gaps include digits and every punctuation/formatting character. Apostrophes
+    # inside a word belong to the word, allowing its/it's and your/you're.
+    if _REPAIR_WORD_RE.split(src) != _REPAIR_WORD_RE.split(out):
+        return None
+    protected = _protected_spans(src, known_terms)
+    changes = []
+    for index, (original, proposed) in enumerate(zip(before, after)):
+        a, b = original.group(), proposed.group()
+        if _repair_key(a) == _repair_key(b):
+            continue  # retain the source's capitalization and apostrophe style
+        if (_overlaps(*original.span(), protected)
+                or _repair_key(a) in _NEGATIONS or _repair_key(b) in _NEGATIONS
+                or a.isupper()
+                or (index > 0 and a[:1].isupper() and _is_distinctive(a))
+                or not _plausible_repair(a, b, language=language)):
+            return None
+        replacement = _preserve_case(a, b.lower())
+        if "’" in a:
+            replacement = replacement.replace("'", "’")
+        changes.append((original.start(), original.end(), replacement))
+    if changes and (len(before) < 3
+                    or len(changes) > max(1, (len(before) + 3) // 4)):
+        return None
+    for start, end, replacement in reversed(changes):
+        src = src[:start] + replacement + src[end:]
+    return src
+
+
+def _repair_output_ok(src: str, out: str) -> bool:
+    """Compatibility predicate for the in-place repair validator."""
+    return _validated_repair(src, out) is not None
 
 
 def _preserve_source_terminal_punctuation(src: str, out: str) -> str:
@@ -2760,7 +2913,10 @@ def local_repair(text: str, cfg: dict, context: dict | None = None,
         # Construction can download/load and warm an MLX model, so it belongs
         # under the same GPU lock as generation—not just the final generate call.
         rep = _get_local_repairer(repo_id)
-        system = _LOCAL_REPAIR_SYSTEM + _context_blocks(context)
+        system = (_LOCAL_REPAIR_SYSTEM
+                  + "\nKeep the input language. Never translate. Preserve all numbers, "
+                    "negations, URLs, code, and known spellings exactly."
+                  + _context_blocks(context, text=text))
         messages = ([{"role": "system", "content": system}]
                     + _LOCAL_REPAIR_SHOTS
                     + [{"role": "user", "content": text}])
@@ -2776,10 +2932,17 @@ def local_repair(text: str, cfg: dict, context: dict | None = None,
 
     out = (out or "").strip()
     # The model sometimes wraps its answer in quotes/backticks despite instructions.
-    if len(out) >= 2 and out[0] in "\"'`" and out[-1] == out[0]:
+    if (len(out) >= 2 and out[0] in "\"'`" and out[-1] == out[0]
+            and not text.startswith(out[0])):
         out = out[1:-1].strip()
     out = _preserve_source_terminal_punctuation(text, out)
-    return out if _repair_output_ok(text, out) else text
+    lang = str(cfg.get("language", "en") or "en").lower()
+    if lang == "auto":
+        lang = _detect_cleanup_language(text)
+    accepted = _validated_repair(
+        text, out, known_terms=list(load_corrections().values()) + distinctive_terms(),
+        language=lang)
+    return text if accepted is None else accepted
 
 
 def clean(text: str, cfg: dict, context: dict | None = None, gpu_lock=None) -> str:
@@ -2796,26 +2959,26 @@ def clean(text: str, cfg: dict, context: dict | None = None, gpu_lock=None) -> s
         # Multilingual engines detect the SPEECH language per-utterance; mirror
         # that here so e.g. Spanish text gets Spanish cleanup rules.
         lang = _detect_cleanup_language(text)
-    if mode == "none":
-        out = text
-    elif mode == "local":
-        # On-device context repair. basic_cleanup FIRST (deterministic fillers/punct/
-        # casing) so the model sees clean prose and does exactly ONE job: word repair.
+    out = text if mode == "none" else basic_cleanup(text, language=lang)
+    # Explicit rules are authoritative. Fuzzy repair touches only unmatched
+    # source spans; the model then sees and must preserve those known spellings.
+    corrections = load_corrections()
+    terms = distinctive_terms()
+    transform = None
+    if cfg.get("fuzzy_correct", True):
+        protected = _protected_spans(out, corrections.values())
+
+        def transform(fragment, offset):
+            return fuzzy_correct_text(
+                fragment, terms, float(cfg.get("fuzzy_threshold", 0.74)), language=lang,
+                protected_spans=[(a - offset, b - offset) for a, b in protected])
+    out = apply_corrections(out, corrections=corrections,
+                            transform_unmatched=transform)
+    if mode == "local":
         try:
-            out = basic_cleanup(text, language=lang)
             out = local_repair(out, cfg, context, gpu_lock=gpu_lock)
         except Exception as e:  # noqa: BLE001  fall back, never lose the words
-            print(f"[flow] local repair failed ({e}); using basic cleanup.")
-            out = basic_cleanup(text, language=lang)
-    else:
-        out = basic_cleanup(text, language=lang)
-    # Exact taught corrections first (precise), then phonetic fuzzy repair of any
-    # remaining near-miss proper nouns against your learned vocabulary. These run
-    # AFTER local_repair, so a taught spelling still wins over the model.
-    out = apply_corrections(out)
-    if cfg.get("fuzzy_correct", True):
-        out = fuzzy_correct_text(out, distinctive_terms(),
-                                 float(cfg.get("fuzzy_threshold", 0.74)))
+            print(f"[flow] local repair failed ({e}); using deterministic cleanup.")
     return out
 
 
@@ -6764,8 +6927,9 @@ def _settings_controller_class():
                  "Grant them from the Privacy tab — you're only asked once."),
                 ("Learn from my edits",
                  "When on, if you correct a word right after früt Flow pastes it "
-                 "(a name it misheard, say), it remembers the fix and applies it "
-                 "next time. Everything it learns is stored on this Mac only."),
+                 "(a name it misheard, say), the same fix in two separate "
+                 "dictations teaches it the spelling. Teach a Word applies "
+                 "immediately. Everything stays on this Mac."),
             )),
         )
 
@@ -9394,6 +9558,10 @@ class FlowApp:
         el = _ax_focused_element()
         if el is None:
             return   # app doesn't expose its text field; nothing to learn from
+        baseline = _ax_read_value(el)
+        if (not baseline or len(baseline) > 16_384 or baseline.count(pasted) != 1):
+            return  # no unique insertion to anchor; never diff the whole document
+        app_name = _focused_app_name() or ""
         try:
             win = float(self.cfg.get("learn_window_seconds", 20))
         except Exception:  # noqa: BLE001
@@ -9404,6 +9572,7 @@ class FlowApp:
             generation = self._learn_generation
             self._pending_learn = {
                 "el": el, "pasted": pasted, "done": False,
+                "baseline": baseline, "app": app_name,
                 "generation": generation,
             }
             timer = threading.Timer(
@@ -9432,7 +9601,8 @@ class FlowApp:
         if timer is not None and timer is not threading.current_thread():
             timer.cancel()
         try:
-            learn_from_edit(pend["el"], pend["pasted"])
+            learn_from_edit(pend["el"], pend["pasted"],
+                            baseline=pend.get("baseline"), app=pend.get("app", ""))
         except Exception:  # noqa: BLE001  learning must never break dictation
             pass
 
