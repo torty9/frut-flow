@@ -8,7 +8,7 @@ machine. It's **100% free**.
 
 ```
 hold ⌥ (Right Option) ─► 🎤 record ─► 🧠 transcribe on‑device (Parakeet, GPU)
-     ─► ✨ cleanup ─► 🩹 fix your proper nouns ─► 📋 paste ─► 👂 learn your edits
+     ─► ✨ cleanup ─► 🩹 taught names + guarded repair ─► 📋 paste ─► 👂 confirm edits
 ```
 
 It can run right from a Terminal (`./run.sh`) or, once set up, as a real
@@ -27,7 +27,7 @@ Restart, Open Log, and Quit**.
   *"new paragraph"*, *"question mark"*, or in Spanish *"abrir comillas"*,
   *"punto y aparte"*, *"signo de interrogación"* — with guards so prose like
   "the trial period" or "punto de vista" is never mangled.
-- **Automatic accuracy**: phonetic proper‑noun repair + learns corrections from your edits.
+- **Conservative corrections**: authoritative taught spellings, guarded name matching and local repair, plus name fixes learned from two matching edits.
 - **Menu‑bar app** — no Terminal window needed; `frutflow.app` owns the macOS
   permissions while the code and venv live beside it for easy updates.
 - **Voice undo — "never mind."** If a whole utterance is *"never mind"* (or *"scratch

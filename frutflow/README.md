@@ -204,8 +204,8 @@ Edit `~/.flowdictate/config.json` (see `config.example.json`, or use the in-app
 | `parakeet_model` | `"mlx-community/parakeet-tdt-0.6b-v2"` | v2 = English (best English accuracy) · `...-v3` = 25 languages incl. Spanish (auto-detects) |
 | `model` | `"distil-large-v3"` | faster-whisper model, used when `transcribe_backend: "local"`. English-only; swapped for `large-v3-turbo` automatically when `language` isn't `"en"`. |
 | `normalize_method` | `"rms"` | `"rms"` = average-loudness normalize + soft-limit (best for quiet/whispered) · `"peak"` = old peak-normalize |
-| `fuzzy_correct` | `true` | Phonetic proper-noun repair against your learned vocab (engine-agnostic) |
-| `learn_from_edits` | `true` | Auto-learn corrections by watching the field you paste into |
+| `fuzzy_correct` | `true` | Conservative English name repair; skips real words, technical literals, and ambiguous matches. Explicit teachings work in every language. |
+| `learn_from_edits` | `true` | Learn name fixes after two matching edits in separate dictations, limited to the inserted text |
 | `cleanup` | `"basic"` | `"none"` (raw) · `"basic"` (fillers, spacing, caps + spoken punctuation like "quote … end quote") · `"local"` (on-device misheard-word repair — no cloud, no key) |
 | `insert_method` | `"paste"` | `"paste"` (clipboard+Cmd-V), `"type"` (key-by-key), or `"clipboard"` (copy only — you press Cmd-V; needs **no** Accessibility permission) |
 | `restore_clipboard` | `true` | Put your previous clipboard back after pasting the dictation |
@@ -254,11 +254,48 @@ stderr so stdout is just the text.
 ./run.sh --try "some Versal text"   # dry-run the correction pipeline on a string
 ```
 
-You usually won't need to teach it anything — it learns from your edits. But you
-still can: `./run.sh --correct "heard" "correct"` (or double-click
+Name fixes are learned after the same edit in two separate dictations. To teach
+an authoritative replacement immediately, use: `./run.sh --correct "heard" "correct"` (or double-click
 **Teach a Word.command**). Teach a Word can also save optional context and app
 name, which the local repair model uses as relevant examples later. From the CLI:
 `./run.sh --correct "Versal" "Vercel" --correct-context "deploy to Vercel" --correct-app "Cursor"`.
+
+### How corrections are chosen
+
+1. Basic cleanup handles spoken punctuation, fillers, and spacing (unless cleanup
+   is `none`).
+2. Your saved replacements run once, longest phrase first. A replacement cannot
+   trigger another rule or be changed by fuzzy matching. Your chosen spelling
+   and capitalization are kept, including names such as `früt`, `iPhone`, and `C++`.
+3. English fuzzy repair requires both similar spelling and phonetic evidence,
+   with a clear winning candidate. It skips dictionary words, acronyms, URLs,
+   email addresses, paths, code, and identifiers. If a real word is a misheard
+   name (for example `Versal`), teach that replacement explicitly.
+4. Optional local model repair sees the corrected text. Its proposal must consist
+   of small, plausible word substitutions; changed numbers, negations, technical
+   literals, saved spellings, word counts, or formatting reject the proposal.
+   Rejected proposals and model failures retain the deterministic result.
+
+Automatic learning uses a snapshot of the field after insertion. It only compares
+that insertion while the surrounding text stays unchanged. Repeated/ambiguous
+insertions, document rewrites, and fields over 16,384 characters are skipped.
+The same name fix must occur in two separate dictations in the same app before
+it becomes a saved correction. Pending observations are stored privately in
+`~/.flowdictate/pending_corrections.json`; they do not influence transcription or
+repair until confirmed. Existing saved corrections continue to work immediately
+and automatic learning cannot overwrite them.
+
+These checks favor keeping your words when uncertain. They reduce specific false
+corrections; they cannot guarantee that every speech-recognition error is fixed.
+
+Run the model-free regression suite (requires `numpy`, `rapidfuzz`, `jellyfish`):
+
+```bash
+python -m unittest discover -s frutflow/tests -v  # from the repository root
+```
+
+`frutflow/try_repair.py` separately exercises the local model on a Mac with GPU
+access. Its text examples are a small diagnostic set, not an audio accuracy benchmark.
 
 ### Optional on-device cleanup (still 100% local, still free)
 
@@ -284,7 +321,7 @@ optional extra is a **fully on-device** cleanup step:
 | First run is slow | It's downloading the speech model once; subsequent launches load it from the local cache. |
 | First dictation is slow after opening the lid | The current build automatically coalesces closed-lid maintenance wakes, refreshes audio once, and warms the model after a visible wake. Open `~/.flowdictate/flow.log` if this still repeats. |
 | Dictation feels slow | The default Parakeet backend is already sub-second/clip. If you switched to `"local"` (faster-whisper), that's the ~2–5 s CPU path — switch back to `"parakeet"`. |
-| It keeps misspelling a name | Just fix it once after it pastes — it learns the correction automatically. Or `./run.sh --correct "heard" "correct"`. |
+| It keeps misspelling a name | Fix it in two separate dictations to teach it automatically. Or `./run.sh --correct "heard" "correct"`. |
 | A real word gets "corrected" | Raise `"fuzzy_threshold"` (e.g. `0.85`), or set `"fuzzy_correct": false`. |
 | Old clipboard isn't restored | `restore_clipboard` is on by default; if it misses on a slow Mac, set `"restore_clipboard": false` for dictation-only behavior. |
 | Transcription too aggressive | Set `"cleanup": "none"` to keep the raw engine output (your taught corrections still apply). |
