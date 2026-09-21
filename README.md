@@ -27,7 +27,15 @@ Restart, Open Log, and Quit**.
   *"new paragraph"*, *"question mark"*, or in Spanish *"abrir comillas"*,
   *"punto y aparte"*, *"signo de interrogación"* — with guards so prose like
   "the trial period" or "punto de vista" is never mangled.
-- **Automatic accuracy**: phonetic proper‑noun repair + learns corrections from your edits.
+- **Automatic accuracy**: phonetic proper‑noun repair + learns corrections from your
+  edits — and spells names the way the **text on screen** already does ("Versal" →
+  "Vercel" when Vercel is in the email you're answering), with nothing stored.
+- **Writing styles, per app, fully offline** — *Polish* drops false starts and
+  repeated words, *Email* adds greeting/paragraphs/sign‑off, *Message* is chat‑ready,
+  *Notes* makes bullets. Pick one per app in Settings ▸ Apps (Email in Mail,
+  Message in Slack…) and früt Flow switches by itself. It runs on the same
+  on‑device model as cleanup — no API key — behind a **faithfulness guard**: if
+  the model adds, drops or *answers* anything, your exact words are typed instead.
 - **Menu‑bar app** — no Terminal window needed; `frutflow.app` owns the macOS
   permissions while the code and venv live beside it for easy updates.
 - **Voice undo — "never mind."** If a whole utterance is *"never mind"* (or *"scratch

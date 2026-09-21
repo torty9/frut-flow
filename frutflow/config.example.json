@@ -23,8 +23,10 @@
   "local_repair_model": "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
   "local_repair_temperature": 0.0,
   "local_repair_max_input_chars": 2000,
+  "style": "verbatim",
   "fuzzy_correct": true,
   "fuzzy_threshold": 0.74,
+  "context_awareness": true,
   "learn_from_edits": true,
   "learn_window_seconds": 20,
   "history_enabled": true,
@@ -32,6 +34,7 @@
   "insert_method": "paste",
   "restore_clipboard": true,
   "auto_space": true,
+  "app_profiles": [],
   "undo_enabled": true,
   "undo_phrases": [
     "never mind",

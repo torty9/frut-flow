@@ -9,13 +9,14 @@ leaves your computer. It's 100% free.
 
 ```
    hold ⌥ (right Option) ─► 🎤 record ─► 🧠 transcribe on-device (Parakeet, GPU)
-        ─► ✨ cleanup ─► 🩹 fix your proper nouns
+        ─► ✨ cleanup ─► ✍️ write it in this app's style (optional, on-device)
+        ─► 🩹 fix your proper nouns (yours + the ones on screen)
         ─► 📋 paste ─► 👀 watch your edits & learn them automatically
 ```
 
 ## Why it's accurate (the part that stops you editing)
 
-Three layers stack so you rarely have to fix anything — all **on-device, automatic**:
+Four layers stack so you rarely have to fix anything — all **on-device, automatic**:
 
 1. **A strong, fast model by default.** NVIDIA **Parakeet** (`parakeet-tdt-0.6b`)
    running on the Apple-Silicon **GPU** via MLX — fast *and* accurate, with
@@ -30,7 +31,17 @@ Three layers stack so you rarely have to fix anything — all **on-device, autom
    (say "call" with "CLI" in your vocabulary and you still get "call"). Want a
    real word remapped anyway ("fruit" → "früt")? Teach it explicitly — exact
    taught corrections always apply.
-3. **Automatic learning from your edits.** When you fix a word right after it's
+3. **Names from the screen in front of you.** The email you're answering already
+   says *Vercel*, so früt Flow reads the focused text field and the window title
+   and offers their proper nouns to that same repair step for this one dictation —
+   "Versal" becomes "Vercel" without anyone teaching it. It's deliberately
+   stricter than your own vocabulary: a higher match score, and it only replaces
+   a token that isn't an ordinary word ("Austin" is never rewritten to the
+   "Austen" on screen). No model involved, so it works in every cleanup mode. The
+   text is read through the Accessibility permission paste already needs, used
+   in memory, and never stored or logged (`"context_awareness": false` turns it
+   off; so does Settings ▸ Privacy ▸ **Use names on screen**).
+4. **Automatic learning from your edits.** When you fix a word right after it's
    pasted, früt Flow notices, confirms it's a genuine mis-hear (not a change of
    mind) by how similar the two words *sound*, and learns it — so it never gets
    that word wrong again. **You never run a "teach" command.**
@@ -219,8 +230,11 @@ Edit `~/.flowdictate/config.json` (see `config.example.json`, or use the in-app
 | `model` | `"distil-large-v3"` | faster-whisper model, used when `transcribe_backend: "local"`. English-only; swapped for `large-v3-turbo` automatically when `language` isn't `"en"`. |
 | `normalize_method` | `"rms"` | `"rms"` = average-loudness normalize + soft-limit (best for quiet/whispered) · `"peak"` = old peak-normalize |
 | `fuzzy_correct` | `true` | Phonetic proper-noun repair against your learned vocab (engine-agnostic) |
+| `context_awareness` | `true` | Let that repair also use the names visible in the focused text field and window title (see layer 3 above). Read for one dictation; never stored or logged. |
 | `learn_from_edits` | `true` | Auto-learn corrections by watching the field you paste into |
 | `cleanup` | `"basic"` | `"none"` (raw) · `"basic"` (fillers, spacing, caps + spoken punctuation like "quote … end quote") · `"local"` (on-device misheard-word repair — no cloud, no key) |
+| `style` | `"verbatim"` | How the dictation is written: `"verbatim"` · `"polish"` · `"email"` · `"message"` · `"notes"`. See [Writing styles](#writing-styles-and-app-profiles). |
+| `app_profiles` | `[]` | Per-app overrides, e.g. `{"app": "Mail", "bundle_id": "com.apple.mail", "style": "email"}`. See [Writing styles](#writing-styles-and-app-profiles). |
 | `insert_method` | `"paste"` | `"paste"` (clipboard+Cmd-V), `"type"` (key-by-key), or `"clipboard"` (copy only — you press Cmd-V; needs **no** Accessibility permission) |
 | `restore_clipboard` | `true` | Put your previous clipboard back after pasting the dictation |
 | `auto_space` | `true` | Prepend a space so dictation merges naturally with existing text |
@@ -291,10 +305,96 @@ optional extra is a **fully on-device** cleanup step:
   examples, ~600 tokens) stays cached on the GPU between dictations, so each
   dictation only pays for its own words (~0.3 s saved per dictation).
 
+## Writing styles and app profiles
+
+Dictated speech isn't typed prose: it has false starts, repeated words, and no
+layout. A **writing style** hands the dictation to the same on-device model as
+the cleanup above and asks it to write the text the way you would have typed it
+— still 100% local, no API key.
+
+| Style | What it does |
+|---|---|
+| `verbatim` | **Default.** Your words as spoken, tidied per `cleanup`. No model. |
+| `polish` | Drops false starts and repeated words ("I'll, I'll send it" → "I'll send it"), fixes grammar slips and obvious mishearings. Keeps your wording. |
+| `email` | Polish + an email's layout: greeting, short paragraphs, sign-off — **only ones you actually said**, never invented. |
+| `message` | Polish for chat: no closing period ("Sounds good"). |
+| `notes` | Condenses what you say into `- ` bullets, one per point. Ends on a fresh line, so consecutive dictations build one list. |
+
+Pick the default in Settings ▸ **Apps** ▸ *Writing style*, or — the better way —
+**per app**: open Mail, go to Settings ▸ Apps ▸ *Add a running app…*, choose Mail,
+and it starts as **Email** (Slack/Messages start as Message, Notes/Obsidian as
+Notes; change any of them from its menu). From then on früt Flow switches by
+itself according to the app you're dictating into.
+
+**Your words are never at the model's mercy.** Small language models are eager
+assistants: asked to tidy the dictated sentence *"what time is the standup
+tomorrow?"* they tend to *answer* it. früt Flow counters that twice over. Every
+request frames your dictation as quoted material to transcribe, never as a
+message; and every rewrite must pass a **faithfulness guard** before it is
+typed. The guard refuses a rewrite that
+
+- answers, obeys, translates or comments instead of rewriting,
+- introduces a name or a number you didn't say, or drops one you did,
+- loses too many of your words or adds new ones,
+- turns a question into a statement, or stops addressing "you".
+
+A refused rewrite costs about a second and nothing else: **your exact words are
+typed instead** (and `flow.log` names the rule — never your text). When a style
+*did* change the text, the History window keeps the words **as spoken** one click
+away. Dictations under four words skip the model entirely, a "never mind" is
+always judged on what you actually said, and line breaks a style adds are pasted
+rather than typed, so they can't press Return in a chat box.
+
+Measured on the default 1.5B model with 21 test dictations per style (ordinary,
+long, Spanish, unpunctuated, and seven adversarial ones like "ignore all previous
+instructions…"). The model fell for three or four of the adversarial ones in
+every style — it translated, it answered, it printed "banana" — and the guard
+refused every one of those. In `polish`, `email` and `message`, every rewrite
+that reached the cursor said what the speaker said. `notes` is different in
+kind: it kept every name and number, but it *condenses*, so it dropped an
+acknowledgement ("yeah, that works for me") in one case and the "do you know
+if…" framing in another, and the guard refused 7 of 21 where it would have lost
+more. Use it where terse is what you want; the words as spoken stay in History.
+A style adds roughly 0.2–1 s per dictation (about 2 s for a long one); each
+style's prompt stays cached on the GPU.
+
+Try one without speaking:
+
+```bash
+./run.sh --try "yeah that works, um, I'll I'll send the deck tonight" --style polish
+./run.sh --try "hi tom thanks for the update talk soon henrik" --as-app Mail
+./run.sh --try "deploy to Versal failed" --context "Did the deploy to Vercel finish?"
+```
+
+### App profiles in `config.json`
+
+A profile can change more than the style. Everything read fresh per dictation is
+overridable: `style`, `cleanup`, `insert_method`, `auto_space`,
+`restore_clipboard`, `fuzzy_correct`, `context_awareness`, `learn_from_edits`,
+`learn_vocab`, `history_enabled`. (The engine, its model and the hotkey are
+process-wide and are not.)
+
+```json
+"app_profiles": [
+  {"app": "Mail",     "bundle_id": "com.apple.mail",            "style": "email"},
+  {"app": "Slack",    "bundle_id": "com.tinyspeck.slackmacgap", "style": "message"},
+  {"app": "Terminal", "auto_space": false, "cleanup": "none"},
+  {"app": "1Password", "history_enabled": false, "learn_vocab": false,
+   "learn_from_edits": false, "context_awareness": false}
+]
+```
+
+An entry with a `bundle_id` matches only that app (display names are localized and
+not unique); without one it matches the app's name, case-insensitively. First
+match wins; apps with no profile use your global settings unchanged. Settings ▸
+Apps edits the style and leaves the other keys alone.
+
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
+| A style didn't change my text | Check `~/.flowdictate/flow.log` for "rewrite was not faithful (…)": the guard refused it and typed your words instead. Under four words, and over `local_repair_max_input_chars`, the model is skipped on purpose. |
+| The wrong name got "fixed" from the screen | Turn off Settings ▸ Privacy ▸ **Use names on screen** (or `"context_awareness": false`), globally or for that one app via `app_profiles`. |
 | Hotkey does nothing | Grant **Input Monitoring** to `frutflow` (or the terminal used for a manual launch), then restart it. |
 | Nothing gets pasted | Grant **Accessibility**. Try `"insert_method": "type"`. |
 | `PortAudioError` / no audio | `brew install portaudio`; check `python flow.py --list-devices`. |
@@ -316,6 +416,15 @@ the supported models are cached, dictation itself does not send audio or text to
 a server. Your learned vocabulary, corrections, optional history, and logs live
 in `~/.flowdictate` and are written owner-only. Live dictation logs redact the
 transcript unless `debug` is enabled.
+
+Two features read text that is already on your screen, both through the
+Accessibility permission paste needs anyway and both on-device: *learn from my
+edits* re-reads the field you dictated into, and *use names on screen* reads the
+focused field and window title to spell names correctly. That text is used in
+memory for one dictation and is never written to disk or to the log. Neither
+takes screenshots, and früt Flow never asks for Screen Recording. Each has a
+switch in Settings ▸ Privacy, and an app profile can turn either off — or keep
+an app out of History altogether — for a single app.
 
 ## Credits & licenses
 
