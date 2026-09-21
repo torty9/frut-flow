@@ -435,6 +435,25 @@ def _valid_hotkey(name: str) -> bool:
     return name in _MODIFIER_VKS_BY_NAME or _parse_vk_binding(name) is not None
 
 
+# Keys you type with: the main alphanumeric block (minus the ISO section key,
+# vk 10, a popular push-to-talk choice), Space/Return/Tab/Delete, keypad Enter,
+# Forward Delete and the arrows. A non-modifier hotkey is CONSUMED system-wide
+# (FlowApp._should_consume_hotkey_event), so binding one of these makes it stop
+# typing in every app — and the only ways back are the mouse or editing JSON.
+# The Settings capture refuses them; config.json still honors any vk:N for the
+# rare setup that truly wants one (a macro pad that emits a letter, say).
+_TYPING_VKS = (frozenset(range(0, 52)) - {10}) | {52, 76, 117, 123, 124, 125, 126}
+
+
+def _hotkey_capture_problem(vk: int) -> str | None:
+    """Why the key `vk` must not become the hotkey via the Settings capture —
+    a short label-sized phrase — or None when it is fine to bind."""
+    vk = int(vk)
+    if vk in _MODIFIER_NAME_BY_VK or vk not in _TYPING_VKS:
+        return None
+    return f"{_VK_LABELS.get(vk, f'Key {vk}')}: typing key"
+
+
 def _clean_undo_phrases(value) -> list[str]:
     if not isinstance(value, list):
         return list(DEFAULT_CONFIG["undo_phrases"])
@@ -547,8 +566,16 @@ def write_default_config() -> None:
     else:
         _write_private_json(CONFIG_PATH, DEFAULT_CONFIG, indent=2)
         print(f"[flow] wrote default config to {CONFIG_PATH}")
-    code_dir = str(Path(__file__).resolve().parent)
-    _write_private_text(CODE_DIR_PATH, code_dir + "\n")
+    code_dir = Path(__file__).resolve().parent
+    # The installed frutflow.app launches whatever this pointer names. Never
+    # repoint an existing install at a checkout that has no virtualenv (e.g.
+    # `python3 flow.py --setup` in the repo): the app would then crash at every
+    # login with a missing-dependency error.
+    if CODE_DIR_PATH.exists() and not (code_dir / ".venv").is_dir():
+        print(f"[flow] leaving code directory pointer as is ({CODE_DIR_PATH}): "
+              f"{code_dir} has no .venv, so the app could not run from there.")
+        return
+    _write_private_text(CODE_DIR_PATH, str(code_dir) + "\n")
     print(f"[flow] wrote code directory pointer to {CODE_DIR_PATH}")
 
 
@@ -576,13 +603,19 @@ class Recorder:
                 self._frames.append(indata.copy())
 
     def _open_stream(self):
+        # Timed separately so flow.log can answer "how long does the mic take to
+        # come up?" with data: device open (CoreAudio/PortAudio setup) vs start.
+        t0 = time.monotonic()
         stream = self._sd.InputStream(
             samplerate=self.sample_rate,
             channels=CHANNELS,
             dtype="float32",
             callback=self._callback,
         )
+        t1 = time.monotonic()
         stream.start()
+        self.last_open_ms = (t1 - t0) * 1000.0
+        self.last_start_ms = (time.monotonic() - t1) * 1000.0
         return stream
 
     def _reinitialize_locked(self) -> None:
@@ -712,6 +745,7 @@ class LocalTranscriber:
         # "auto"/empty → None, which tells faster-whisper to detect the spoken
         # language per clip instead of forcing one.
         lang = str(language or "").strip().lower()
+        self.model_name = model_name
         self.language = None if lang in ("", "auto") else lang
         self.normalize = normalize
         self.normalize_peak = normalize_peak
@@ -899,6 +933,7 @@ class ParakeetTranscriber:
         self._toks_to_sents = tokens_to_sentences
         self._sents_to_result = sentences_to_result
         self._DecodingConfig = DecodingConfig
+        self.model_name = model_name   # Settings asks which checkpoint is LOADED
         self.language = language
         self.normalize = normalize
         self.normalize_peak = normalize_peak
@@ -1353,8 +1388,11 @@ def apply_corrections(text: str) -> str:
             # The replacement goes through a lambda so backslashes in a taught
             # correction (paths, LaTeX) are inserted literally — as a template
             # string, re.sub would reject "\U" or corrupt "\n" into a newline.
-            text = re.sub(rf"\b{re.escape(heard)}\b", lambda _m, c=correct: c,
-                          text, flags=re.IGNORECASE)
+            # Explicit not-a-word-character lookarounds instead of \b: a taught
+            # phrase that starts or ends with punctuation ("C++", "früt.") has
+            # no \b there, so it could never match as a whole word.
+            text = re.sub(rf"(?<!\w){re.escape(heard)}(?!\w)",
+                          lambda _m, c=correct: c, text, flags=re.IGNORECASE)
     return text
 
 
@@ -1396,11 +1434,16 @@ def load_history() -> list:
     for e in data[-HISTORY_CAP:]:
         if not isinstance(e, dict) or not isinstance(e.get("text"), str):
             continue
+        text = e.get("text", "")
+        # Coerce the numeric fields too: the History window formats them, and a
+        # hand-edited or half-written value ("words": "12") would raise inside an
+        # AppKit callback and leave the window blank.
         good.append({
-            "text": e.get("text", ""),
-            "ts": e.get("ts", 0),
+            "text": text,
+            "ts": _clamp_number(e.get("ts", 0), 0.0, 0.0, 4e10),
             "app": e.get("app") if isinstance(e.get("app"), str) else None,
-            "words": e.get("words", len(str(e.get("text", "")).split())),
+            "words": _clamp_number(e.get("words"), len(text.split()), 0, 1_000_000,
+                                   as_int=True),
             "delivered": bool(e.get("delivered", True)),
         })
     return list(reversed(good))        # disk oldest-first -> newest-first for UI
@@ -1764,18 +1807,40 @@ def _preserve_case(src: str, repl: str) -> str:
     return repl
 
 
+def _at_sentence_start(parts: list[str], i: int) -> bool:
+    """True when word slot `i` of a re.split(r"(\\W+)") list opens a sentence:
+    nothing but delimiters precede it, or the delimiter right before it holds a
+    sentence-ending mark. Word slots sit at even indices, delimiters at odd."""
+    if i == 0:
+        return True
+    if re.search(r"[.!?…\n]", parts[i - 1]):
+        return True
+    return not any(parts[:i:2])
+
+
 def fuzzy_correct_text(text: str, terms: list[str], threshold: float = 0.74) -> str:
     """Snap near-miss single words to known vocabulary. High-precision: only
-    alpha tokens length>=3, length-ratio guarded, phonetic+edit-distance scored,
-    case preserved. Surrounding spacing/punctuation is untouched."""
+    alpha tokens length>=4, length-ratio guarded, phonetic+edit-distance scored,
+    case preserved. Surrounding spacing/punctuation is untouched.
+
+    Two guards keep real words real. A token that is an ordinary dictionary
+    word *as dictated* — lowercase anywhere, or capitalized only because it
+    opens the sentence — is never rewritten ("phone" must not become "iPhone",
+    "call" must not become "CLI"); a capitalized dictionary word mid-sentence
+    is still a candidate, because that is exactly how the engine renders a
+    misheard name ("deploy to Versal" → "Vercel"). And terms shorter than four
+    letters are never fuzzy targets: a three-letter acronym matches far too
+    many everyday words phonetically. Exact taught corrections cover both
+    cases when that is what you actually want ("fruit" → "früt")."""
     if not text or not terms or not FUZZY_AVAILABLE:
         return text
     # Single-token candidates only: correction TARGETS can be multi-word
     # phrases ("New York"), and snapping one dictated token onto a phrase
     # rewrites words the user never said ("Newark" → "New York").
-    terms = [t for t in terms if " " not in t]
+    terms = [t for t in terms if " " not in t and len(t) >= 4]
     if not terms:
         return text
+    dictionary = _english_words()
     parts = re.split(r"(\W+)", text)   # keeps the delimiters in place
     for i, tok in enumerate(parts):
         # Three-letter tokens are too collision-prone for fuzzy repair: API/App,
@@ -1783,6 +1848,8 @@ def fuzzy_correct_text(text: str, terms: list[str], threshold: float = 0.74) -> 
         if len(tok) < 4 or not tok.isalpha():
             continue
         low = tok.lower()
+        if low in dictionary and (tok == low or _at_sentence_start(parts, i)):
+            continue   # an ordinary word, dictated as such — leave it alone
         best, best_score = None, 0.0
         for term in terms:
             tl = term.lower()
@@ -2635,6 +2702,17 @@ class _LocalRepairer:
         self.repo_id = repo_id
         self._generate = generate
         self._make_sampler = make_sampler
+        # Prefix KV cache (see generate_chat). ~600 of the ~650 prompt tokens per
+        # dictation are the same system prompt + few-shot turns; prefilling them
+        # again every time cost ~0.35s per dictation on an M-series GPU.
+        self._cache_mod = None
+        self._cache = None
+        self._cache_tokens: list[int] = []
+        try:
+            from mlx_lm.models import cache as _cache_mod
+            self._cache_mod = _cache_mod
+        except Exception:  # noqa: BLE001  older mlx-lm: plain uncached generation
+            self._cache_mod = None
         cached = _hf_cached_snapshot(repo_id)
         if cached is None:
             print(f"[flow] first run: downloading on-device repair model "
@@ -2653,16 +2731,70 @@ class _LocalRepairer:
             print(f"[flow] repair model ready. (warm-up issue: {e})",
                   file=sys.stderr, flush=True)
 
-    def generate(self, prompt, *, max_tokens: int, temp: float) -> str:
+    def generate(self, prompt, *, max_tokens: int, temp: float, **kwargs) -> str:
         try:
             sampler = self._make_sampler(temp=temp)
             return self._generate(self.model, self.tokenizer, prompt,
                                   max_tokens=max_tokens, sampler=sampler,
-                                  verbose=False)
+                                  verbose=False, **kwargs)
         except TypeError:
             # API-drift guard: an mlx-lm without make_sampler / the sampler= kwarg.
             return self._generate(self.model, self.tokenizer, prompt,
-                                  max_tokens=max_tokens, verbose=False)
+                                  max_tokens=max_tokens, verbose=False, **kwargs)
+
+    def generate_chat(self, messages: list[dict], *, max_tokens: int,
+                      temp: float) -> str:
+        """Generate for a chat `messages` list, reusing the KV state of the prompt
+        prefix shared with the previous call.
+
+        The prompt is [system(+glossary)] + few-shot turns + [user text]. Only the
+        final user turn changes between two dictations in the same app, so the
+        cache keeps the KV entries for everything before it and the model only
+        prefills the new turn (an app switch or new vocabulary shortens the
+        reusable prefix; it is never wrong, just longer). Greedy decoding on the
+        identical token sequence gives identical output to a cold prefill. Any
+        surprise (template quirk, cache API drift) falls back to the plain
+        uncached path so a dictation is never lost to an optimization."""
+        tok = self.tokenizer
+        prompt_text = tok.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False)
+        if self._cache_mod is None or len(messages) < 2:
+            return self.generate(prompt_text, max_tokens=max_tokens, temp=temp)
+        try:
+            full = list(tok.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=True))
+            prefix = list(tok.apply_chat_template(messages[:-1], tokenize=True))
+            if not (0 < len(prefix) < len(full) and full[:len(prefix)] == prefix):
+                return self.generate(prompt_text, max_tokens=max_tokens, temp=temp)
+            cm = self._cache_mod
+            if self._cache is None or not cm.can_trim_prompt_cache(self._cache):
+                self._cache = cm.make_prompt_cache(self.model)
+                self._cache_tokens = []
+            common = 0
+            for a, b in zip(self._cache_tokens, prefix):
+                if a != b:
+                    break
+                common += 1
+            extra = cm.cache_length(self._cache) - common
+            if extra > 0:
+                cm.trim_prompt_cache(self._cache, extra)
+            out = self.generate(full[common:], max_tokens=max_tokens, temp=temp,
+                                prompt_cache=self._cache)
+            # Materialize on this thread, then drop the user turn + answer so only
+            # the reusable prefix stays resident (~20 MB for the default model).
+            import mlx.core as mx
+            mx.eval([c.state for c in self._cache])
+            extra = cm.cache_length(self._cache) - len(prefix)
+            if extra > 0:
+                cm.trim_prompt_cache(self._cache, extra)
+            self._cache_tokens = prefix
+            return out
+        except Exception as e:  # noqa: BLE001  never let the cache cost a dictation
+            print(f"[flow] repair prompt cache disabled for this call ({e}).",
+                  flush=True)
+            self._cache = None
+            self._cache_tokens = []
+            return self.generate(prompt_text, max_tokens=max_tokens, temp=temp)
 
     def warm_up(self) -> float:
         t0 = time.monotonic()
@@ -2764,9 +2896,7 @@ def local_repair(text: str, cfg: dict, context: dict | None = None,
         messages = ([{"role": "system", "content": system}]
                     + _LOCAL_REPAIR_SHOTS
                     + [{"role": "user", "content": text}])
-        prompt = rep.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False)
-        return rep.generate(prompt, max_tokens=max_tokens, temp=temp)
+        return rep.generate_chat(messages, max_tokens=max_tokens, temp=temp)
 
     if gpu_lock is not None:
         with gpu_lock:
@@ -3124,7 +3254,15 @@ def insert_text(text: str, cfg: dict) -> bool:
 
     # Stash the existing clipboard, including non-text items when AppKit exposes
     # them, so dictation paste does not wipe images/files from the user's clipboard.
-    old = _clip_snapshot() if cfg["restore_clipboard"] else None
+    # If the previous dictation's restore is still pending and the pasteboard
+    # still holds OUR text, the user's real clipboard is the one that earlier
+    # snapshot saved — snapshotting now would capture our own dictation and hand
+    # it back as "their" clipboard 2s later, losing what they had actually copied.
+    old = None
+    if cfg["restore_clipboard"]:
+        old = _clip_take_pending_snapshot()
+        if old is None:
+            old = _clip_snapshot()
 
     # In-process write is synchronous and confirmed on return — no poll loop needed
     # (the old pbcopy subprocess needed one; NSPasteboard does not).
@@ -3143,13 +3281,48 @@ def insert_text(text: str, cfg: dict) -> bool:
     # dictation — silently, with a success ding. 2s is imperceptible (the user's
     # clipboard comes back before they can use it) and loses the race far less.
     if old:
-        def _restore(expected=our_count, prev=old):
-            if expected < 0 or _clip_change_count() == expected:
-                _clip_restore(prev)
-        t = threading.Timer(2.0, _restore)
-        t.daemon = True
-        t.start()
+        _clip_schedule_restore(our_count, old)
     return True
+
+
+# The one clipboard restore that may be pending at a time: {"count", "snapshot",
+# "timer"}. Guarded by _CLIP_RESTORE_LOCK; only the paste path and its timer touch it.
+_CLIP_RESTORE_LOCK = threading.Lock()
+_CLIP_PENDING: dict | None = None
+
+
+def _clip_take_pending_snapshot():
+    """If a restore is pending and the pasteboard still holds the text that paste
+    put there, cancel that restore and hand back ITS snapshot (the user's real
+    clipboard) for the caller to restore instead. None when nothing applies."""
+    global _CLIP_PENDING
+    with _CLIP_RESTORE_LOCK:
+        pending = _CLIP_PENDING
+        if pending is None:
+            return None
+        if pending["count"] < 0 or _clip_change_count() != pending["count"]:
+            return None          # someone else copied since — their clipboard wins
+        _CLIP_PENDING = None
+        pending["timer"].cancel()
+        return pending["snapshot"]
+
+
+def _clip_schedule_restore(our_count: int, snapshot) -> None:
+    global _CLIP_PENDING
+
+    def _restore(expected=our_count, prev=snapshot):
+        global _CLIP_PENDING
+        with _CLIP_RESTORE_LOCK:
+            if _CLIP_PENDING is not None and _CLIP_PENDING["count"] == expected:
+                _CLIP_PENDING = None
+        if expected < 0 or _clip_change_count() == expected:
+            _clip_restore(prev)
+
+    t = threading.Timer(2.0, _restore)
+    t.daemon = True
+    with _CLIP_RESTORE_LOCK:
+        _CLIP_PENDING = {"count": our_count, "snapshot": snapshot, "timer": t}
+    t.start()
 
 
 # ---------------------------------------------------------------------------
@@ -3394,6 +3567,17 @@ def _menu_actions_class():
                         pc._apply_status_to_vc()
                     except Exception:  # noqa: BLE001
                         pass
+                # Fourth: the History home page lists the latest dictations and
+                # the time saved. It used to refresh only on open, so a window
+                # left open went stale. Back-to-idle means a dictation just
+                # finished (its history/stats writes precede this status).
+                hc = app._history_ctrl
+                if glyph == "🎙️" and hc is not None:
+                    try:
+                        if hc._win.isVisible():
+                            hc._reload()
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception:  # noqa: BLE001
                 pass
 
@@ -3602,6 +3786,19 @@ def _appearance_for(pref):
 # referenceable by weakref.ref (it raises TypeError), whereas objc.WeakRef is
 # pyobjc's zeroing weak reference and reads back the same way (wr() -> obj/None).
 # ---------------------------------------------------------------------------
+def _timer_in_common_modes(timer) -> None:
+    """Also run an already-scheduled NSTimer in NSRunLoopCommonModes, so it keeps
+    firing while a menu is open, a window is dragged/resized, or a panel is up
+    (the run loop is then in a tracking/modal mode, where a default-mode-only
+    timer silently stalls). Best-effort; never raises."""
+    try:
+        from Foundation import NSRunLoop, NSRunLoopCommonModes
+        if timer is not None:
+            NSRunLoop.mainRunLoop().addTimer_forMode_(timer, NSRunLoopCommonModes)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 _THEMED_LAYERS = []   # list of (objc.WeakRef(layer), which_str, dyn_NSColor)
 
 
@@ -4592,7 +4789,11 @@ def _transcribe_controller_class():
 
         @objc.python_method
         def _can_accept_drop(self, sender):
-            if self._busy:
+            # Only the empty state takes a drop: the finished view holds an
+            # editable transcript, and a second file dropped there used to
+            # replace it — edits and all — with no confirmation. Use
+            # "Transcribe another" first.
+            if self._busy or self._state != "empty":
                 return False
             return self._dropped_path(sender) is not None
 
@@ -5127,6 +5328,7 @@ def _history_controller_class():
                 self._resize_timer.invalidate()
             self._resize_timer = NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
                 0.05, False, lambda _t: self._resize_doc())
+            _timer_in_common_modes(self._resize_timer)   # fire during the live resize too
 
         @objc.python_method
         def _cancel_timers(self):
@@ -5425,6 +5627,7 @@ def _history_controller_class():
                 self._filter_timer.invalidate()
             self._filter_timer = NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
                 0.12, False, lambda _t: self._rebuild(str(self._search.stringValue() or "")))
+            _timer_in_common_modes(self._filter_timer)
 
         def copyCard_(self, sender):
             txt = self._rows.get(int(sender.tag()))
@@ -5561,6 +5764,7 @@ def _hud_controller_class():
             self._built = False
             self._panel = None
             self._bars = []
+            self._dot = None                # set by _build; read by _stop_anim
             self._timer = None
             self._anim_on = False
             self._state = "hidden"          # hidden | listening | transcribing
@@ -5874,6 +6078,9 @@ def _hud_controller_class():
             from Cocoa import NSTimer
             self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 1.0, self, "tick:", None, True)
+            # Keep the clock ticking while a menu is open or a window is being
+            # dragged (those run the loop in a tracking mode, not the default one).
+            _timer_in_common_modes(self._timer)
 
         def _stop_timer(self):
             if self._timer is not None:
@@ -5920,14 +6127,27 @@ def _settings_config_save(key, value):
             cur = json.loads(CONFIG_PATH.read_text())
             if not isinstance(cur, dict):
                 cur = {}
-        except (FileNotFoundError, json.JSONDecodeError, OSError, ValueError):
+        except FileNotFoundError:
             cur = {}
+        except (json.JSONDecodeError, ValueError) as e:
+            # The file exists but is not valid JSON (a hand-edit with a trailing
+            # comma, say). Writing defaults-plus-one-key over it would silently
+            # erase every other setting the user had — keep their file intact and
+            # let them see why the change did not persist.
+            print(f"[flow] not saving '{key}': {CONFIG_PATH} is not valid JSON "
+                  f"({e}). Fix the file (or delete it to start fresh).", flush=True)
+            return False
+        except OSError as e:
+            print(f"[flow] not saving '{key}': could not read {CONFIG_PATH}: {e}",
+                  flush=True)
+            return False
         cur[key] = value
         known = _normalize_config(cur)
         unknown = {k: v for k, v in cur.items() if k not in DEFAULT_CONFIG}
         _write_private_json(CONFIG_PATH, {**unknown, **known}, indent=2)
         return True
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        print(f"[flow] could not save '{key}' to {CONFIG_PATH}: {e}", flush=True)
         return False
 
 
@@ -6045,6 +6265,8 @@ def _settings_controller_class():
             self._hotkey_change_button = None
             self._hotkey_capture_monitor = None
             self._pkmodel_seg = None    # the v2/v3 segment; apply_language flips it
+            self._lang_seg = None       # the language segment; apply_pkmodel flips it
+            self._model_note = None     # the Model pane's "takes effect after Restart" line
             self._build()
             return self
 
@@ -6454,16 +6676,17 @@ def _settings_controller_class():
             self._add_segment(inner, 0, ("Parakeet", "Whisper"),
                               ("parakeet", "local"),
                               self._cfg("transcribe_backend", "parakeet"),
-                              cfg_key="transcribe_backend", seg_w=66.0)
+                              apply_name="apply_backend", seg_w=66.0)
             self._row_divider(inner, 1)
             self._row_text(inner, 1, "Spoken language",
                            "Auto detects per dictation", right_x=230.0)
             cur_lang = str(self._cfg("language", "en") or "en").lower()
             if cur_lang not in ("auto", "en", "es"):
                 cur_lang = "auto"    # any other code: at least show a true state
-            self._add_segment(inner, 1, ("Auto", "English", "Español"),
-                              ("auto", "en", "es"), cur_lang,
-                              apply_name="apply_language", seg_w=72.0)
+            self._lang_seg = self._add_segment(
+                inner, 1, ("Auto", "English", "Español"),
+                ("auto", "en", "es"), cur_lang,
+                apply_name="apply_language", seg_w=72.0)
             self._row_divider(inner, 2)
             self._row_text(inner, 2, "Language model",
                            "v2 English, or v3 for 25 languages", right_x=210.0)
@@ -6480,12 +6703,13 @@ def _settings_controller_class():
                               ("None", "Basic", "On-device"),
                               ("none", "basic", "local"),
                               self._cfg("cleanup", "basic"),
-                              cfg_key="cleanup", seg_w=None)
+                              apply_name="apply_cleanup", seg_w=None)
             self._row_divider(inner, 4)
             self._row_text(inner, 4, "Normalize audio",
                            "Boost quiet or whispered speech")
             self._add_switch(inner, 4, "normalize_audio",
-                             bool(self._cfg("normalize_audio", True)))
+                             bool(self._cfg("normalize_audio", True)),
+                             apply_name="apply_normalize")
             y += h + 12
             note = NSTextField.wrappingLabelWithString_(
                 "Engine, language, and language-model changes take effect "
@@ -6493,6 +6717,7 @@ def _settings_controller_class():
             note.setFont_(G.rounded_font(11.5))
             note.setTextColor_(SUB_COL)
             note.setFrame_(NSMakeRect(PAD + 2, 0, CONTENT_W - 4, 30))
+            self._model_note = note      # _flag_restart_needed rewrites it
             self._place_top(pane, note, y, 30)
             y += 30 + PAD
             self._finish_pane(pane, y)
@@ -7027,9 +7252,15 @@ def _settings_controller_class():
 
         @objc.python_method
         def _refresh_permissions(self):
-            for key, granted in (("mic", self._mic_granted()),
-                                 ("ax", self._ax_granted()),
-                                 ("input", self._input_granted())):
+            state = (("mic", self._mic_granted()),
+                     ("ax", self._ax_granted()),
+                     ("input", self._input_granted()))
+            # Runs at 1 Hz while the window is open: skip the three attributed
+            # titles + layer repaints unless a permission actually changed.
+            if state == getattr(self, "_perm_state", None):
+                return
+            self._perm_state = state
+            for key, granted in state:
                 row = self._perm_rows.get(key)
                 if not row:
                     continue
@@ -7094,6 +7325,13 @@ def _settings_controller_class():
             app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
             app.activateIgnoringOtherApps_(True)
             self._refresh_permissions()
+            # The Corrections list is rebuilt from disk on each visit; a window
+            # reopened on that tab after a "Teach a Word" must not show the old list.
+            if getattr(self, "_tab", None) == "Corrections":
+                try:
+                    self._show_pane("Corrections")
+                except Exception:  # noqa: BLE001
+                    pass
             self._win.makeKeyAndOrderFront_(None)
             self._ensure_perm_timer()
 
@@ -7125,6 +7363,7 @@ def _settings_controller_class():
         def _update_hotkey_display(self):
             if self._hotkey_value_label is not None:
                 self._hotkey_value_label.setStringValue_(self._hotkey_display())
+                self._hotkey_value_label.setToolTip_(None)   # drop a capture hint
             if self._hotkey_change_button is not None:
                 self._hotkey_change_button.setTitle_("Change")
                 self._hotkey_change_button.setEnabled_(True)
@@ -7159,18 +7398,34 @@ def _settings_controller_class():
 
         @objc.python_method
         def _capture_hotkey_event(self, event):
+            keep_listening = False
             try:
                 keycode = int(event.keyCode())
                 # Escape cancels the capture instead of becoming the binding —
                 # otherwise the tap would own Esc system-wide with no way out.
                 if keycode == 53:
                     return None
+                # Same reasoning for every key you type with: bound as the
+                # hotkey, Space/Return/a letter would stop typing in every app.
+                # Say so and keep listening for a usable key (Esc still cancels).
+                problem = _hotkey_capture_problem(keycode)
+                if problem:
+                    keep_listening = True
+                    lbl = self._hotkey_value_label
+                    if lbl is not None:
+                        lbl.setStringValue_(problem)
+                        lbl.setToolTip_(
+                            "As the hotkey this key would stop typing in every "
+                            "app. Press a modifier (⌥ ⌘ ⌃ ⇧ Fn), a function key "
+                            "or a keypad key instead — or Esc to cancel.")
+                    return None
                 value = _hotkey_name_for_vk(keycode)
                 self.apply_hotkey(value)
             except Exception as e:  # noqa: BLE001
                 print(f"[flow] could not capture hotkey: {e}", flush=True)
             finally:
-                self._end_hotkey_capture()
+                if not keep_listening:
+                    self._end_hotkey_capture()
             return None
 
         # ---- Obj-C action selectors --------------------------------------
@@ -7237,9 +7492,14 @@ def _settings_controller_class():
                 return
             self._save("max_record_seconds", v)
             # Take effect WITHOUT a restart: the recording loop enforces
-            # FlowApp._MAX_RECORD_SECONDS, snapshotted once at launch.
+            # FlowApp._MAX_RECORD_SECONDS, snapshotted once at launch. Keep the
+            # pre-cap warning below the new cap too (the on-disk normalizer
+            # clamps it; the live value must follow, or a hand-set long warning
+            # would fire one second into every recording).
             try:
                 self._app._MAX_RECORD_SECONDS = float(v)
+                self._app._warn_before = min(
+                    float(self._app._warn_before), max(0.0, float(v) - 1.0))
             except Exception:  # noqa: BLE001
                 pass
 
@@ -7274,8 +7534,13 @@ def _settings_controller_class():
                 button_title="Save")
             if app is None:
                 return
-            if not update_correction(row.get("heard", ""), heard, correct,
-                                     context=context, app=app):
+            try:
+                ok = update_correction(row.get("heard", ""), heard, correct,
+                                       context=context, app=app)
+            except Exception as e:  # noqa: BLE001  disk full / unwritable dir
+                self._correction_edit_error(f"Couldn't save the correction: {e}")
+                return
+            if not ok:
                 self._correction_edit_error(
                     "Heard and correction must both be filled in, and they "
                     "cannot be the same.")
@@ -7316,12 +7581,78 @@ def _settings_controller_class():
                 self._update_hotkey_display()
 
         @objc.python_method
+        def _flag_restart_needed(self):
+            """The engine, language and speech model are loaded once at launch.
+            Say so at the moment one of them changes, where the user is looking,
+            instead of leaving a control that shows a value the running app is
+            not using yet."""
+            note = self._model_note
+            if note is None:
+                return
+            try:
+                note.setStringValue_("Restart früt Flow to apply this change "
+                                     "(menu bar ▸ Restart).")
+                note.setTextColor_(ACCENT_TXT)
+            except Exception:  # noqa: BLE001
+                pass
+
+        @objc.python_method
+        def apply_backend(self, value):
+            self._save("transcribe_backend", value)
+            self._flag_restart_needed()
+
+        @objc.python_method
+        def apply_cleanup(self, value):
+            self._save("cleanup", value)
+            # "On-device" needs the ~1 GB repair model. Start loading it NOW in
+            # the background rather than inside the user's next dictation, where
+            # it used to hold the GPU lock with the HUD stuck on "Transcribing".
+            if value == "local":
+                try:
+                    self._app.request_repair_preload()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        @objc.python_method
+        def apply_normalize(self, on):
+            # switchToggled_ already persisted the key. The transcriber snapshots
+            # this flag when it is built, so without pushing it into the live
+            # engine the switch changed nothing until the next restart.
+            try:
+                self._app.transcriber.normalize = bool(on)
+            except Exception:  # noqa: BLE001
+                pass
+
+        @objc.python_method
         def apply_pkmodel(self, value):
             self._save("parakeet_model", PK_V3 if value == "v3" else PK_V2)
+            # Mirror of apply_language: the English-only v2 checkpoint cannot
+            # serve Auto/Español — at launch _resolve_parakeet_model would load v3
+            # anyway and this control would show a model that is not running.
+            # Choosing the English model therefore also chooses English, visibly.
+            if value != "v3" and str(
+                    self._cfg("language", "en") or "en").lower() != "en":
+                self._save("language", "en")
+                try:
+                    if self._lang_seg is not None:
+                        self._lang_seg.setSelectedSegment_(1)
+                except Exception:  # noqa: BLE001
+                    pass
+                print("[flow] English-only Parakeet v2 selected: spoken language "
+                      "set to English to match (takes effect after Restart).",
+                      flush=True)
+            self._flag_restart_needed()
 
         @objc.python_method
         def apply_language(self, value):
             self._save("language", value)
+            # A loaded multilingual Parakeet v3 serves every language as it is —
+            # it detects the speech language itself, and cleanup reads the live
+            # config — so only an English-only engine actually needs the restart.
+            tr = getattr(self._app, "transcriber", None)
+            if not (isinstance(tr, ParakeetTranscriber)
+                    and str(getattr(tr, "model_name", "")).endswith("-v3")):
+                self._flag_restart_needed()
             # Anything but forced-English needs the multilingual Parakeet v3
             # checkpoint (v2 is English-only and would produce garbage), so
             # flip the model along with the language — and keep the on-screen
@@ -8067,7 +8398,7 @@ def _popover_controller_class():
     from Cocoa import (
         NSObject, NSView, NSViewController, NSPopover, NSTextField, NSButton,
         NSImage, NSImageView, NSColor, NSBezierPath, NSTrackingArea,
-        NSMakeRect, NSMakeSize, NSInsetRect,
+        NSMakeRect, NSMakeSize, NSInsetRect, NSPointInRect,
         NSTextAlignmentCenter, NSTextAlignmentLeft, NSTextAlignmentRight,
         NSImageScaleProportionallyUpOrDown,
     )
@@ -8187,7 +8518,16 @@ def _popover_controller_class():
             except Exception:  # noqa: BLE001
                 pass
 
-        def mouseUp_(self, _ev):
+        def mouseUp_(self, ev):
+            # AppKit sends mouseUp to the view that took the mouseDown wherever
+            # the button is released. Only act when it is released over THIS row,
+            # so pressing "Quit" and dragging away to change your mind is a no-op.
+            try:
+                p = self.convertPoint_fromView_(ev.locationInWindow(), None)
+                if not NSPointInRect(p, self.bounds()):
+                    return
+            except Exception:  # noqa: BLE001  can't tell — behave as before
+                pass
             try:
                 self._ctl.performSelector_withObject_(self._sel, self)
             except Exception:  # noqa: BLE001
@@ -8719,6 +9059,10 @@ class FlowApp:
         self._last_runtime_recover_wall = 0.0
         self._wake_recovery_pending = False
         self._wake_pending_reason = ""
+        # Set by the DidWake notification and the clock-skew detector; cleared by
+        # a full recovery. A display wake WITHOUT this (screen saver, idle display
+        # sleep) rebuilds nothing — see _after_display_only_wake.
+        self._system_slept = False
         self._tap_lifecycle_lock = threading.Lock()
         self._tap_disabled_streak = 0  # consecutive watchdog checks finding it dead
         self._activity_token = None    # NSActivity assertion (App Nap opt-out)
@@ -8752,6 +9096,7 @@ class FlowApp:
         self._work_q: queue.Queue = queue.Queue(maxsize=5)
         self._wake_warm_token = object()
         self._wake_warm_event = threading.Event()
+        self._repair_preload_token = object()   # Settings switched cleanup to "local"
         self._processing_started: float | None = None  # set while the worker runs
         self._proc_warned = False
         # Auto-learn-from-edits: a handle on the field we last pasted into, so we
@@ -8813,7 +9158,6 @@ class FlowApp:
             return False
 
         old = self.hotkey_name
-        stop_hold_recording = False
         with self._state_lock:
             self.cfg["hotkey"] = name
             self.hotkey_name = name
@@ -8821,11 +9165,13 @@ class FlowApp:
             self._key_down = False
             self._locked = False
             self._last_toggle = 0.0
-            stop_hold_recording = (
-                self.cfg.get("mode") == "hold"
-                and (self.recorder.recording or self._capture_requested))
+            # Capturing a hotkey in Settings means the press also reached the
+            # live tap: in hold mode that leaves a capture latched on a key that
+            # no longer counts, in toggle mode it simply STARTED one. Stop
+            # either — nobody is dictating while they rebind the key.
+            stop_recording = self.recorder.recording or self._capture_requested
 
-        if stop_hold_recording:
+        if stop_recording:
             self._request_capture(False)
         # The popover bakes the hotkey chip into its content at build time.
         self._invalidate_popover()
@@ -8939,7 +9285,13 @@ class FlowApp:
             self._record_started = time.monotonic()
             self._warned_capture = False
         play("Tink", self.cfg)
-        print("[flow] ● recording...")
+        open_ms = getattr(self.recorder, "last_open_ms", None)
+        start_ms = getattr(self.recorder, "last_start_ms", None)
+        if open_ms is not None and start_ms is not None:
+            print(f"[flow] ● recording... (mic ready in {open_ms + start_ms:.0f} ms: "
+                  f"open {open_ms:.0f} + start {start_ms:.0f})")
+        else:
+            print("[flow] ● recording...")
         self._set_status("🔴", "● Listening…")
         # Lock in any edit you made to the LAST dictation — but do it OFF the Quartz
         # tap thread and AFTER the mic is already capturing. An Accessibility read of
@@ -9012,15 +9364,61 @@ class FlowApp:
             # Distinct cue so you know earlier text is still on its way.
             play("Morse", self.cfg, volume=self.cfg.get("ding_volume", 0.25))
 
+    def _preload_pipeline(self) -> None:
+        """Pay the one-time costs of the text pipeline now, on the worker, rather
+        than inside the user's first dictation: the English wordlist the
+        corrector consults, and — with on-device cleanup on — the repair model,
+        which used to load lazily during the FIRST paste after every launch
+        (2.5–3.5s of extra wait on that dictation). Priming it through the real
+        prompt for the frontmost app also fills the prefix KV cache, so even the
+        first dictation only prefills its own words. Best-effort: any failure
+        leaves the lazy path exactly as it was."""
+        try:
+            _english_words()
+        except Exception:  # noqa: BLE001
+            pass
+        if self.cfg.get("cleanup") != "local":
+            return
+        try:
+            t0 = time.monotonic()
+            already = _LOCAL_REPAIRER is not None
+            local_repair("Warm up.", self.cfg, {"app": _focused_app_name()},
+                         gpu_lock=self._transcribe_lock)
+            with self._transcribe_lock:
+                _clear_mlx_cache()
+            if not already:
+                print(f"[flow] repair model preloaded "
+                      f"({time.monotonic() - t0:.1f}s) — first dictation won't wait for it.",
+                      flush=True)
+        except Exception as e:  # noqa: BLE001  the first dictation retries lazily
+            print(f"[flow] repair model preload failed ({e}); it will load on "
+                  "first use instead.", flush=True)
+
+    def request_repair_preload(self) -> None:
+        """Settings just switched cleanup to 'local': load the repair model in the
+        background now, so the NEXT dictation does not sit on a ~1 GB download and
+        model load (under the GPU lock, with the HUD stuck on 'Transcribing')."""
+        try:
+            self._work_q.put_nowait(self._repair_preload_token)
+        except queue.Full:
+            pass   # the next dictation loads it lazily, as before
+
     def _transcription_worker(self) -> None:
         """Single long-lived consumer of the capture queue. Serializes transcription
         and pasting so two clips never overlap, without ever blocking capture."""
+        self._preload_pipeline()
         while True:
             item = self._work_q.get()
             if item is self._wake_warm_token:
                 try:
                     if self._wake_warm_event.is_set():
                         self._warm_models_after_wake()
+                finally:
+                    self._work_q.task_done()
+                continue
+            if item is self._repair_preload_token:
+                try:
+                    self._preload_pipeline()
                 finally:
                     self._work_q.task_done()
                 continue
@@ -9492,6 +9890,8 @@ class FlowApp:
             display_awake = _display_is_awake()
             if skew > 15.0:
                 reason = f"system slept ~{skew:.0f}s"
+                with self._state_lock:
+                    self._system_slept = True
                 if display_awake:
                     self._recover_after_wake(reason, visible=True)
                 else:
@@ -9918,6 +10318,7 @@ class FlowApp:
                 self._last_recover_wall = now_wall
             if runtime:
                 self._last_runtime_recover_wall = now_wall
+                self._system_slept = False
             self._wake_recovery_pending = False
             self._wake_pending_reason = ""
 
@@ -9943,6 +10344,48 @@ class FlowApp:
               flush=True)
         self._request_model_warmup()
         self._schedule_audio_refresh()
+
+    def _on_system_did_wake(self) -> None:
+        """NSWorkspaceDidWake: the Mac slept. It also fires for closed-lid
+        maintenance DarkWakes — recovery checks the real display state and
+        defers all native teardown while the display is dark."""
+        with self._state_lock:
+            self._system_slept = True
+        self._recover_after_wake("mac woke from sleep")
+
+    def _on_screens_did_wake(self) -> None:
+        """NSWorkspaceScreensDidWake fires for EVERY display wake: after a system
+        sleep (lid open — rebuild everything) but also after a mere screen-saver
+        or idle display sleep, which dozens of times a day used to trigger a
+        tap rebuild plus a GPU warm-up for nothing."""
+        with self._state_lock:
+            slept = self._system_slept or self._wake_recovery_pending
+        if slept:
+            self._recover_after_wake("displays woke (lid open?)", visible=True)
+        else:
+            self._after_display_only_wake()
+
+    def _after_display_only_wake(self) -> None:
+        """The display came back but the Mac never slept (screen saver, idle
+        display sleep, wake-to-unlock). That leaves the taps' mach ports and the
+        resident models untouched, so the full rebuild + GPU warm-up + PortAudio
+        reset the system-wake path runs is wasted work here — and it used to
+        cancel a dictation whose hotkey press was what woke the screen. Only make
+        sure the taps are still enabled; the watchdog escalates if that doesn't
+        stick. Main thread (wake notifications are delivered on the main queue)."""
+        try:
+            import Quartz
+            fixed = []
+            for name, tap in (("hotkey", self._tap), ("lock", self._lock_tap)):
+                if tap is not None and not Quartz.CGEventTapIsEnabled(tap):
+                    Quartz.CGEventTapEnable(tap, True)
+                    fixed.append(name)
+            what = (f"re-enabled the {' + '.join(fixed)} tap" if fixed
+                    else "taps healthy, nothing to rebuild")
+            print(f"[flow] displays woke without a system sleep — {what}.",
+                  flush=True)
+        except Exception:  # noqa: BLE001  the watchdog still checks every second
+            pass
 
     def _perform_wake_recovery(self, reason: str, *, runtime: bool) -> None:
         """Main-thread half of visible-wake recovery."""
@@ -10175,12 +10618,10 @@ class FlowApp:
             nc = NSWorkspace.sharedWorkspace().notificationCenter()
 
             def _on_wake(_note):
-                # DidWake also fires for closed-lid maintenance DarkWakes. Check
-                # actual display state and defer all native teardown while hidden.
-                self._recover_after_wake("mac woke from sleep")
+                self._on_system_did_wake()
 
             def _on_screens_wake(_note):
-                self._recover_after_wake("displays woke (lid open?)", visible=True)
+                self._on_screens_did_wake()
 
             # Deliver on the main queue because Quartz run-loop source changes are
             # main-thread lifecycle work. Both wake signals are coalesced into one
@@ -10237,9 +10678,11 @@ class FlowApp:
         """Transcribe an audio FILE with the app's already-loaded engine + the full
         cleanup/vocab pipeline. Returns (text, error_message). Reuses self.transcriber
         (no second model load) and serializes with the live mic path via a lock."""
-        audio = _load_audio_file(path)
+        errors: list[str] = []
+        audio = _load_audio_file(path, errors=errors)
         if audio is None:
-            return None, "Couldn't read that audio file (unsupported format or corrupt)."
+            why = errors[0] if errors else "unsupported format or corrupt"
+            return None, f"Couldn't read that audio file ({why})."
         if len(audio) / SAMPLE_RATE < 0.05:
             return None, "That file has essentially no audio."
         prompt = hotwords = None
@@ -10546,17 +10989,25 @@ def ensure_microphone_access() -> None:
               flush=True)
 
 
-def _load_audio_file(path: str) -> np.ndarray | None:
+def _load_audio_file(path: str, errors: list | None = None) -> np.ndarray | None:
     """Load any audio file macOS can read into a 16 kHz mono float32 array — the same
     format the mic path produces. Uses `afconvert` (ships with macOS) to normalize
     sample rate / channels / codec, so wav, aiff, caf, m4a, mp3, etc. all work without
-    ffmpeg. Returns None (with a message) if the file is missing or unreadable."""
+    ffmpeg. Returns None (with a message) if the file is missing or unreadable; the
+    message is also appended to `errors` when a list is given, so a window can show
+    the actual reason instead of a generic one."""
     import wave
     import tempfile
+
+    def _fail(msg: str):
+        print(f"[flow] {msg}")
+        if errors is not None:
+            errors.append(msg)
+        return None
+
     src = Path(path).expanduser()
     if not src.exists():
-        print(f"[flow] file not found: {src}")
-        return None
+        return _fail(f"file not found: {src}")
     # mkstemp gives a fresh 0600 file with an unpredictable name (O_EXCL), so a
     # local attacker can't pre-plant a symlink at a guessable /tmp path.
     _fd, _tmp = tempfile.mkstemp(prefix="frutflow_in_", suffix=".wav")
@@ -10571,12 +11022,12 @@ def _load_audio_file(path: str) -> np.ndarray | None:
             raw = w.readframes(w.getnframes())
         return np.frombuffer(raw, np.int16).astype(np.float32) / 32768.0
     except FileNotFoundError:
-        print("[flow] 'afconvert' not found (expected on macOS); cannot read this file.")
-        return None
+        return _fail("'afconvert' not found (expected on macOS); cannot read this file.")
     except subprocess.CalledProcessError as e:
         msg = (e.stderr or b"").decode(errors="ignore").strip()[:200]
-        print(f"[flow] could not decode {src.name}: {msg or 'unsupported format'}")
-        return None
+        return _fail(f"could not decode {src.name}: {msg or 'unsupported format'}")
+    except (OSError, wave.Error, ValueError) as e:
+        return _fail(f"could not read {src.name}: {e}")
     finally:
         try:
             tmp.unlink()
@@ -10879,25 +11330,15 @@ def main() -> int:
         return 0
 
     cfg = load_config()
-    try:
-        transcriber = build_transcriber(cfg)
-    except ModuleNotFoundError as e:
-        print(f"[flow] missing dependency: {e.name}\n"
-              f"       install requirements first:  pip install -r requirements.txt")
-        return 1
-    except Exception as e:  # noqa: BLE001
-        # e.g. offline with an empty model cache. Exit cleanly instead of
-        # letting the raw traceback feed the watchdog's relaunch loop forever.
-        print(f"[flow] could not load a transcription engine: {e}\n"
-              f"       Check your network for the one-time model download, "
-              f"then relaunch früt Flow.", flush=True)
-        return 1
 
     # Single-instance guard for the LONG-RUNNING app only (one-shot commands
     # like --transcribe stay usable while the app runs). Launching from
     # Terminal while the installed .app is already live would otherwise give
     # TWO hotkey listeners typing every dictation twice. flock releases
     # automatically when the process dies, so a crash can never wedge it.
+    # Taken BEFORE the model load: a duplicate launch (watchdog, a second
+    # double-click) used to spend seconds loading Parakeet onto the GPU just
+    # to discover it should exit.
     global _INSTANCE_LOCK_FD
     try:
         import fcntl
@@ -10912,6 +11353,20 @@ def main() -> int:
         return 0
     except Exception:  # noqa: BLE001  best-effort guard, never fatal
         pass
+
+    try:
+        transcriber = build_transcriber(cfg)
+    except ModuleNotFoundError as e:
+        print(f"[flow] missing dependency: {e.name}\n"
+              f"       install requirements first:  pip install -r requirements.txt")
+        return 1
+    except Exception as e:  # noqa: BLE001
+        # e.g. offline with an empty model cache. Exit cleanly instead of
+        # letting the raw traceback feed the watchdog's relaunch loop forever.
+        print(f"[flow] could not load a transcription engine: {e}\n"
+              f"       Check your network for the one-time model download, "
+              f"then relaunch früt Flow.", flush=True)
+        return 1
 
     app = FlowApp(cfg, transcriber)
     # The mic TCC prompt can only be presented by a bona-fide app. In classic /

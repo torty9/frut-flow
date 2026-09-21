@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -345,6 +346,74 @@ class SpanishUndoPhraseTests(unittest.TestCase):
     def test_borra_eso_retracts_previous_dictation(self):
         kept, prev_delete = flow.apply_undo("borra eso", flow.DEFAULT_CONFIG)
         self.assertEqual((kept, prev_delete), ("", 1))
+
+
+class FuzzyGuardTests(unittest.TestCase):
+    """The phonetic corrector snaps misheard NAMES to learned spellings. It must
+    never rewrite an ordinary word the user actually said: with the terms
+    ["GitHub", "CLI", "iPhone"] it used to turn "call" into "CLI" and "phone"
+    into "iPhone" in everyday dictation."""
+
+    WORDS = frozenset("""call cell clip clue phone fruit versal parcel give me
+        a my is dead fresh the deploy to now love ok she said short""".split())
+
+    def setUp(self):
+        if not flow.FUZZY_AVAILABLE:
+            self.skipTest("rapidfuzz/jellyfish not installed")
+        patcher = mock.patch.object(flow, "_english_words",
+                                    return_value=self.WORDS)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fix(self, text, terms):
+        return flow.fuzzy_correct_text(text, terms, 0.74)
+
+    def test_three_letter_acronym_is_never_a_fuzzy_target(self):
+        self.assertEqual(self.fix("give me a call", ["CLI"]), "give me a call")
+        self.assertEqual(self.fix("the Clip is short", ["CLI"]),
+                         "the Clip is short")
+
+    def test_lowercase_dictionary_word_is_left_alone(self):
+        self.assertEqual(self.fix("my phone is dead", ["iPhone"]),
+                         "my phone is dead")
+        self.assertEqual(self.fix("fresh fruit", ["früt"]), "fresh fruit")
+
+    def test_capitalized_dictionary_word_opening_a_sentence_is_left_alone(self):
+        self.assertEqual(self.fix("Phone me later.", ["iPhone"]),
+                         "Phone me later.")
+        self.assertEqual(self.fix('"Phone me", she said', ["iPhone"]),
+                         '"Phone me", she said')
+        self.assertEqual(self.fix("Ok. Phone me", ["iPhone"]), "Ok. Phone me")
+
+    def test_capitalized_dictionary_word_mid_sentence_is_still_repaired(self):
+        # "versal" is a (rare) dictionary word, but the engine capitalized it
+        # mid-sentence — that is exactly how a misheard name is rendered.
+        self.assertEqual(self.fix("deploy to Versal now", ["Vercel"]),
+                         "deploy to Vercel now")
+
+    def test_non_dictionary_near_miss_is_repaired(self):
+        self.assertEqual(self.fix("I love Frut", ["früt"]), "I love Früt")
+
+    def test_no_dictionary_available_keeps_the_old_behaviour(self):
+        with mock.patch.object(flow, "_english_words", return_value=frozenset()):
+            self.assertEqual(self.fix("my phone is dead", ["iPhone"]),
+                             "my iPhone is dead")
+
+
+class CorrectionBoundaryTests(unittest.TestCase):
+    def test_taught_phrase_with_punctuation_matches_as_a_whole_word(self):
+        with mock.patch.object(flow, "load_corrections",
+                               return_value={"C++": "C++17", "früt.": "früt"}):
+            self.assertEqual(flow.apply_corrections("we use C++ daily"),
+                             "we use C++17 daily")
+            self.assertEqual(flow.apply_corrections("früt. is great"),
+                             "früt is great")
+
+    def test_inner_word_is_not_replaced(self):
+        with mock.patch.object(flow, "load_corrections",
+                               return_value={"art": "Art"}):
+            self.assertEqual(flow.apply_corrections("start the art class"),
+                             "start the Art class")
 
 
 class RegressionTests(unittest.TestCase):

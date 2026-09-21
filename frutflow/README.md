@@ -24,8 +24,12 @@ Three layers stack so you rarely have to fix anything — all **on-device, autom
    repairs. (`faster-whisper distil-large-v3` is still available as a CPU fallback.)
 2. **Phonetic proper-noun repair.** After transcription, near-miss words are
    snapped to your known vocabulary using sound-alike + edit-distance matching
-   ("Versal" → "Vercel", "Frut" → "früt"), with guards so real words like
-   *versatile* or *Boston* are never touched.
+   ("Versal" → "Vercel", "Frut" → "früt"), with guards so real words are never
+   touched: an ordinary dictionary word dictated as such ("phone", "call",
+   "fruit") is left alone, and three-letter acronyms are never fuzzy targets
+   (say "call" with "CLI" in your vocabulary and you still get "call"). Want a
+   real word remapped anyway ("fruit" → "früt")? Teach it explicitly — exact
+   taught corrections always apply.
 3. **Automatic learning from your edits.** When you fix a word right after it's
    pasted, früt Flow notices, confirms it's a genuine mis-hear (not a change of
    mind) by how similar the two words *sound*, and learns it — so it never gets
@@ -102,10 +106,16 @@ notarized `.dmg` or `.pkg` with an Apple Developer account.
 ```bash
 brew install portaudio
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.lock   # exact, tested-together versions (Python 3.12)
+                                   # …or requirements.txt for the ">=" floors
 python flow.py --setup
 python flow.py
 ```
+
+`requirements.txt` says *what* früt Flow needs; `requirements.lock` records the
+exact versions it is developed against. `run.sh` installs from the lock whenever
+the venv's Python matches the one named in the lock's header, so a new install
+gets a known-good combination rather than whatever resolves that day.
 
 ## Grant macOS permissions (one-time)
 
@@ -125,7 +135,11 @@ After granting, **fully quit and reopen** that program.
 3. **Hold Right Option, speak, then release.** A second later the cleaned-up
    text is pasted at your cursor.
 
-Quit with `Ctrl-C`.
+Quit with `Ctrl-C`. (If you installed with `Install frut Flow.command`, the
+app also starts at login and a small watchdog relaunches it if it ever dies;
+use the menu-bar **Quit** or **`Quit frutflow.command`** to stop it, and drag
+`~/Applications/frutflow.app` to the Trash to uninstall — the watchdog stops
+on its own once the app is gone.)
 
 ## Languages (English, Spanish, and 23 more)
 
@@ -197,7 +211,7 @@ Edit `~/.flowdictate/config.json` (see `config.example.json`, or use the in-app
 
 | Key | Default | Notes |
 |---|---|---|
-| `hotkey` | `"alt_r"` | Use Settings ▸ Dictation ▸ **Change**, then press the single key you want. Regular keys are stored as `vk:N`; modifier names like `alt`, `cmd`, `ctrl`, `shift`, or `cmd_r` also work in JSON. |
+| `hotkey` | `"alt_r"` | Use Settings ▸ Dictation ▸ **Change**, then press the single key you want: a modifier, a function key, a keypad key. Keys you *type* with (letters, digits, Space, Return, Tab, Delete, arrows) are refused there, because a non-modifier hotkey is consumed system-wide and would stop typing in every app. Regular keys are stored as `vk:N`; modifier names like `alt`, `cmd`, `ctrl`, `shift`, or `cmd_r` also work in JSON — and JSON still accepts any `vk:N` if you really want one. |
 | `mode` | `"hold"` | `"hold"` = push-to-talk · `"toggle"` = tap to start/stop |
 | `transcribe_backend` | `"parakeet"` | `"parakeet"` (NVIDIA Parakeet on the GPU — fastest, default) · `"local"` (faster-whisper on CPU). Both on-device. |
 | `language` | `"en"` | `"en"` · `"es"` · any ISO code · `"auto"` (detect per dictation). Non-English auto-selects a multilingual model. |
@@ -272,7 +286,10 @@ optional extra is a **fully on-device** cleanup step:
   cloud, no account, no API key. Everything it needs is already installed by
   `requirements.txt` — just set `"cleanup": "local"` (or pick **On-device** in
   Settings ▸ Model). The repair model (~0.9 GB) downloads once on first use,
-  then runs entirely on your Apple-Silicon GPU.
+  then runs entirely on your Apple-Silicon GPU. It is loaded in the background
+  right after launch, and the unchanging part of its prompt (instructions +
+  examples, ~600 tokens) stays cached on the GPU between dictations, so each
+  dictation only pays for its own words (~0.3 s saved per dictation).
 
 ## Troubleshooting
 
@@ -285,7 +302,8 @@ optional extra is a **fully on-device** cleanup step:
 | First dictation is slow after opening the lid | The current build automatically coalesces closed-lid maintenance wakes, refreshes audio once, and warms the model after a visible wake. Open `~/.flowdictate/flow.log` if this still repeats. |
 | Dictation feels slow | The default Parakeet backend is already sub-second/clip. If you switched to `"local"` (faster-whisper), that's the ~2–5 s CPU path — switch back to `"parakeet"`. |
 | It keeps misspelling a name | Just fix it once after it pastes — it learns the correction automatically. Or `./run.sh --correct "heard" "correct"`. |
-| A real word gets "corrected" | Raise `"fuzzy_threshold"` (e.g. `0.85`), or set `"fuzzy_correct": false`. |
+| A real word gets "corrected" | Dictionary words dictated as such are guarded; if a name-like token still snaps wrongly, raise `"fuzzy_threshold"` (e.g. `0.85`) or set `"fuzzy_correct": false`. |
+| The first dictation after launch is slow | With `"cleanup": "local"` the repair model is now preloaded right after start-up; if you dictate in those first seconds the clip simply waits for it (watch `flow.log` for "repair model preloaded"). |
 | Old clipboard isn't restored | `restore_clipboard` is on by default; if it misses on a slow Mac, set `"restore_clipboard": false` for dictation-only behavior. |
 | Transcription too aggressive | Set `"cleanup": "none"` to keep the raw engine output (your taught corrections still apply). |
 

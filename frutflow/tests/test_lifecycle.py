@@ -706,6 +706,395 @@ class CorrectionsEscapeTests(unittest.TestCase):
         self.assertEqual(out, "\\alpha then \\n")
 
 
+class DisplayWakeTests(unittest.TestCase):
+    """A display wake with no system sleep behind it (screen saver, idle display
+    sleep) must not rebuild the taps or warm the models; a real wake must."""
+
+    @staticmethod
+    def _app():
+        app = flow.FlowApp.__new__(flow.FlowApp)
+        app._state_lock = threading.RLock()
+        app._system_slept = False
+        app._wake_recovery_pending = False
+        app.full = []
+        app.light = []
+        app._recover_after_wake = (
+            lambda reason, **kw: app.full.append((reason, kw)) or True)
+        app._after_display_only_wake = lambda: app.light.append("light")
+        return app
+
+    def test_display_only_wake_takes_the_light_path(self):
+        app = self._app()
+        app._on_screens_did_wake()
+        self.assertEqual(app.full, [])
+        self.assertEqual(app.light, ["light"])
+
+    def test_display_wake_after_system_wake_recovers_fully(self):
+        app = self._app()
+        app._on_system_did_wake()
+        self.assertTrue(app._system_slept)
+        app._on_screens_did_wake()
+        self.assertEqual([r for r, _kw in app.full],
+                         ["mac woke from sleep", "displays woke (lid open?)"])
+        self.assertEqual(app.full[1][1], {"visible": True})
+        self.assertEqual(app.light, [])
+
+    def test_deferred_dark_wake_still_recovers_on_display_wake(self):
+        app = self._app()
+        app._wake_recovery_pending = True     # DidWake arrived while dark
+        app._on_screens_did_wake()
+        self.assertEqual(len(app.full), 1)
+        self.assertEqual(app.light, [])
+
+    def test_full_runtime_recovery_clears_the_slept_flag(self):
+        app = WakeRecoveryTests._app()
+        app._system_slept = True
+        with mock.patch.object(flow.time, "time", return_value=100.0):
+            self.assertTrue(app._recover_after_wake(
+                "display woke", visible=True, runtime=True))
+        self.assertFalse(app._system_slept)
+
+    def test_light_path_reenables_a_disabled_tap_only(self):
+        app = flow.FlowApp.__new__(flow.FlowApp)
+        app._tap, app._lock_tap = object(), object()
+        enabled = {app._tap: False, app._lock_tap: True}
+        fake_quartz = types.SimpleNamespace(
+            CGEventTapIsEnabled=lambda t: enabled[t],
+            CGEventTapEnable=lambda t, on: enabled.__setitem__(t, on))
+        with mock.patch.dict(sys.modules, {"Quartz": fake_quartz}), \
+                redirect_stdout(io.StringIO()) as out:
+            app._after_display_only_wake()
+        self.assertTrue(enabled[app._tap])
+        self.assertIn("re-enabled the hotkey tap", out.getvalue())
+
+
+class RebindHotkeyTests(unittest.TestCase):
+    def _app(self, mode):
+        app = flow.FlowApp.__new__(flow.FlowApp)
+        app._state_lock = threading.RLock()
+        app.cfg = {"mode": mode, "hotkey": "alt_r"}
+        app.hotkey_name = "alt_r"
+        app.target_vks = {61}
+        app._key_down = True
+        app._locked = False
+        app._last_toggle = 0.0
+        app.recorder = types.SimpleNamespace(recording=False)
+        app._capture_requested = True      # the captured press started a capture
+        app.stops = []
+        app._request_capture = lambda begin: app.stops.append(begin)
+        app._invalidate_popover = lambda: None
+        return app
+
+    def test_rebind_in_toggle_mode_stops_the_capture_the_press_started(self):
+        app = self._app("toggle")
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(app.apply_hotkey("vk:49"))
+        self.assertEqual(app.stops, [False])
+        self.assertEqual(app.target_vks, {49})
+        self.assertFalse(app._key_down)
+
+    def test_rebind_in_hold_mode_still_stops_it(self):
+        app = self._app("hold")
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(app.apply_hotkey("cmd_r"))
+        self.assertEqual(app.stops, [False])
+
+
+class HotkeyCaptureGuardTests(unittest.TestCase):
+    """The Settings capture must refuse keys you type with: a non-modifier
+    hotkey is consumed system-wide, so Space/Return/a letter would stop typing
+    in every app."""
+
+    def test_typing_keys_are_refused(self):
+        for vk, label in ((49, "Space"), (36, "Return"), (48, "Tab"),
+                          (51, "Delete"), (0, "A"), (18, "1"), (50, "`"),
+                          (76, "Enter"), (117, "Forward Delete"),
+                          (123, "Left Arrow")):
+            problem = flow._hotkey_capture_problem(vk)
+            self.assertIsNotNone(problem, f"vk {vk} ({label}) should be refused")
+            self.assertTrue(problem.startswith(label), problem)
+
+    def test_modifiers_function_keys_and_keypad_are_fine(self):
+        for vk in (61, 58, 54, 55, 59, 62, 56, 60,     # modifiers, both sides
+                   57, 63,                             # Caps Lock, Fn/Globe
+                   122, 120, 105, 107, 113,            # F1, F2, F13, F14, F15
+                   82, 65, 67,                         # keypad 0 . *
+                   10,                                 # ISO section key
+                   115, 119, 116, 121):                # Home End PgUp PgDn
+            self.assertIsNone(flow._hotkey_capture_problem(vk), f"vk {vk}")
+
+    def test_config_file_still_accepts_any_key(self):
+        # The guard is a Settings-UI courtesy, not a config restriction.
+        self.assertTrue(flow._valid_hotkey("vk:49"))
+        self.assertEqual(flow._normalize_config({"hotkey": "vk:49"})["hotkey"],
+                         "vk:49")
+
+
+class RecorderTimingTests(unittest.TestCase):
+    def test_open_and_start_are_timed_separately(self):
+        rec = flow.Recorder.__new__(flow.Recorder)
+        rec.sample_rate = flow.SAMPLE_RATE
+        rec._callback = lambda *a: None
+        started = []
+
+        class FakeStream:
+            def start(self):
+                started.append(True)
+
+        rec._sd = types.SimpleNamespace(InputStream=lambda **kw: FakeStream())
+        clock = iter([10.000, 10.060, 10.085])
+        with mock.patch.object(flow.time, "monotonic", side_effect=lambda: next(clock)):
+            stream = rec._open_stream()
+        self.assertIsInstance(stream, FakeStream)
+        self.assertEqual(started, [True])
+        self.assertAlmostEqual(rec.last_open_ms, 60.0, places=3)
+        self.assertAlmostEqual(rec.last_start_ms, 25.0, places=3)
+
+
+class ClipboardRestoreTests(unittest.TestCase):
+    """Two dictations inside the 2 s restore window must give the user back
+    their ORIGINAL clipboard — not the first dictation's text."""
+
+    class FakePasteboard:
+        def __init__(self, initial):
+            self.text, self.count = initial, 1
+
+        def set(self, text):
+            self.text, self.count = text, self.count + 1
+            return self.count
+
+        def snapshot(self):
+            return ("text", self.text) if self.text else None
+
+        def restore(self, snap):
+            return self.set(snap[1])
+
+    class FakeTimer:
+        pending = []
+
+        def __init__(self, delay, fn):
+            self.delay, self.fn, self.cancelled = delay, fn, False
+            ClipboardRestoreTests.FakeTimer.pending.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    def _patched(self, pb):
+        self.FakeTimer.pending.clear()
+        flow._CLIP_PENDING = None
+        self.addCleanup(setattr, flow, "_CLIP_PENDING", None)
+        stack = [
+            mock.patch.object(flow, "_ax_trusted", return_value=True),
+            mock.patch.object(flow, "_secure_input_active", return_value=False),
+            mock.patch.object(flow, "_send_paste"),
+            mock.patch.object(flow, "_clip_set", side_effect=pb.set),
+            mock.patch.object(flow, "_clip_snapshot", side_effect=pb.snapshot),
+            mock.patch.object(flow, "_clip_change_count",
+                              side_effect=lambda: pb.count),
+            mock.patch.object(flow, "_clip_restore", side_effect=pb.restore),
+            mock.patch.object(flow.threading, "Timer", self.FakeTimer),
+        ]
+        for p in stack:
+            p.start()
+            self.addCleanup(p.stop)
+
+    CFG = {"insert_method": "paste", "restore_clipboard": True}
+
+    def test_single_paste_restores_the_original(self):
+        pb = self.FakePasteboard("ORIGINAL")
+        self._patched(pb)
+        self.assertTrue(flow.insert_text(" first", self.CFG))
+        self.assertEqual(pb.text, " first")
+        self.FakeTimer.pending[0].fn()
+        self.assertEqual(pb.text, "ORIGINAL")
+        self.assertIsNone(flow._CLIP_PENDING)
+
+    def test_rapid_second_dictation_keeps_the_original_clipboard(self):
+        pb = self.FakePasteboard("ORIGINAL")
+        self._patched(pb)
+        flow.insert_text(" first", self.CFG)
+        flow.insert_text(" second", self.CFG)   # before the first restore fired
+        timers = list(self.FakeTimer.pending)
+        self.assertEqual(len(timers), 2)
+        self.assertTrue(timers[0].cancelled)
+        self.assertEqual(pb.text, " second")
+        timers[1].fn()
+        self.assertEqual(pb.text, "ORIGINAL")   # not " first"
+
+    def test_restore_is_skipped_when_someone_else_copied_meanwhile(self):
+        pb = self.FakePasteboard("ORIGINAL")
+        self._patched(pb)
+        flow.insert_text(" first", self.CFG)
+        pb.set("USER COPIED THIS")
+        self.FakeTimer.pending[0].fn()
+        self.assertEqual(pb.text, "USER COPIED THIS")
+
+    def test_second_paste_after_a_user_copy_snapshots_the_new_clipboard(self):
+        pb = self.FakePasteboard("ORIGINAL")
+        self._patched(pb)
+        flow.insert_text(" first", self.CFG)
+        pb.set("USER COPIED THIS")
+        flow.insert_text(" second", self.CFG)
+        timers = list(self.FakeTimer.pending)
+        self.assertFalse(timers[0].cancelled)   # not ours any more: left alone
+        timers[0].fn()                          # count moved on: no-op
+        timers[1].fn()
+        self.assertEqual(pb.text, "USER COPIED THIS")
+
+
+class RepairPromptCacheTests(unittest.TestCase):
+    """_LocalRepairer.generate_chat must feed the model only the tokens that
+    follow the cached prefix, keep exactly the prefix resident afterwards, and
+    fall back to a plain uncached call on any surprise."""
+
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, add_generation_prompt=False,
+                                tokenize=False):
+            toks = []
+            for m in messages:
+                base = (hash((m["role"], m["content"])) & 0xFFF) + 1
+                toks += [base, base + 1, base + 2]
+            if add_generation_prompt:
+                toks.append(7)
+            return toks if tokenize else "T:" + ",".join(map(str, toks))
+
+    class FakeKV:
+        def __init__(self):
+            self.offset = 0
+
+        def is_trimmable(self):
+            return True
+
+        def trim(self, n):
+            n = min(self.offset, n)
+            self.offset -= n
+            return n
+
+        def __len__(self):
+            return self.offset
+
+        @property
+        def state(self):
+            return []
+
+    class FakeCacheMod:
+        def __init__(self):
+            self.made = 0
+
+        def make_prompt_cache(self, model):
+            self.made += 1
+            return [RepairPromptCacheTests.FakeKV()]
+
+        def can_trim_prompt_cache(self, cache):
+            return True
+
+        def trim_prompt_cache(self, cache, n):
+            return [c.trim(n) for c in cache][0]
+
+        def cache_length(self, cache):
+            return max(len(c) for c in cache)
+
+    def _repairer(self):
+        rep = flow._LocalRepairer.__new__(flow._LocalRepairer)
+        rep.repo_id = "fake"
+        rep.model = object()
+        rep.tokenizer = self.FakeTokenizer()
+        rep._make_sampler = lambda temp: None
+        rep._cache_mod = self.FakeCacheMod()
+        rep._cache = None
+        rep._cache_tokens = []
+        rep.calls = []
+
+        def fake_generate(model, tokenizer, prompt, *, max_tokens, sampler=None,
+                          verbose=False, prompt_cache=None):
+            rep.calls.append((prompt, prompt_cache is not None))
+            if prompt_cache is not None:
+                prompt_cache[0].offset += len(prompt) + 5   # prompt + answer
+            return "fixed"
+        rep._generate = fake_generate
+        fake_mx = types.SimpleNamespace(eval=lambda *a, **k: None)
+        patcher = mock.patch.dict(sys.modules, {"mlx": types.SimpleNamespace(core=fake_mx),
+                                                "mlx.core": fake_mx})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return rep
+
+    @staticmethod
+    def _messages(system, user):
+        return ([{"role": "system", "content": system}]
+                + [{"role": "user", "content": "peer"},
+                   {"role": "assistant", "content": "pier"}]
+                + [{"role": "user", "content": user}])
+
+    def test_same_prefix_only_feeds_the_new_user_turn(self):
+        rep = self._repairer()
+        tok = rep.tokenizer
+        m1 = self._messages("sys A", "hello there")
+        m2 = self._messages("sys A", "another sentence")
+        self.assertEqual(rep.generate_chat(m1, max_tokens=8, temp=0.0), "fixed")
+        full1 = tok.apply_chat_template(m1, add_generation_prompt=True, tokenize=True)
+        prefix = tok.apply_chat_template(m1[:-1], tokenize=True)
+        self.assertEqual(rep.calls[0], (full1, True))       # cold: everything
+        self.assertEqual(rep._cache_tokens, prefix)
+        self.assertEqual(len(rep._cache[0]), len(prefix))   # answer trimmed off
+
+        rep.generate_chat(m2, max_tokens=8, temp=0.0)
+        full2 = tok.apply_chat_template(m2, add_generation_prompt=True, tokenize=True)
+        self.assertEqual(rep.calls[1], (full2[len(prefix):], True))
+        self.assertEqual(len(rep._cache[0]), len(prefix))
+        self.assertEqual(rep._cache_mod.made, 1)
+
+    def test_changed_system_prompt_refills_from_the_common_prefix(self):
+        rep = self._repairer()
+        rep.generate_chat(self._messages("sys A", "one"), max_tokens=8, temp=0.0)
+        m3 = self._messages("sys B", "two")
+        rep.generate_chat(m3, max_tokens=8, temp=0.0)
+        full3 = rep.tokenizer.apply_chat_template(
+            m3, add_generation_prompt=True, tokenize=True)
+        self.assertEqual(rep.calls[1], (full3, True))       # nothing shared: refill
+        prefix3 = rep.tokenizer.apply_chat_template(m3[:-1], tokenize=True)
+        self.assertEqual(rep._cache_tokens, prefix3)
+
+    def test_without_cache_module_plain_string_prompt_is_used(self):
+        rep = self._repairer()
+        rep._cache_mod = None
+        m = self._messages("sys A", "one")
+        rep.generate_chat(m, max_tokens=8, temp=0.0)
+        expected = rep.tokenizer.apply_chat_template(
+            m, add_generation_prompt=True, tokenize=False)
+        self.assertEqual(rep.calls, [(expected, False)])
+
+    def test_cache_failure_falls_back_and_resets(self):
+        rep = self._repairer()
+        rep.generate_chat(self._messages("sys A", "one"), max_tokens=8, temp=0.0)
+
+        def boom(cache, n):
+            raise RuntimeError("cache api drift")
+        rep._cache_mod.trim_prompt_cache = boom
+        m = self._messages("sys A", "two")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(rep.generate_chat(m, max_tokens=8, temp=0.0), "fixed")
+        self.assertEqual(rep.calls[-1][1], False)            # uncached
+        self.assertIsInstance(rep.calls[-1][0], str)
+        self.assertIsNone(rep._cache)
+        self.assertEqual(rep._cache_tokens, [])
+
+
+class HistoryLoadTests(unittest.TestCase):
+    def test_malformed_numeric_fields_are_coerced(self):
+        entries = [{"text": "hello there", "ts": "soon", "words": "twelve"},
+                   {"text": "ok", "ts": 1.5, "words": 1, "delivered": 0}]
+        with mock.patch.object(flow, "_read_json", return_value=entries):
+            hist = flow.load_history()
+        self.assertEqual(hist[1]["words"], 2)       # recomputed from the text
+        self.assertEqual(hist[1]["ts"], 0.0)
+        self.assertEqual(hist[0]["words"], 1)
+        self.assertFalse(hist[0]["delivered"])
+
+
 class DefaultConfigWriteTests(unittest.TestCase):
     """--setup runs write_default_config on every install/update; it must never
     clobber an existing, possibly hand-tuned config.json."""

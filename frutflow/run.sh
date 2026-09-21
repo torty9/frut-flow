@@ -28,8 +28,11 @@ if ! command -v brew >/dev/null 2>&1; then
   exit 1
 fi
 
-# PortAudio is the native library sounddevice binds to.
-if ! brew list portaudio >/dev/null 2>&1; then
+# PortAudio is the native library sounddevice binds to. Check for the library
+# file first: `brew list` boots Ruby (~1s) and used to run on EVERY launch.
+BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
+if [ ! -e "$BREW_PREFIX/opt/portaudio/lib/libportaudio.dylib" ] &&
+   ! brew list portaudio >/dev/null 2>&1; then
   echo "[run] installing portaudio via Homebrew..."
   brew install portaudio
 fi
@@ -50,14 +53,30 @@ if [ ! -x "$VENV_PY" ]; then
   python3 -m venv "$VENV_DIR"
 fi
 
-REQ_HASH="$(/usr/bin/shasum -a 256 "$REQ" | /usr/bin/awk '{print $1}')"
+# Prefer the lock file (exact, verified-together versions) when this venv's
+# Python is the one it was frozen for; otherwise fall back to the ">=" floors in
+# requirements.txt, which is what every install used to get.
+REQ_FILE="$REQ"
+LOCK="$SCRIPT_DIR/requirements.lock"
+if [ -f "$LOCK" ]; then
+  LOCK_PY="$(/usr/bin/sed -n 's/^# python: *//p' "$LOCK" | /usr/bin/head -n 1)"
+  VENV_PY_VER="$("$VENV_PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+  if [ -n "$LOCK_PY" ] && [ "$LOCK_PY" = "$VENV_PY_VER" ]; then
+    REQ_FILE="$LOCK"
+  else
+    echo "[run] requirements.lock is for Python ${LOCK_PY:-?} but this venv runs" \
+         "$VENV_PY_VER — using the requirements.txt floors instead."
+  fi
+fi
+
+REQ_HASH="$(/usr/bin/shasum -a 256 "$REQ_FILE" | /usr/bin/awk '{print $1}')"
 if [ ! -f "$REQ_STAMP" ] || [ "$(cat "$REQ_STAMP")" != "$REQ_HASH" ]; then
-  echo "[run] installing python deps..."
+  echo "[run] installing python deps from $(basename "$REQ_FILE")..."
   "$VENV_PY" -m pip install --quiet --upgrade pip
-  "$VENV_PY" -m pip install --quiet -r "$REQ"
+  "$VENV_PY" -m pip install --quiet -r "$REQ_FILE"
   printf '%s\n' "$REQ_HASH" > "$REQ_STAMP"
 else
-  echo "[run] python deps already match requirements.txt"
+  echo "[run] python deps already match $(basename "$REQ_FILE")"
 fi
 
 umask 077

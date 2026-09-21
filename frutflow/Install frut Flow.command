@@ -60,7 +60,14 @@ ensure_homebrew() {
     *) fail "Homebrew was not installed." ;;
   esac
 
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  # Download first, then run: with the download inline, a failed curl handed
+  # bash an EMPTY script, which "succeeded", and the user was told Homebrew had
+  # been installed but was missing from PATH.
+  local installer
+  installer="$(curl -fsSL --proto '=https' https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" ||
+    fail "Could not download the Homebrew installer (no network connection?)."
+  [ -n "$installer" ] || fail "The Homebrew installer download was empty."
+  /bin/bash -c "$installer"
   load_homebrew_path
   command -v brew >/dev/null 2>&1 ||
     fail "Homebrew installed, but brew is not available on PATH."
@@ -126,7 +133,10 @@ chmod 600 "$CODE_PTR"
 echo "Installing dependencies and writing the default config..."
 echo
 setup_args=(--setup)
-if enabled "$ENABLE_LOCAL_REPAIR"; then
+# Turn on on-device repair for a FRESH install only. Re-running the installer
+# to upgrade must not flip a user who deliberately switched cleanup back to
+# "basic" (and would otherwise re-download the ~1 GB repair model for them).
+if enabled "$ENABLE_LOCAL_REPAIR" && [ ! -f "$FLOWDICTATE_DIR/config.json" ]; then
   setup_args+=(--enable-local-repair)
 fi
 "$INSTALL_DIR/run.sh" "${setup_args[@]}"
@@ -153,6 +163,12 @@ create_app_bundle() {
       python_path="$(python3 -c 'import sys; print(sys.executable)')"
       cp -f "$python_path" "$APP/Contents/MacOS/python3"
       chmod +x "$APP/Contents/MacOS/python3"
+      # set-icon.py attaches the app icon as a Finder custom icon (an "Icon^M"
+      # file plus a FinderInfo xattr on the bundle). codesign refuses to sign a
+      # bundle carrying that ("Finder information, or similar detritus not
+      # allowed"), so strip it first; set-icon.py puts it back after this step.
+      xattr -d com.apple.FinderInfo "$APP" >/dev/null 2>&1 || true
+      rm -f "$APP/Icon"$'\r'
       if command -v codesign >/dev/null 2>&1; then
         codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
       fi
@@ -256,6 +272,12 @@ SP=""
 for cand in "$CODE_DIR"/.venv/lib/python*/site-packages; do
   [ -d "$cand" ] && SP="$cand" && break
 done
+if [ -z "$SP" ]; then
+  # Running without the virtualenv would only crash on the first import and
+  # feed the watchdog a relaunch loop; say what is wrong instead.
+  echo "[frutflow] No virtualenv under $CODE_DIR (.venv missing). Re-run Install frut Flow.command." >> "$LOG"
+  exit 1
+fi
 
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
 export DYLD_FALLBACK_LIBRARY_PATH="/opt/homebrew/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
@@ -278,18 +300,22 @@ LAUNCHER
 
 create_launch_agent() {
   mkdir -p "$HOME/Library/LaunchAgents"
-  python3 - "$AGENT" "$INSTALL_DIR/watchdog.sh" <<'PY'
+  python3 - "$AGENT" "$INSTALL_DIR/watchdog.sh" "$APP" <<'PY'
 import plistlib
 import sys
 from pathlib import Path
 
 agent_path = Path(sys.argv[1])
 watchdog = sys.argv[2]
+app_bundle = sys.argv[3]
 plist = {
     "Label": "com.frutflow.dictation",
     "ProgramArguments": ["/bin/bash", watchdog],
     "RunAtLoad": True,
-    "KeepAlive": True,
+    # Keep the watchdog alive only while frutflow.app exists. Dragging the app
+    # to the Trash is how Mac users uninstall; with a plain KeepAlive the agent
+    # kept relaunching a missing app at every login, forever.
+    "KeepAlive": {"PathState": {app_bundle: True}},
 }
 with agent_path.open("wb") as f:
     plistlib.dump(plist, f)

@@ -48,32 +48,124 @@ exec /bin/bash "$INSTALLER"
 INSTALLER
 
 cat > "$STAGE/READ ME FIRST.txt" <<'README'
-frut Flow - installation
+früt Flow — READ ME FIRST
+=========================
 
-Double-click:
-  Install frut Flow.command
+Thanks for trying früt Flow! It is a free voice-dictation app for your Mac.
+Hold a key, talk, let go, and your words are typed wherever your cursor is.
+Everything runs on your own Mac: no account, no subscription, and your voice
+never leaves your computer.
 
-The installer downloads and configures everything needed, including:
-- Homebrew and Python when they are not already installed
-- Python dependencies and PortAudio
-- Parakeet on-device speech recognition
-- Qwen on-device cleanup
 
-This disk image is not signed with an Apple Developer ID. If macOS blocks it:
-1. Try to open "Install frut Flow.command" once.
-2. Open System Settings > Privacy & Security.
-3. Scroll to Security and click Open Anyway.
-4. Confirm by clicking Open.
+BEFORE YOU START
+----------------
+You need:
 
-After installation, allow frutflow in Privacy & Security for:
-- Microphone
-- Accessibility
-- Input Monitoring
+- A Mac with an Apple chip (M1, M2, M3, M4 or newer). Intel Macs are not
+  supported. Apple menu > About This Mac shows which chip you have.
+- macOS 14 (Sonoma) or newer.
+- Internet during setup and about 3 to 5 GB of free disk space. Setup
+  downloads the speech models once; after that, dictation works offline.
+- Your Mac login password. The installer needs it once if it has to install
+  a helper tool called Homebrew.
 
-Requirements:
-- Apple Silicon Mac
-- macOS 14 (Sonoma) or newer
-- Internet access during installation
+Set aside 15 to 30 minutes. Almost all of it is waiting for downloads.
+
+
+INSTALL
+-------
+1. Open the disk image (double-click the .dmg file) if it is not open yet.
+   A window appears with this note and "Install frut Flow.command".
+
+2. Double-click "Install frut Flow.command".
+
+   macOS will most likely say it cannot verify the file, or that it could
+   not check it for malware. That is expected: this app was shared with you
+   by a friend, not downloaded from the App Store. To allow it:
+
+     a. Close the warning with "Done" or "OK". Do NOT choose "Move to Trash".
+     b. Open System Settings > Privacy & Security.
+     c. Scroll down to the "Security" section. It says
+        "Install frut Flow.command" was blocked. Click "Open Anyway".
+     d. Confirm with "Open". macOS may ask for your password or Touch ID.
+
+   Shortcut on macOS 14 (Sonoma): Control-click the file, choose "Open",
+   then click "Open" again in the dialog.
+
+3. A Terminal window opens and does the rest. Follow what it says:
+
+   - If it asks "Install Homebrew now? [y/N]", type  y  and press Return.
+     Homebrew asks for your Mac password (nothing shows while you type;
+     press Return when done) and asks you to press Return to continue.
+     It may also install Apple's command line tools, which can take a
+     while.
+   - The installer then sets up the app and downloads the speech models.
+     The window can look frozen for several minutes at a time. Leave it
+     alone and do not close it.
+   - When you see "Setup finished", press Return. früt Flow starts and a
+     microphone icon appears in the menu bar at the top right of the screen.
+
+4. Grant the three permissions it needs. A Welcome window opens the first
+   time and walks you through them, with a button for each. Or do it
+   yourself: open System Settings > Privacy & Security and turn on
+   "frutflow" under:
+
+     - Microphone         so it can hear you
+     - Accessibility      so it can type into other apps
+     - Input Monitoring   so it can notice you holding the dictation key
+
+   Afterwards, click the microphone icon in the menu bar and choose
+   "Restart" so the new permissions take effect.
+
+5. Done. You can close the Terminal window and eject the disk image.
+   Everything has been copied to your Mac.
+
+
+USING IT
+--------
+1. Click into any text box: a message, an email, a document, a search field.
+2. Press and HOLD the Right Option (⌥) key, speak, then let go.
+3. About a second later, your words appear at the cursor, cleaned up and
+   punctuated.
+
+Handy extras:
+
+- Say "period", "comma", "question mark", "new paragraph", or
+  "quote ... end quote" to punctuate.
+- Said something you did not mean? Hold the key and say "never mind". The
+  last dictation is deleted.
+- If it misspells a name, just fix it in the text. It learns from your edit
+  and gets it right next time.
+- The menu-bar icon has History, Teach a Word, Settings (change the key, the
+  language, and more), Restart, and Quit.
+- früt Flow starts by itself whenever you log in. To stop it, click the
+  menu-bar icon and choose "Quit früt Flow".
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+- Holding the key does nothing, or the menu-bar icon shows a warning sign:
+  turn on Input Monitoring for frutflow, then Restart from the menu-bar icon.
+- Nothing gets typed: turn on Accessibility for frutflow, then Restart.
+- Lost the Welcome window? Click the menu-bar icon and choose
+  "Welcome / Setup..." to open it again.
+- No microphone icon in the menu bar: in Finder choose Go > Home, open the
+  Applications folder there, and double-click frutflow. (This is the
+  Applications folder inside your home folder, not the main one.)
+- The install stopped with an error: simply double-click
+  "Install frut Flow.command" again. It is safe to re-run and it picks up
+  where it left off.
+- Still stuck? Click the menu-bar icon, choose "Open Log", and send that
+  log file to the person who gave you this.
+
+
+PRIVACY
+-------
+Speech recognition runs on your Mac's own chip. No audio and no text is ever
+sent anywhere. The one-time setup downloads open-source software and model
+files from the internet; after that, dictation works with Wi-Fi turned off.
+
+früt Flow is free and open source (MIT license).
 README
 
 chmod +x "$STAGE/$INSTALLER_NAME"

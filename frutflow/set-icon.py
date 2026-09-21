@@ -6,6 +6,12 @@ Input Monitoring). So instead of baking the icon into Contents/Resources + Info.
 (which would change the code signature), this uses the Finder custom-icon mechanism
 (NSWorkspace.setIcon), which attaches the icon to the bundle without touching the seal.
 
+This route also matters on macOS 26 (Tahoe): the glossy badge does not fill the
+system's rounded icon tile, so when it is served from Contents/Resources the Dock
+draws it shrunken on a grey backing plate. A Finder custom icon is drawn as-is,
+badge, glow and all. If the grey plate ever comes back, re-run this script and
+then `killall Dock`.
+
 Usage:  ./.venv/bin/python3 set-icon.py [path/to/icon.icns]
         (defaults to assets/frut-flow.icns next to this script)
 """

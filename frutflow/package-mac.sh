@@ -18,6 +18,7 @@ required=(
   "watchdog.sh"
   "set-icon.py"
   "requirements.txt"
+  "requirements.lock"
   "config.example.json"
   "README.md"
   "LICENSE"

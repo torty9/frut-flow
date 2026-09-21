@@ -12,6 +12,11 @@ pynput>=1.7.6
 numpy>=2.2.5                 # parakeet-mlx 0.5.2 minimum
 pyobjc-framework-AVFoundation>=10.0   # to request the macOS microphone prompt
 pyobjc-framework-Cocoa>=10.0          # NSWorkspace + AX reads + in-process NSPasteboard
+# flow.py imports these two directly (the CGEventTap hotkey, synthetic Cmd-V,
+# AXIsProcessTrusted). They currently arrive only as pynput's macOS extras;
+# declare them so a future pynput release can't silently drop them.
+pyobjc-framework-Quartz>=10.0
+pyobjc-framework-ApplicationServices>=10.0
 
 # Accuracy layer — phonetic + fuzzy proper-noun correction and auto-learning.
 # Small, pure-wheel installs. If missing, the app still runs (those features just
