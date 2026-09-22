@@ -6057,8 +6057,7 @@ def _history_controller_class():
     import objc
     from Cocoa import (
         NSObject, NSView, NSWindow, NSScrollView, NSStackView, NSTextField,
-        NSButton, NSImageView, NSSearchField, NSSearchFieldCell,
-        NSApplication, NSTrackingArea,
+        NSButton, NSImageView, NSApplication, NSTrackingArea,
         NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
         NSApplicationActivationPolicyRegular,
         NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
@@ -6121,31 +6120,6 @@ def _history_controller_class():
         if not name:
             return None
         return _APP_SYMBOLS.get(str(name).strip().lower())
-
-    # Our search field draws no bezel, so AppKit lays the magnifier and the text
-    # out with a bezel's insets it never actually draws — the magnifier lands on
-    # top of the placeholder/typed text ("Se⌕arch"). Place both rects by hand:
-    # magnifier hard left, text after it, a gap on the right for the cancel (×).
-    class _SearchCell(NSSearchFieldCell):
-        def searchButtonRectForBounds_(self, bounds):
-            side = 13.0
-            return NSMakeRect(
-                bounds.origin.x + 3.0,
-                bounds.origin.y + (bounds.size.height - side) / 2.0,
-                side, side)
-
-        def searchTextRectForBounds_(self, bounds):
-            left, right = 21.0, 18.0
-            return NSMakeRect(
-                bounds.origin.x + left, bounds.origin.y,
-                max(0.0, bounds.size.width - left - right), bounds.size.height)
-
-        def cancelButtonRectForBounds_(self, bounds):
-            side = 14.0
-            return NSMakeRect(
-                bounds.origin.x + bounds.size.width - side - 2.0,
-                bounds.origin.y + (bounds.size.height - side) / 2.0,
-                side, side)
 
     # A flipped document view so the stack lays out TOP-DOWN (AppKit's default
     # origin is bottom-left); the newest row ends up at the top.
@@ -6276,27 +6250,50 @@ def _history_controller_class():
                 NSMakeRect(tools_x, ctrl_y, SEARCH_W, BTN))
             sbox.setAutoresizingMask_(NSViewMinXMargin)
             G.fill(sbox, "CONTROL_FILL", "RIM", G.R_CONTROL)
-            # 19pt at y=3: the small cell's own height, which is what puts its
-            # text and its magnifier on the box's centre line.
-            search = NSSearchField.alloc().initWithFrame_(
-                NSMakeRect(3, 3, SEARCH_W - 6, 19))
-            try:
-                # Hand-laid rects (see _SearchCell) so the magnifier never draws
-                # over the text on this bezel-less field.
-                search.setCell_(_SearchCell.alloc().initTextCell_(""))
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                search.setControlSize_(1)      # NSControlSizeSmall: a 12pt magnifier
-            except Exception:  # noqa: BLE001
-                pass
+            # We lay the magnifier and the text field out ourselves rather than use
+            # NSSearchField: on modern macOS its magnifier is an internal SUBVIEW
+            # whose position ignores the cell's rect overrides, so on a bezel-less
+            # field it draws on top of the text. Our own glyph + a plain field with
+            # fixed frames can't overlap. ICON_X..ICON_X+ICON_W is the magnifier;
+            # the field starts after it.
+            ICON_X, ICON_W = 8.0, 13.0
+            TEXT_X = ICON_X + ICON_W + 5.0        # 26: clears the magnifier
+            mag = NSImageView.alloc().initWithFrame_(
+                NSMakeRect(ICON_X, (BTN - ICON_W) / 2.0, ICON_W, ICON_W))
+            magimg = _phosphor_sf("magnifyingglass", "Search", point=ICON_W)
+            if magimg is not None:
+                mag.setImage_(magimg)
+                mag.setImageScaling_(_SCALE_FIT)
+                try:
+                    mag.setContentTintColor_(G.white(0.35))
+                except Exception:  # noqa: BLE001
+                    pass
+            sbox.addSubview_(mag)
+
+            search = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(TEXT_X, 3, SEARCH_W - TEXT_X - 6, 19))
             search.setFont_(G.font(G.SECONDARY, G.REGULAR))
             search.setTextColor_(G.TEXT_1)
+            # A borderless field top-aligns its text, so a tall frame parks the
+            # text near the top of the box. Shrink the frame to one line's height
+            # (font metrics, not cellSize — that varies once a placeholder is set)
+            # and centre it on the box's mid-line, level with the glyph.
+            try:
+                _fnt = search.font()
+                _fh = round(_fnt.ascender() - _fnt.descender()) + 2.0
+            except Exception:  # noqa: BLE001
+                _fh = 16.0
+            search.setFrame_(NSMakeRect(
+                TEXT_X, (BTN - _fh) / 2.0, SEARCH_W - TEXT_X - 6, _fh))
             try:
                 search.setBezeled_(False)
                 search.setBordered_(False)
                 search.setDrawsBackground_(False)
                 search.setFocusRingType_(1)    # NSFocusRingTypeNone
+                search.setEditable_(True)
+                search.setSelectable_(True)
+                search.cell().setScrollable_(True)   # keep on one line, scroll it
+                search.cell().setWraps_(False)
             except Exception:  # noqa: BLE001
                 pass
             try:
