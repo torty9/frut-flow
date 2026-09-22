@@ -6057,7 +6057,8 @@ def _history_controller_class():
     import objc
     from Cocoa import (
         NSObject, NSView, NSWindow, NSScrollView, NSStackView, NSTextField,
-        NSButton, NSImageView, NSSearchField, NSApplication, NSTrackingArea,
+        NSButton, NSImageView, NSSearchField, NSSearchFieldCell,
+        NSApplication, NSTrackingArea,
         NSMakeRect, NSMakeSize, NSMakePoint, NSOperationQueue, NSTimer,
         NSApplicationActivationPolicyRegular,
         NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
@@ -6120,6 +6121,31 @@ def _history_controller_class():
         if not name:
             return None
         return _APP_SYMBOLS.get(str(name).strip().lower())
+
+    # Our search field draws no bezel, so AppKit lays the magnifier and the text
+    # out with a bezel's insets it never actually draws — the magnifier lands on
+    # top of the placeholder/typed text ("Se⌕arch"). Place both rects by hand:
+    # magnifier hard left, text after it, a gap on the right for the cancel (×).
+    class _SearchCell(NSSearchFieldCell):
+        def searchButtonRectForBounds_(self, bounds):
+            side = 13.0
+            return NSMakeRect(
+                bounds.origin.x + 3.0,
+                bounds.origin.y + (bounds.size.height - side) / 2.0,
+                side, side)
+
+        def searchTextRectForBounds_(self, bounds):
+            left, right = 21.0, 18.0
+            return NSMakeRect(
+                bounds.origin.x + left, bounds.origin.y,
+                max(0.0, bounds.size.width - left - right), bounds.size.height)
+
+        def cancelButtonRectForBounds_(self, bounds):
+            side = 14.0
+            return NSMakeRect(
+                bounds.origin.x + bounds.size.width - side - 2.0,
+                bounds.origin.y + (bounds.size.height - side) / 2.0,
+                side, side)
 
     # A flipped document view so the stack lays out TOP-DOWN (AppKit's default
     # origin is bottom-left); the newest row ends up at the top.
@@ -6255,15 +6281,13 @@ def _history_controller_class():
             search = NSSearchField.alloc().initWithFrame_(
                 NSMakeRect(3, 3, SEARCH_W - 6, 19))
             try:
-                search.setControlSize_(1)      # NSControlSizeSmall: a 12pt magnifier
+                # Hand-laid rects (see _SearchCell) so the magnifier never draws
+                # over the text on this bezel-less field.
+                search.setCell_(_SearchCell.alloc().initTextCell_(""))
             except Exception:  # noqa: BLE001
                 pass
             try:
-                # Left-align the magnifier + placeholder as one group. The default
-                # (centred) placeholder draws over the magnifier once the bezel is
-                # off, since AppKit then lays the icon and text rects out
-                # independently — that's the "Se⌕arch" overlap.
-                search.cell().setCentersPlaceholder_(False)
+                search.setControlSize_(1)      # NSControlSizeSmall: a 12pt magnifier
             except Exception:  # noqa: BLE001
                 pass
             search.setFont_(G.font(G.SECONDARY, G.REGULAR))
