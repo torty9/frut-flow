@@ -4900,17 +4900,34 @@ def _reresolve_layer_colors(appearance):
     _THEMED_LAYERS[:] = live
 
 
+# The identifier _apply_appearance stamps on a window, so a theme switch can find
+# the windows that carry an appearance of their own.
+_THEMED_WINDOW_ID = "frut.themed"
+
+
 def _apply_appearance(win):
-    """Theme one NSWindow per _APPEARANCE_PREF (None => system). Never raises."""
+    """Theme one NSWindow per _APPEARANCE_PREF (None => system) and mark it for
+    later theme switches. Never raises."""
     try:
         win.setAppearance_(_appearance_for(_APPEARANCE_PREF))
+        win.setIdentifier_(_THEMED_WINDOW_ID)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _pin_dark(win):
+    """Keep a window dark whatever the theme: for a window whose content is
+    pinned dark, so its title bar and traffic lights match it. Never raises."""
+    try:
+        win.setAppearance_(_appearance_for("dark"))
+        win.setIdentifier_("frut.pinned-dark")   # theme switches pass it by
     except Exception:  # noqa: BLE001
         pass
 
 
 def _set_appearance_pref(pref):
     """Change the global UI theme and apply it EVERYWHERE at once: the app-wide
-    appearance plus every open window (our glass windows carry a per-window
+    appearance plus every themed window (our glass windows carry a per-window
     appearance that overrides the app's, so they must be re-applied explicitly).
     Used by the Settings 'Appearance' control and at launch. Never raises."""
     global _APPEARANCE_PREF
@@ -4921,8 +4938,12 @@ def _set_appearance_pref(pref):
         ap = _appearance_for(_APPEARANCE_PREF)
         app.setAppearance_(ap)
         for w in app.windows():
+            # Only the windows _apply_appearance themed. Alerts, panels and the
+            # HUD follow the app's appearance on their own; the popover and the
+            # windows pinned dark must keep the one they were given.
             try:
-                w.setAppearance_(ap)
+                if w.identifier() == _THEMED_WINDOW_ID:
+                    w.setAppearance_(ap)
             except Exception:  # noqa: BLE001
                 pass
         # Layer CGColors carry no appearance, so re-resolve every registered
@@ -5429,7 +5450,7 @@ def _transcribe_controller_class():
         NSTextField, NSImageView, NSProgressIndicator, NSBezierPath,
         NSOpenPanel, NSSavePanel, NSApplication, NSColor,
         NSApplicationActivationPolicyRegular,
-        NSMakeRect, NSMakeSize, NSInsetRect, NSOperationQueue,
+        NSMakeRect, NSMakeSize, NSMakePoint, NSInsetRect, NSOperationQueue,
         NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
         NSWindowStyleMaskResizable, NSWindowStyleMaskMiniaturizable,
         NSBackingStoreBuffered, NSViewWidthSizable, NSViewHeightSizable,
@@ -5448,6 +5469,7 @@ def _transcribe_controller_class():
 
     ERROR_TXT = NSColor.colorWithSRGBRed_green_blue_alpha_(1.0, 0.62, 0.5, 1.0)
     BEARING = 2.0        # a frame-placed label draws its text 2pt inside its frame
+    SUB_INSET = 40.0     # the drop zone's subtitle wraps this far inside its edges
 
     def _symbol(name, point_size):
         """The template glyph for an SF Symbol name at a point size, or None."""
@@ -5546,6 +5568,7 @@ def _transcribe_controller_class():
             win.setDelegate_(self)
             win.setMinSize_(NSMakeSize(440, 360))
             G.dress_window(win)
+            _pin_dark(win)       # the content is always dark; so is its chrome
 
             frame = win.contentView().frame()
             # The DROP content view: it carries the drag-and-drop plumbing. (It is
@@ -5580,10 +5603,23 @@ def _transcribe_controller_class():
             G.fill(wash, fill="WINDOW_BG", dark=True)
             content.addSubview_(wash)
 
-            # ---- header strip: the window's title is hidden (dress_window), so
-            # say what this window is, clear of the traffic lights.
-            HEADER_H = 52.0
+            # ---- header: the window's title is hidden (dress_window), so name
+            # the window on the traffic lights' own line, just past them, with a
+            # hairline under that title bar. The lights are measured rather than
+            # assumed — their inset and the bar's height vary across releases.
             PAD = 16.0
+            lights_right, lights_cy = 63.0, 14.0     # a standard 28pt title bar
+            try:
+                for which in (2, 1, 0):              # zoom, miniaturize, close
+                    b = win.standardWindowButton_(which)
+                    if b is not None and not b.isHidden():
+                        r = b.convertRect_toView_(b.bounds(), None)
+                        lights_right = r.origin.x + r.size.width
+                        lights_cy = H - (r.origin.y + r.size.height / 2.0)
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+            HEADER_H = round(2.0 * lights_cy)  # the lights sit mid-bar
             TOP = HEADER_H + PAD               # where the three states begin
             rule = G.hairline(NSMakeRect(0, H - HEADER_H, W, 1), "DIVIDER",
                               dark=True)
@@ -5592,8 +5628,10 @@ def _transcribe_controller_class():
             heading = NSTextField.labelWithString_("Transcribe Audio File")
             heading.setFont_(G.font(G.BODY, G.SEMIBOLD))
             heading.setTextColor_(D.white(0.85))
-            heading.setFrame_(NSMakeRect(88 - BEARING, H - 44, W - 88 - PAD,
-                                         G.LINE_H[G.BODY]))
+            head_x = lights_right + 18.0
+            heading.setFrame_(NSMakeRect(
+                head_x - BEARING, H - lights_cy - G.LINE_H[G.BODY] / 2.0,
+                W - head_x - PAD, G.LINE_H[G.BODY]))
             heading.setAutoresizingMask_(NSViewWidthSizable | NSViewMinYMargin)
             content.addSubview_(heading)
 
@@ -5609,14 +5647,20 @@ def _transcribe_controller_class():
             content.addSubview_(empty)
 
             ew = empty.frame().size.width
-            cy = empty.frame().size.height / 2.0
             cx = ew / 2.0
 
-            # A column centred in the zone: glyph · 16 · title · 5 · formats ·
-            # 20 · button. The glyph is monochrome — nothing has happened yet.
+            # A column centred in the zone: glyph · 14 · title · 2 · formats ·
+            # 20 · button. It is ONE view, centred as a whole, so a smaller
+            # window moves the column instead of squeezing its rows together.
+            # The glyph is monochrome — nothing has happened yet.
+            col = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, ew, 128))
+            col.setAutoresizingMask_(NSViewWidthSizable | centered_y)
+            empty.addSubview_(col)
+            self._empty_col = col
+
             wiv = NSImageView.alloc().initWithFrame_(
-                NSMakeRect(cx - 15, cy + 32, 30, 30))
-            wiv.setAutoresizingMask_(centered_x | centered_y)
+                NSMakeRect(cx - 15, 98, 30, 30))
+            wiv.setAutoresizingMask_(centered_x)
             wf = _symbol("waveform", 30.0)
             if wf is not None:
                 wiv.setImage_(wf)
@@ -5625,33 +5669,44 @@ def _transcribe_controller_class():
             except Exception:  # noqa: BLE001
                 pass
             wiv.setImageScaling_(1)     # NSImageScaleProportionallyDown
-            empty.addSubview_(wiv)
+            col.addSubview_(wiv)
+            self._empty_glyph = wiv
 
             title = NSTextField.labelWithString_(self._EMPTY_TITLE_DEFAULT)
-            title.setFrame_(NSMakeRect(0, cy - 1, ew, G.LINE_H[G.TITLE]))
+            title.setFrame_(NSMakeRect(0, 65, ew, G.LINE_H[G.TITLE]))
             title.setAlignment_(NSTextAlignmentCenter)
             title.setFont_(G.font(G.TITLE, G.SEMIBOLD))
-            title.setAutoresizingMask_(NSViewWidthSizable | centered_y)
-            empty.addSubview_(title)
+            title.setAutoresizingMask_(NSViewWidthSizable)
+            col.addSubview_(title)
 
-            sub = NSTextField.labelWithString_(self._EMPTY_SUB_DEFAULT)
-            sub.setFrame_(NSMakeRect(0, cy - 18, ew, G.LINE_H[G.SECONDARY]))
+            # Wrapping, so an error's reason can run to three centred lines
+            # (see _fit_empty_sub) instead of being clipped at both ends.
+            sub = NSTextField.wrappingLabelWithString_(self._EMPTY_SUB_DEFAULT)
+            sub.setFrame_(NSMakeRect(SUB_INSET, 48, ew - 2 * SUB_INSET,
+                                     G.LINE_H[G.SECONDARY]))
             sub.setAlignment_(NSTextAlignmentCenter)
             sub.setFont_(G.font(G.SECONDARY, G.REGULAR))
-            sub.setAutoresizingMask_(NSViewWidthSizable | centered_y)
-            empty.addSubview_(sub)
+            sub.setSelectable_(False)
+            try:
+                sub.setMaximumNumberOfLines_(3)
+                sub.cell().setTruncatesLastVisibleLine_(True)
+            except Exception:  # noqa: BLE001
+                pass
+            sub.setAutoresizingMask_(NSViewWidthSizable)
+            col.addSubview_(sub)
+
+            choose = G.accent_button("Choose File…", self, "chooseFile:")
+            bw = G.title_width("Choose File…") + 32.0
+            choose.setFrame_(NSMakeRect(cx - bw / 2.0, 0, bw, 28))
+            choose.setAutoresizingMask_(centered_x)
+            col.addSubview_(choose)
+            self._choose = choose
+
             # Kept so a failed transcription can surface its error RIGHT HERE —
             # the drop zone is the only view left on screen after a failure.
             self._empty_title = title
             self._empty_sub = sub
             self._reset_empty_copy()
-
-            choose = G.accent_button("Choose File…", self, "chooseFile:")
-            bw = G.title_width("Choose File…") + 32.0
-            choose.setFrame_(NSMakeRect(cx - bw / 2.0, cy - 66, bw, 28))
-            choose.setAutoresizingMask_(centered_x | centered_y)
-            empty.addSubview_(choose)
-            self._choose = choose
 
             # ---- LOADING state ------------------------------------------------
             loading = NSView.alloc().initWithFrame_(
@@ -5665,37 +5720,44 @@ def _transcribe_controller_class():
             lh = loading.frame().size.height
             lcx = lw / 2.0
 
+            # spinner · 14 · title · 3 · subtitle, one centred column again. It
+            # sits 16pt above the middle, so the title lands about where the
+            # empty state's title was when a file is dropped.
+            lcol = NSView.alloc().initWithFrame_(
+                NSMakeRect(0, lh / 2.0 - 28, lw, 88))
+            lcol.setAutoresizingMask_(NSViewWidthSizable | centered_y)
+            loading.addSubview_(lcol)
+
             spinner = NSProgressIndicator.alloc().initWithFrame_(
-                NSMakeRect(lcx - 16, lh / 2.0 + 28, 32, 32))
+                NSMakeRect(lcx - 16, 56, 32, 32))
             spinner.setStyle_(1)          # NSProgressIndicatorStyleSpinning
             spinner.setIndeterminate_(True)
             spinner.setDisplayedWhenStopped_(False)
-            spinner.setAutoresizingMask_(centered_x | centered_y)
-            loading.addSubview_(spinner)
+            spinner.setAutoresizingMask_(centered_x)
+            lcol.addSubview_(spinner)
             self._spinner = spinner
 
             ltitle = NSTextField.labelWithString_("Transcribing…")
-            ltitle.setFrame_(NSMakeRect(0, lh / 2.0 - 6, lw, G.LINE_H[G.TITLE]))
+            ltitle.setFrame_(NSMakeRect(0, 22, lw, G.LINE_H[G.TITLE]))
             ltitle.setAlignment_(NSTextAlignmentCenter)
             ltitle.setFont_(G.font(G.TITLE, G.SEMIBOLD))
             ltitle.setTextColor_(D.white(0.85))
-            ltitle.setAutoresizingMask_(NSViewWidthSizable | centered_y)
+            ltitle.setAutoresizingMask_(NSViewWidthSizable)
             try:
                 ltitle.setLineBreakMode_(5)    # NSLineBreakByTruncatingMiddle
             except Exception:  # noqa: BLE001
                 pass
-            loading.addSubview_(ltitle)
+            lcol.addSubview_(ltitle)
             self._loading_title = ltitle
 
             lsub = NSTextField.labelWithString_(
                 "Running on-device on the GPU — long files take a little longer.")
-            lsub.setFrame_(NSMakeRect(0, lh / 2.0 - 28, lw,
-                                      G.LINE_H[G.SECONDARY]))
+            lsub.setFrame_(NSMakeRect(0, 0, lw, G.LINE_H[G.SECONDARY]))
             lsub.setAlignment_(NSTextAlignmentCenter)
             lsub.setFont_(G.font(G.SECONDARY, G.REGULAR))
             lsub.setTextColor_(D.TEXT_3)
-            lsub.setAutoresizingMask_(NSViewWidthSizable | centered_y)
-            loading.addSubview_(lsub)
+            lsub.setAutoresizingMask_(NSViewWidthSizable)
+            lcol.addSubview_(lsub)
 
             # ---- DONE state ---------------------------------------------------
             done = NSView.alloc().initWithFrame_(
@@ -5960,6 +6022,7 @@ def _transcribe_controller_class():
                 self._empty_title.setTextColor_(ERROR_TXT)
                 self._empty_sub.setStringValue_(str(msg))
                 self._empty_sub.setTextColor_(D.white(0.62))
+                self._fit_empty_sub()
             except Exception:  # noqa: BLE001
                 pass
             print(f"[flow] transcribe: {msg}", flush=True)
@@ -5971,8 +6034,48 @@ def _transcribe_controller_class():
                 self._empty_title.setTextColor_(D.white(0.85))
                 self._empty_sub.setStringValue_(self._EMPTY_SUB_DEFAULT)
                 self._empty_sub.setTextColor_(D.TEXT_3)
+                self._fit_empty_sub()
             except Exception:  # noqa: BLE001
                 pass
+
+        @objc.python_method
+        def _fit_empty_sub(self):
+            """Size the drop zone's subtitle to its text — one line normally, up
+            to three for an error's reason — then restack the column bottom-up
+            (button · 20 · subtitle · 2 · title · 14 · glyph) and centre it."""
+            import math
+            sub = self._empty_sub
+            f = sub.frame()
+            h = G.LINE_H[G.SECONDARY]
+            try:
+                from Cocoa import (NSAttributedString, NSFontAttributeName,
+                                   NSStringDrawingUsesLineFragmentOrigin as _LFO)
+                font = G.font(G.SECONDARY, G.REGULAR)
+
+                def _measure(s):
+                    return NSAttributedString.alloc().initWithString_attributes_(
+                        s, {NSFontAttributeName: font}).boundingRectWithSize_options_(
+                        NSMakeSize(f.size.width - 2 * BEARING, 1e5),
+                        _LFO).size.height
+                text_h, one_h = _measure(str(sub.stringValue())), _measure("A")
+                if text_h > one_h * 1.5:
+                    # A wrapping label drops a last line that does not fit
+                    # whole, so give it a little slack.
+                    h = math.ceil(min(text_h, 3 * one_h)) + 3.0
+            except Exception:  # noqa: BLE001
+                pass
+            y = self._choose.frame().size.height + 20.0
+            sub.setFrame_(NSMakeRect(f.origin.x, y, f.size.width, h))
+            y += h + 2.0
+            t = self._empty_title.frame()
+            self._empty_title.setFrameOrigin_(NSMakePoint(t.origin.x, y))
+            y += t.size.height + 14.0
+            g = self._empty_glyph.frame()
+            self._empty_glyph.setFrameOrigin_(NSMakePoint(g.origin.x, y))
+            y += g.size.height
+            col, zone = self._empty_col, self._empty.bounds().size
+            col.setFrame_(NSMakeRect(0, round((zone.height - y) / 2.0),
+                                     zone.width, y))
 
         # -- window lifecycle -----------------------------------------------
         @objc.python_method
@@ -6389,6 +6492,10 @@ def _history_controller_class():
             ebody.setFont_(G.font(G.SECONDARY, G.REGULAR))
             ebody.setTextColor_(G.TEXT_3)
             ebody.setAlignment_(NSTextAlignmentCenter)
+            try:
+                ebody.cell().setTruncatesLastVisibleLine_(True)
+            except Exception:  # noqa: BLE001
+                pass
             ebody.setFrame_(NSMakeRect(W / 2 - 130, cy - 54, 260, 34))
             ebody.setAutoresizingMask_(centered)
             empty.addSubview_(ebody)
@@ -6514,10 +6621,14 @@ def _history_controller_class():
             if not items:
                 # Empty (no history at all) vs no-results (search matched nothing).
                 if q:
+                    # Quote a long query shortened: the message has two lines.
+                    shown = query.strip()
+                    if len(shown) > 24:
+                        shown = shown[:23].rstrip() + "…"
                     self._empty_title.setStringValue_("No matches")
                     self._empty_body.setStringValue_(
                         "No dictations match “%s”. Try a different search."
-                        % query.strip())
+                        % shown)
                 else:
                     self._empty_title.setStringValue_("No dictations yet")
                     self._empty_body.setStringValue_(
@@ -6708,6 +6819,7 @@ def _history_controller_class():
                     spoken.setContentTintColor_(G.TEXT_2)
                 except Exception:  # noqa: BLE001
                     pass
+                self._set_spoken_title(spoken, "as spoken")
                 spoken.setToolTip_(
                     "Rewritten by a writing style. As you said it (click to copy):"
                     "\n\n" + (original if len(original) <= 600
@@ -6790,14 +6902,31 @@ def _history_controller_class():
             if not txt:
                 return
             _clip_set(txt)
-            sender.setTitle_("copied ✓")
+            self._set_spoken_title(sender, "copied ✓")
 
             def _back(_t):
                 try:
-                    sender.setTitle_("as spoken")
+                    self._set_spoken_title(sender, "as spoken")
                 except Exception:  # noqa: BLE001
                     pass
             NSTimer.scheduledTimerWithTimeInterval_repeats_block_(1.1, False, _back)
+
+        @objc.python_method
+        def _set_spoken_title(self, btn, title):
+            """(Re)title an "as spoken" link exactly as wide as its text. The meta
+            stack spaces its items by their alignment rects, which for a label
+            is the text itself but for a button is the whole frame — so any side
+            padding would open a wider gap in front of the link than elsewhere."""
+            btn.setTitle_(title)
+            w = G.title_width(title, G.font(G.CAPTION, G.REGULAR))
+            try:
+                for c in btn.constraints():
+                    if c.firstAttribute() == 7 and c.secondItem() is None:
+                        c.setConstant_(w)          # NSLayoutAttributeWidth
+                        return
+                btn.widthAnchor().constraintEqualToConstant_(w).setActive_(True)
+            except Exception:  # noqa: BLE001
+                pass
 
         @objc.python_method
         def _restore_copy(self, sender):
@@ -6892,8 +7021,10 @@ def _hud_controller_class():
     HINT_H, GAP_V = 16.0, 8.0
     PANEL_W, PANEL_H = PILL_W, PILL_H + GAP_V + HINT_H
     PILL_Y = HINT_H + GAP_V                 # pill sits above the hint line
-    PAD_L, PAD_R, GAP = 16.0, 6.0, 12.0
     DOT, STOP, CLOCK_W = 8.0, 28.0, 36.0    # the clock fits "10:00", the cap
+    # The Stop button is inset as far from the pill's end as from its top and
+    # bottom, so the circle sits concentric in the rounded end cap.
+    PAD_L, PAD_R, GAP = 16.0, (PILL_H - STOP) / 2.0, 12.0
     WAVE_H, BAR_W, BAR_PITCH = 20.0, 2.0, 6.0
     STOP_X = PILL_W - PAD_R - STOP
     CLOCK_X = STOP_X - GAP - CLOCK_W
@@ -7106,6 +7237,12 @@ def _hud_controller_class():
             self._stop.setHidden_(not listening)
             self._hint.setHidden_(not listening)
             self._time.setTextColor_(D.white(0.72 if listening else 0.45))
+            # Without the Stop button the clock moves up to the end, as far in
+            # from that edge as the dot is from the other (+2: text bearing).
+            f = self._time.frame()
+            self._time.setFrameOrigin_(
+                (CLOCK_X + 2 if listening else PILL_W - PAD_L - CLOCK_W + 2,
+                 f.origin.y))
 
         def _hint_text(self):
             # Just the one thing to do next. ("Never mind" is taught in onboarding
@@ -7590,7 +7727,7 @@ def _settings_controller_class():
             side.addSubview_(G.hairline(
                 NSMakeRect(INSET, FOOT_Y + FOOT_H, row_w, 1)))
             shield = NSImageView.alloc().initWithFrame_(
-                NSMakeRect(INSET + 6, FOOT_Y + (FOOT_H - 14) / 2.0, 14, 14))
+                NSMakeRect(INSET + 8, FOOT_Y + (FOOT_H - 14) / 2.0, 14, 14))
             simg = _phosphor_sf("checkmark.shield.fill", "on-device", point=14.0)
             if simg is not None:
                 shield.setImage_(simg)
@@ -7603,10 +7740,10 @@ def _settings_controller_class():
             trust = NSTextField.labelWithString_("Runs entirely on this Mac")
             trust.setFont_(G.font(G.CAPTION, G.REGULAR))
             trust.setTextColor_(G.TEXT_3)
-            trust.setFrame_(NSMakeRect(INSET + 6 + 14 + 7 - BEARING,
+            text_x = INSET + 8 + 15 + 9          # the row labels' text column
+            trust.setFrame_(NSMakeRect(text_x - BEARING,
                                        FOOT_Y + (FOOT_H - cap) / 2.0,
-                                       SIDEBAR_W - INSET - (INSET + 27 - BEARING),
-                                       cap))
+                                       SIDEBAR_W - 2 - (text_x - BEARING), cap))
             side.addSubview_(trust)
 
             # ---- content column: a fixed pane title, the pane scrolling under it.
@@ -7708,11 +7845,12 @@ def _settings_controller_class():
 
         @objc.python_method
         def _row(self, card, title, subtitle=None, control=None, glyph=None,
-                 wrap=True, pad_y=ROW_PAD_Y):
+                 wrap=True, pad_y=ROW_PAD_Y, sub_break=5):
             """Append one row: a title, a caption line ONLY where it says something
             the title does not, and a right-aligned control. The row is as tall
             as its content plus `pad_y` above and below; a hairline inset to the
-            text separates it from the row above."""
+            text separates it from the row above. An unwrapped caption truncates
+            per `sub_break` (5 middle, 4 tail)."""
             view = card.view
             W = view.frame().size.width
             top = card.y
@@ -7764,7 +7902,7 @@ def _settings_controller_class():
                 s.setTextColor_(SUB_COL)
                 s.setSelectable_(False)
                 if not wrap:
-                    s.setLineBreakMode_(5)   # NSLineBreakByTruncatingMiddle
+                    s.setLineBreakMode_(sub_break)
                 s.setFrame_(NSMakeRect(text_x - BEARING,
                                        mid - text_h / 2.0 + line + 2.0,
                                        text_w + 2 * BEARING, sub_h))
@@ -7897,15 +8035,12 @@ def _settings_controller_class():
         def _maxrec_control(self):
             cur = int(self._cfg("max_record_seconds", 120) or 120)
             cur = max(30, min(600, cur))
+            # No tick marks: the 58 ten-second stops would be drawn 2pt apart,
+            # which fuses them into one solid bar. maxRecChanged_ snaps to them.
             sl = NSSlider.alloc().initWithFrame_(NSMakeRect(0, 0, 124, 20))
             sl.setMinValue_(30.0)
             sl.setMaxValue_(600.0)
             sl.setDoubleValue_(float(cur))
-            try:
-                sl.setNumberOfTickMarks_(58)          # 30..600 step 10
-                sl.setAllowsTickMarkValuesOnly_(True)
-            except Exception:  # noqa: BLE001
-                pass
             sl.setTarget_(self)
             sl.setAction_("maxRecChanged:")
             self._maxrec_slider = sl
@@ -7966,7 +8101,7 @@ def _settings_controller_class():
             # All three config values, or a "clipboard" user would see "Paste"
             # selected — one click from silently overwriting their setting.
             self._row(card, "Insert method",
-                      "Paste, type, or copy-only (no permissions)",
+                      "Copy needs no Accessibility access",
                       self._segment(("Paste", "Type", "Copy"),
                                     ("paste", "type", "clipboard"),
                                     self._cfg("insert_method", "paste"),
@@ -8136,7 +8271,7 @@ def _settings_controller_class():
 
             for i, prof in enumerate(profiles):
                 extras = describe_profile_extras(prof)
-                detail = ("also  " + extras) if extras else (
+                detail = ("also sets " + extras) if extras else (
                     str(prof.get("bundle_id") or "matched by name"))
                 tag = self._tag()
                 self._profile_rows[tag] = i
@@ -8184,18 +8319,20 @@ def _settings_controller_class():
             for row in rows:
                 tag = self._tag()
                 self._correction_edit_rows[tag] = row
+                # Short facts first and the free-text context last, so a long
+                # context is what gets cut — at its end, not mid-word.
                 meta = []
-                if row["context"]:
-                    meta.append(f"context: {row['context']}")
-                if row["app"]:
-                    meta.append(f"app: {row['app']}")
                 if row["count"]:
                     meta.append("used once" if row["count"] == 1
                                 else f"used {row['count']} times")
+                if row["app"]:
+                    meta.append(f"app: {row['app']}")
+                if row["context"]:
+                    meta.append(f"context: {row['context']}")
                 self._row(card, f"{row['heard']} → {row['correct']}",
                           " · ".join(meta) if meta else "Applies everywhere",
                           self._push_button("Edit", "editCorrection:", tag=tag),
-                          wrap=False)
+                          wrap=False, sub_break=4)
             return self._close(card)
 
         @objc.python_method
@@ -8253,7 +8390,9 @@ def _settings_controller_class():
         def _pane_privacy(self):
             pane = self._pane()
             y = PANE_TOP
-            y += self._section(pane, "macOS permissions", y)
+            # Not "macOS permissions": section headers are set in capitals, and
+            # "MACOS" is how the name must never be written.
+            y += self._section(pane, "Permissions", y)
             card = self._card(pane, y)
             self._perm_row(card, "mic", "Microphone", URL_MIC)
             self._perm_row(card, "ax", "Accessibility", URL_AX)
@@ -8406,6 +8545,11 @@ def _settings_controller_class():
                  "permission you already granted, only replaces words that aren't "
                  "real words, and keeps nothing: the text is read for that one "
                  "dictation and never stored or logged."),
+                ("Dictation history",
+                 f"Keeps your last {HISTORY_CAP} dictations on this Mac so you can "
+                 "find and copy one again in the History window. Turn it off and "
+                 "new dictations aren't saved; “Clear history” removes the ones "
+                 "already there. The time-saved count is kept either way."),
             )),
         )
 
@@ -8672,7 +8816,7 @@ def _settings_controller_class():
             if self._hotkey_change_button is not None:
                 self._hotkey_change_button.setTitle_("Press key")
             if self._hotkey_value_label is not None:
-                self._hotkey_value_label.setStringValue_("Listening...")
+                self._hotkey_value_label.setStringValue_("Listening…")
             try:
                 self._win.makeFirstResponder_(self._win.contentView())
             except Exception:  # noqa: BLE001
@@ -8808,6 +8952,7 @@ def _settings_controller_class():
                 self._maxrec_label.setStringValue_(self._fmt_maxrec(v))
             if self._is_live_drag():
                 return
+            sender.setDoubleValue_(float(v))      # the knob settles on the stop
             self._save("max_record_seconds", v)
             # Take effect WITHOUT a restart: the recording loop enforces
             # FlowApp._MAX_RECORD_SECONDS, snapshotted once at launch. Keep the
@@ -9077,7 +9222,8 @@ def _onboarding_controller_class():
     WIN_W, WIN_H = 500.0, 560.0
     PAD_X = 34.0
     BAR_H = 64.0                                # bottom bar height
-    TOP = 72.0                                  # where every step's content begins
+    BODY_TOP = 28.0          # the title-bar strip; each step centres below it
+    HEAD_H = 76.0            # a step's headline + paragraph (see _heading)
     PARA_GAP = 4.5                              # paragraph line-height 1.55
     BEARING = 2.0       # a frame-placed label draws its text 2pt inside its frame
 
@@ -9204,32 +9350,43 @@ def _onboarding_controller_class():
             self._label(v, paragraph, (W - pw) / 2.0, H - para_top - para_h, pw,
                         para_h, G.BODY, G.REGULAR, G.TEXT_2, NSTextAlignmentCenter,
                         line_spacing=PARA_GAP)
-            return para_top + 40.0
+            return para_top + 40.0         # = top + HEAD_H
+
+        @objc.python_method
+        def _block_top(self, H, block_h):
+            """Where a step's content starts (from the window's top edge): the
+            block centred between the title-bar strip and the bottom bar. The
+            steps differ in height, so a shared top edge left the shorter two
+            hanging from the top over a band of empty window."""
+            return round(BODY_TOP + (H - BODY_TOP - block_h) / 2.0)
 
         # ---- STEP 0: Welcome ----------------------------------------------
         @objc.python_method
         def _build_step0(self, v, W, H):
+            # icon · 20 · headline + paragraph · 36 · three feature rows
+            INSET, ROW = 56.0, 59.0
+            ic = 80.0
+            top = self._block_top(H, ic + 20.0 + HEAD_H + 36.0 + 3 * ROW + 2.0)
+
             # The app icon, bare: the icns artwork carries its own shape, and a
             # corner radius of ours would clip it.
-            ic = 80.0
             path = _Path(__file__).resolve().parent / "assets" / "frut-flow.icns"
             img = NSImage.alloc().initWithContentsOfFile_(str(path))
             iv = NSImageView.alloc().initWithFrame_(
-                NSMakeRect((W - ic) / 2.0, H - TOP - ic, ic, ic))
+                NSMakeRect((W - ic) / 2.0, H - top - ic, ic, ic))
             if img is not None:
                 iv.setImage_(img)
             iv.setImageScaling_(_SCALE_FILL)
             v.addSubview_(iv)
 
-            self._heading(
-                v, H, TOP + ic + 20.0, "Welcome to früt Flow",
+            top = self._heading(
+                v, H, top + ic + 20.0, "Welcome to früt Flow",
                 "Private, on-device dictation. Hold a key, speak, and your "
                 "words appear in whatever app you're using.")
 
             # Three feature rows on hairlines — grey glyphs, no tiles: the screen
             # should not read like an App Store page.
-            INSET, ROW = 56.0, 59.0
-            top = 284.0
+            top += 36.0
             feats = [
                 ("checkmark.shield.fill", "On-device and private",
                  "No account. Nothing leaves your Mac."),
@@ -9266,8 +9423,10 @@ def _onboarding_controller_class():
         # ---- STEP 1: Permissions ------------------------------------------
         @objc.python_method
         def _build_step1(self, v, W, H):
+            # headline + paragraph · 24 · three 60pt rows, 10pt apart
             bottom = self._heading(
-                v, H, TOP, "A few quick permissions",
+                v, H, self._block_top(H, HEAD_H + 24.0 + 3 * 60.0 + 2 * 10.0),
+                "A few quick permissions",
                 "früt Flow needs these to hear you and type for you. They "
                 "stay on this Mac.")
 
@@ -9322,13 +9481,16 @@ def _onboarding_controller_class():
         # ---- STEP 2: All set ----------------------------------------------
         @objc.python_method
         def _build_step2(self, v, W, H):
+            # glyph · 20 · headline + paragraph · 26 · field · 16 · footnote
+            top = self._block_top(H, 30.0 + 20.0 + HEAD_H + 26.0 + 48.0 + 16.0
+                                  + G.LINE_H[G.CAPTION])
             iv = self._glyph("mic.fill", 30, G.white(0.60))
             if iv is not None:
-                iv.setFrame_(NSMakeRect((W - 30) / 2.0, H - TOP - 30, 30, 30))
+                iv.setFrame_(NSMakeRect((W - 30) / 2.0, H - top - 30, 30, 30))
                 v.addSubview_(iv)
 
             bottom = self._heading(
-                v, H, TOP + 30 + 20.0, "You're all set",
+                v, H, top + 30 + 20.0, "You're all set",
                 "Hold %s, say something, and release to insert it wherever "
                 "your cursor is." % self._hotkey_hint())
 
@@ -9621,15 +9783,15 @@ def _popover_controller_class():
 
     # --- geometry: menu metrics, not a card stack ---------------------------
     PW = 326.0                       # popover content width
-    TOP_PAD, BOTTOM_PAD = 8.0, 6.0
+    TOP_PAD, BOTTOM_PAD = 8.0, 8.0      # = CARD_INSET: the Quit band's inset too
     HEADER_H = 42.0                  # icon · wordmark · status capsule
     HEADER_CY = TOP_PAD + 19.0       # the header's centre line
     STATUS_H = 18.0                  # the status capsule (a pill: radius = h / 2)
     CARD_INSET, CARD_H, CARD_GAP = 8.0, 42.0, 8.0
     ROW_H = 30.0                     # nav row height
     FOOT_ROW_H = 28.0                # footer row height
-    ROW_INSET = 6.0                  # left/right inset of the row band
-    ROW_PAD = 8.0                    # glyph / shortcut inset inside the band
+    ROW_INSET = CARD_INSET           # a hover band spans exactly what the card does
+    ROW_PAD = 6.0                    # glyph / shortcut inset inside the band (14pt in)
     GLYPH = 16.0
     DIV_H = 1.0
 
