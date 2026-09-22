@@ -23,7 +23,6 @@ required=(
   "README.md"
   "LICENSE"
   "Install frut Flow.command"
-  "Install frut Flow from GitHub.command"
   "Start früt Flow.command"
   "Teach a Word.command"
   "Quit frutflow.command"
@@ -43,13 +42,14 @@ for path in "${required[@]}"; do
   cp -p "$ROOT/$path" "$STAGE/"
 done
 
-# Ship runtime assets only. Logo/wordmark source files and the repair-model
+# Ship runtime assets only. The wordmark source files and the repair-model
 # eyeballing harness remain useful to developers but do not belong in an end-user
-# installer archive.
+# installer archive. Neither does "Install frut Flow from GitHub.command": that is
+# the OTHER delivery route's single-file entry point, and inside this payload it
+# would only land in the install directory as a button that re-downloads the app.
 mkdir -p "$STAGE/assets/phosphor"
 cp -p "$ROOT/assets/frut-flow.icns" "$STAGE/assets/"
-rsync -a --exclude ".DS_Store" --exclude "microphone-stage-fill.png" \
-  "$ROOT/assets/phosphor/" "$STAGE/assets/phosphor/"
+rsync -a --exclude ".DS_Store" "$ROOT/assets/phosphor/" "$STAGE/assets/phosphor/"
 
 cat > "$STAGE/README_FIRST.txt" <<'README'
 frut Flow - quick setup
@@ -58,10 +58,12 @@ This is a local macOS voice dictation app. It runs on your Mac and does not
 send audio or dictated text to a cloud service.
 
 Requirements:
-- Apple Silicon Mac
+- Apple Silicon Mac (M1 or newer)
 - macOS 14 (Sonoma) or newer
-- Homebrew installed from https://brew.sh
-- Python 3.10 or newer
+- An internet connection and ~3-5 GB free disk space for the one-time setup
+
+The installer puts Homebrew and Python 3.10+ in place itself if they are
+missing; it asks before installing Homebrew.
 
 First run:
 1. Unzip this folder.
