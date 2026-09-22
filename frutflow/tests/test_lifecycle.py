@@ -15,6 +15,7 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 import weakref
@@ -499,6 +500,38 @@ class ThemedLayerRegistryTests(unittest.TestCase):
             ("background", "first"),
             ("background", "second"),
         ])
+
+
+class RelativeTimeTests(unittest.TestCase):
+    """The History meta line's "when": short, and worded the way macOS does."""
+
+    # Local noon in mid-January: day buckets are calendar-based, so anchoring to
+    # local time (far from any DST change) keeps this true in every timezone.
+    NOW = time.mktime((2027, 1, 15, 12, 0, 0, 0, 0, -1))
+
+    def ago(self, seconds):
+        return flow.relative_time(self.NOW - seconds, now=self.NOW)
+
+    def test_minutes_and_hours_are_spelled_short_not_abbreviated(self):
+        self.assertEqual(self.ago(10), "Just now")
+        self.assertEqual(self.ago(2 * 60), "2 min ago")
+        self.assertEqual(self.ago(41 * 60), "41 min ago")
+        self.assertEqual(self.ago(3 * 3600 + 5), "3 hours ago")
+
+    def test_singular_hour_and_the_sixty_minute_edge(self):
+        self.assertEqual(self.ago(3600 + 30), "1 hour ago")
+        # 59.5–60 min rounds to 60: that is an hour, never "60 min ago".
+        self.assertEqual(self.ago(59 * 60 + 50), "1 hour ago")
+
+    def test_future_and_garbage_timestamps_never_raise(self):
+        self.assertEqual(self.ago(-500), "Just now")
+        self.assertEqual(flow.relative_time("not a time", now=self.NOW), "")
+        self.assertEqual(flow.relative_time(None, now=self.NOW), "")
+
+    def test_older_entries_bucket_by_calendar_day(self):
+        self.assertEqual(self.ago(30 * 3600), "Yesterday")
+        self.assertEqual(self.ago(4 * 86400), "4 days ago")
+        self.assertEqual(self.ago(30 * 86400), "Dec 16")
 
 
 class HuggingFaceCacheTests(unittest.TestCase):
