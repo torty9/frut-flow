@@ -8399,8 +8399,8 @@ def _settings_controller_class():
             card = self._card(pane, y_top)
             if not rows:
                 self._row(card, "No saved corrections yet",
-                          "Use Teach a Word from the menu bar to save the words "
-                          "früt Flow should repair next time.")
+                          "Words you teach, and fixes learned from your edits, "
+                          "show up here.")
                 return self._close(card)
 
             for row in rows:
@@ -8433,6 +8433,14 @@ def _settings_controller_class():
                 "Context and app hints are used by on-device cleanup when they "
                 "match.", y)
             y += ih + 14
+
+            # Above the list, not below it: auto-learned fixes can grow the list
+            # to hundreds of rows, and the way to add one must never scroll away.
+            card = self._card(pane, y)
+            self._row(card, "Teach a word",
+                      "Fix a word früt Flow keeps getting wrong",
+                      self._push_button("Teach…", "teachCorrection:"))
+            y += self._close(card) + SECTION_GAP
 
             y += self._section(
                 pane,
@@ -9102,14 +9110,14 @@ def _settings_controller_class():
                 "Edit heard text",
                 "What did früt Flow hear incorrectly?",
                 row.get("heard", ""),
-                required=True)
+                required=True, button_title="Next")
             if heard is None:
                 return
             correct = self._prompt_correction_value(
                 "Edit correction",
                 "What should früt Flow type instead?",
                 row.get("correct", ""),
-                required=True)
+                required=True, button_title="Next")
             if correct is None:
                 return
             context = self._prompt_correction_value(
@@ -9135,6 +9143,47 @@ def _settings_controller_class():
                 self._correction_edit_error(
                     "Heard and correction must both be filled in, and they "
                     "cannot be the same.")
+                return
+            self._show_pane("Corrections")
+
+        def teachCorrection_(self, _sender):
+            # The menu bar's Teach a Word, asked with this window's alerts
+            # rather than osascript dialogs so the new row lands in the list
+            # straight away. No app default: the frontmost app is früt Flow.
+            heard = self._prompt_correction_value(
+                "Teach a word",
+                "What did früt Flow type wrong?",
+                required=True, button_title="Next")
+            if heard is None:
+                return
+            heard_clean = _clean_text_value(heard, max_chars=160)
+            correct = self._prompt_correction_value(
+                "Teach a word",
+                f"What should it type instead of “{heard_clean}”?",
+                required=True, button_title="Next")
+            if correct is None:
+                return
+            if _clean_text_value(correct, max_chars=160) == heard_clean:
+                self._correction_edit_error(
+                    "What it typed and what it should type cannot be the same.")
+                return
+            context = self._prompt_correction_value(
+                "Optional context",
+                "The sentence or situation where this fix matters. Leave it "
+                "blank to skip.")
+            if context is None:
+                return
+            app = self._prompt_correction_value(
+                "Optional app",
+                "Use this fix mainly in one app? Leave it blank to use it "
+                "everywhere.",
+                button_title="Save")
+            if app is None:
+                return
+            try:
+                add_correction(heard, correct, context=context, app=app)
+            except Exception as e:  # noqa: BLE001  disk full / unwritable dir
+                self._correction_edit_error(f"Couldn't save the correction: {e}")
                 return
             self._show_pane("Corrections")
 
