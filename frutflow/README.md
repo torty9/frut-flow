@@ -395,6 +395,7 @@ Apps edits the style and leaves the other keys alone.
 |---|---|
 | A style didn't change my text | Check `~/.flowdictate/flow.log` for "rewrite was not faithful (…)": the guard refused it and typed your words instead. Under four words, and over `local_repair_max_input_chars`, the model is skipped on purpose. |
 | The wrong name got "fixed" from the screen | Turn off Settings ▸ Privacy ▸ **Use names on screen** (or `"context_awareness": false`), globally or for that one app via `app_profiles`. |
+| No 🎙️ in the menu bar | Check that `frutflow` is switched on in System Settings ▸ Menu Bar ▸ **Allow in the Menu Bar**. On a MacBook with a notch, icons that don't fit beside it are hidden, so quit a few other menu-bar apps. |
 | Hotkey does nothing | Grant **Input Monitoring** to `frutflow` (or the terminal used for a manual launch), then restart it. |
 | Nothing gets pasted | Grant **Accessibility**. Try `"insert_method": "type"`. |
 | `PortAudioError` / no audio | `brew install portaudio`; check `python flow.py --list-devices`. |

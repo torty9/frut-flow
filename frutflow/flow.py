@@ -22,11 +22,99 @@ import json
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# macOS 27+: run the menu-bar app in a child process
+#
+# macOS 27 draws other apps' menu-bar icons in a system process (MenuBarAgent)
+# that looks each icon's owner up through RunningBoard by pid AND pid version.
+# frutflow.app's launcher is a shell script that `exec`s python3, and exec bumps
+# the pid version, so RunningBoard's record of the process LaunchServices
+# launched never matches ("process has mismatched pid version"): the 🎙️ is
+# created but parked off-screen for good. A child process has no stale record,
+# so the launched process runs the app as its child and just waits. This runs
+# before the heavy imports below to keep that waiting parent small.
+# The child inherits the parent's TCC responsibility, so frutflow's Microphone,
+# Accessibility and Input Monitoring grants still apply, and the signed bundle
+# those grants are keyed to stays untouched.
+# ---------------------------------------------------------------------------
+
+APP_BUNDLE_ID = "com.frutflow.dictation"
+_APP_CHILD_ENV = "FRUTFLOW_APP_CHILD"   # set only in the child: its parent-watch fd
+
+
+def _macos_major() -> int:
+    import platform
+    try:
+        major = int(platform.mac_ver()[0].split(".")[0])
+    except ValueError:
+        return 0
+    # A Python built against an older SDK may be shown a compatibility version
+    # (macOS 26 reads as 16); no real release was ever numbered 16-25.
+    return major + 10 if 16 <= major <= 25 else major
+
+
+def _quit_when_parent_exits(fd: int) -> None:
+    """In the child: block until the parent-watch pipe hits EOF, which happens
+    the moment the parent dies (even by SIGKILL), then quit too — without the
+    parent, the process macOS holds responsible for our permissions is gone."""
+    try:
+        while os.read(fd, 1):
+            pass
+    except OSError:
+        pass
+    print("[flow] the launching process exited; quitting.", flush=True)
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+def _run_app_in_child_if_needed() -> None:
+    """When LaunchServices launched us as frutflow.app on macOS 27+, run the
+    app as a child, wait for it, and exit with its status. Otherwise return and
+    let this process run the app: in the child itself, a terminal run,
+    --no-menubar, older macOS, or when the child can't be started."""
+    watch_fd = os.environ.pop(_APP_CHILD_ENV, None)
+    if watch_fd is not None:
+        if watch_fd.isdigit():
+            threading.Thread(target=_quit_when_parent_exits,
+                             args=(int(watch_fd),), name="parent-watch",
+                             daemon=True).start()
+        return
+    if (sys.platform != "darwin"
+            or os.environ.get("__CFBundleIdentifier") != APP_BUNDLE_ID
+            or "--no-menubar" in sys.argv
+            or _macos_major() < 27):
+        return
+    # The child sees EOF on watch_r once we are gone; nothing is ever written.
+    watch_r, watch_w = os.pipe()
+    try:
+        child = subprocess.Popen([sys.executable, *sys.orig_argv[1:]],
+                                 env={**os.environ, _APP_CHILD_ENV: str(watch_r)},
+                                 pass_fds=(watch_r,))
+    except OSError as e:
+        os.close(watch_r)
+        os.close(watch_w)
+        print(f"[flow] couldn't start the app as a child process ({e}); running "
+              "it here, where macOS 27 won't show its menu-bar icon.", flush=True)
+        return
+    os.close(watch_r)
+    # restart.sh and Quit frutflow.command signal both processes; forwarding
+    # means anything that signals only this one still stops the app.
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
+    print(f"[flow] macOS 27+: running the app as child pid {child.pid} so its "
+          "menu-bar icon can appear.", flush=True)
+    code = child.wait()
+    sys.exit(128 - code if code < 0 else code)
+
+
+if __name__ == "__main__":
+    _run_app_in_child_if_needed()
 
 # We load the Parakeet weights from the local cache, so the fast xet transfer path
 # is never needed; disable it (harmless, and avoids one class of Hub network call).
@@ -4413,7 +4501,6 @@ def _trust_probe() -> None:
 # ---------------------------------------------------------------------------
 
 APP_BUNDLE_PATH = str(Path.home() / "Applications" / "frutflow.app")
-APP_BUNDLE_ID = "com.frutflow.dictation"
 AGENT_LABEL = "com.frutflow.dictation"
 
 

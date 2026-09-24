@@ -12,6 +12,7 @@ import gc
 import io
 import os
 import queue
+import signal
 import sys
 import tempfile
 import threading
@@ -1146,6 +1147,119 @@ class DefaultConfigWriteTests(unittest.TestCase):
             self.assertEqual(cfg_path.read_text(encoding="utf-8"), payload)
             # the code-dir pointer is the one thing it should (re)write
             self.assertTrue((tmp_path / "code_dir").is_file())
+
+
+class MenuBarChildProcessTests(unittest.TestCase):
+    """On macOS 27 a bundle launch must run the app in a child process, or the
+    menu-bar 🎙️ is never placed (see the top of flow.py)."""
+
+    ARGV = ["/Apps/frutflow.app/Contents/MacOS/python3", "/code/flow.py", "--app"]
+
+    @staticmethod
+    def _close_quietly(*fds):
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _launch(self, env=None, *, major=27, argv=None, exit_code=0):
+        """Call _run_app_in_child_if_needed as a LaunchServices launch would.
+        Returns (Popen mock, child mock, installed handlers, exit code, pipe)."""
+        env = {"__CFBundleIdentifier": flow.APP_BUNDLE_ID} if env is None else env
+        child = mock.Mock(pid=4242)
+        child.wait.return_value = exit_code
+        handlers = {}
+        r, w = os.pipe()
+        self.addCleanup(self._close_quietly, r, w)
+        code = None
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(flow.sys, "platform", "darwin"), \
+                mock.patch.object(flow.sys, "argv", argv or self.ARGV[1:]), \
+                mock.patch.object(flow.sys, "orig_argv", self.ARGV), \
+                mock.patch.object(flow.sys, "executable", self.ARGV[0]), \
+                mock.patch.object(flow, "_macos_major", return_value=major), \
+                mock.patch.object(flow.os, "pipe", return_value=(r, w)), \
+                mock.patch.object(flow.subprocess, "Popen",
+                                  return_value=child) as popen, \
+                mock.patch.object(flow.signal, "signal",
+                                  side_effect=handlers.__setitem__), \
+                redirect_stdout(io.StringIO()):
+            if "__CFBundleIdentifier" not in env:
+                os.environ.pop("__CFBundleIdentifier", None)
+            os.environ.pop(flow._APP_CHILD_ENV, None)
+            try:
+                flow._run_app_in_child_if_needed()
+            except SystemExit as e:
+                code = e.code
+        return popen, child, handlers, code, (r, w)
+
+    def test_bundle_launch_runs_the_app_as_a_child_and_mirrors_its_exit(self):
+        popen, _, _, code, (r, w) = self._launch(exit_code=3)
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0], self.ARGV)      # same interpreter, script, flags
+        self.assertEqual(kwargs["pass_fds"], (r,))
+        self.assertEqual(kwargs["env"][flow._APP_CHILD_ENV], str(r))
+        self.assertEqual(code, 3)
+        with self.assertRaises(OSError):          # the parent keeps only the write end
+            os.fstat(r)
+        os.fstat(w)
+
+    def test_signals_to_the_parent_are_forwarded_to_the_child(self):
+        _, child, handlers, _, _ = self._launch()
+        self.assertEqual(set(handlers),
+                         {signal.SIGTERM, signal.SIGINT, signal.SIGHUP})
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        child.send_signal.assert_called_once_with(signal.SIGTERM)
+
+    def test_child_killed_by_a_signal_exits_like_a_shell_reports_it(self):
+        *_, code, _ = self._launch(exit_code=-signal.SIGTERM)
+        self.assertEqual(code, 128 + signal.SIGTERM)
+
+    def test_other_launches_keep_the_app_in_this_process(self):
+        cases = {
+            "not launched by LaunchServices": dict(env={}),
+            "terminal": dict(env={"__CFBundleIdentifier": "com.apple.Terminal"}),
+            "--no-menubar": dict(argv=["/code/flow.py", "--no-menubar"]),
+            "macOS 26": dict(major=26),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                popen, _, handlers, code, _ = self._launch(**kwargs)
+                popen.assert_not_called()
+                self.assertEqual(handlers, {})
+                self.assertIsNone(code)
+
+    def test_the_child_watches_its_parent_instead_of_spawning_again(self):
+        with mock.patch.dict(os.environ, {flow._APP_CHILD_ENV: "7",
+                                          "__CFBundleIdentifier": flow.APP_BUNDLE_ID}), \
+                mock.patch.object(flow, "_macos_major", return_value=27), \
+                mock.patch.object(flow.subprocess, "Popen") as popen, \
+                mock.patch.object(flow.threading, "Thread") as thread:
+            flow._run_app_in_child_if_needed()
+            # ...and does not hand the marker on to processes it starts.
+            self.assertNotIn(flow._APP_CHILD_ENV, os.environ)
+        popen.assert_not_called()
+        self.assertIs(thread.call_args.kwargs["target"], flow._quit_when_parent_exits)
+        self.assertEqual(thread.call_args.kwargs["args"], (7,))
+        self.assertTrue(thread.call_args.kwargs["daemon"])
+        thread.return_value.start.assert_called_once_with()
+
+    def test_the_child_quits_when_its_parent_goes_away(self):
+        r, w = os.pipe()
+        self.addCleanup(self._close_quietly, r)
+        os.close(w)                               # what the parent dying does
+        with mock.patch.object(flow.os, "kill") as kill, \
+                redirect_stdout(io.StringIO()):
+            flow._quit_when_parent_exits(r)
+        kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+
+    def test_compatibility_version_reads_as_the_real_release(self):
+        for shown, major in (("27.0", 27), ("16.4", 26), ("15.6", 15), ("", 0)):
+            with self.subTest(shown), \
+                    mock.patch("platform.mac_ver",
+                               return_value=(shown, ("", "", ""), "arm64")):
+                self.assertEqual(flow._macos_major(), major)
 
 
 if __name__ == "__main__":
